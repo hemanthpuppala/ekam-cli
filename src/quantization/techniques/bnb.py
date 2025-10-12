@@ -13,6 +13,8 @@ from typing import Callable, Optional
 
 from loguru import logger
 
+from ...models.model import ModelInfo
+from ...models.provider import ProviderType
 from ..models import QuantizationTask, QuantizationType
 from .base import BaseQuantizer
 
@@ -51,6 +53,49 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             QuantizationType.BNB_4BIT_NF4,
             QuantizationType.BNB_4BIT_FP4,
         ]
+
+    def get_source_model_path(self, model_info: ModelInfo) -> Optional[Path]:
+        """Get source model path for quantization.
+
+        BitsAndBytes works with HuggingFace models.
+
+        Args:
+            model_info: Model to quantize
+
+        Returns:
+            Path to model directory, or None if not compatible
+        """
+        # BitsAndBytes works with HuggingFace models
+        if model_info.provider != ProviderType.HUGGINGFACE:
+            return None
+
+        if model_info.file_path:
+            return Path(model_info.file_path)
+
+        return None
+
+    def estimate_output_size(
+        self, model_info: ModelInfo, quant_type: QuantizationType
+    ) -> float:
+        """Estimate output file size in GB.
+
+        Args:
+            model_info: Source model
+            quant_type: Quantization type
+
+        Returns:
+            Estimated size in GB
+        """
+        original_size = model_info.size_gb
+
+        size_factors = {
+            QuantizationType.BNB_8BIT: 0.5,  # 50% of original
+            QuantizationType.BNB_4BIT_NF4: 0.35,  # 35% of original
+            QuantizationType.BNB_4BIT_FP4: 0.35,  # 35% of original
+        }
+
+        factor = size_factors.get(quant_type, 0.35)
+        return original_size * factor
 
     def quantize(
         self,

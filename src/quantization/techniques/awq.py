@@ -13,6 +13,8 @@ from typing import Callable, Optional
 
 from loguru import logger
 
+from ...models.model import ModelInfo
+from ...models.provider import ProviderType
 from ..models import QuantizationTask, QuantizationType
 from .base import BaseQuantizer
 
@@ -49,6 +51,43 @@ class AWQQuantizer(BaseQuantizer):
         return [
             QuantizationType.AWQ_4BIT,
         ]
+
+    def get_source_model_path(self, model_info: ModelInfo) -> Optional[Path]:
+        """Get source model path for quantization.
+
+        AWQ works with HuggingFace models.
+
+        Args:
+            model_info: Model to quantize
+
+        Returns:
+            Path to model directory, or None if not compatible
+        """
+        # AWQ works with HuggingFace models
+        if model_info.provider != ProviderType.HUGGINGFACE:
+            return None
+
+        if model_info.file_path:
+            return Path(model_info.file_path)
+
+        return None
+
+    def estimate_output_size(
+        self, model_info: ModelInfo, quant_type: QuantizationType
+    ) -> float:
+        """Estimate output file size in GB.
+
+        Args:
+            model_info: Source model
+            quant_type: Quantization type
+
+        Returns:
+            Estimated size in GB
+        """
+        original_size = model_info.size_gb
+
+        # AWQ 4-bit is ~30% of original size
+        return original_size * 0.3
 
     def quantize(
         self,
