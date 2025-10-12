@@ -448,6 +448,9 @@ def run_point_endpoint(session_manager: SessionManager, model_info: "ModelInfo")
 # Import chat endpoint from modular implementation
 from .app_chat import run_chat_endpoint
 
+# Import quantization integration
+from .app_quantization import show_quantization_or_inference_menu, run_quantization_mode
+
 
 def run_install_workflow(
     session_manager: SessionManager,
@@ -707,6 +710,50 @@ def main() -> None:
 
     # Show system specs screen
     SystemSpecsScreen.show(system_specs)
+
+    # Show Quantization or Inference menu
+    operation_mode = show_quantization_or_inference_menu()
+    if operation_mode == "quit":
+        logger.info("User quit from operation mode selection")
+        tui.clear_screen()
+        tui.show_message(
+            "Thank you for using VLM/LLM CLI!",
+            title="Goodbye",
+            style="cyan"
+        )
+        return
+    elif operation_mode == "quantization":
+        logger.info("User selected Quantization mode")
+        # Load configuration for quantization
+        LoadingScreen.show("Loading configuration...")
+        try:
+            config = load_config()
+            logger.info("Configuration loaded for quantization mode")
+        except Exception as e:
+            logger.error(f"Config loading failed: {e}")
+            tui.show_error(f"Failed to load configuration: {e}")
+            return
+
+        # Initialize session manager for quantization
+        LoadingScreen.show("Initializing session...")
+        session_manager = SessionManager(config, system_specs)
+        _global_session_manager = session_manager
+
+        # Run quantization mode
+        continue_app = run_quantization_mode(session_manager)
+        if not continue_app:
+            # User quit from quantization mode
+            logger.info("User quit from quantization mode")
+            tui.clear_screen()
+            tui.show_message(
+                "Thank you for using VLM/LLM CLI!",
+                title="Goodbye",
+                style="cyan"
+            )
+        return
+
+    # User selected Inference mode - continue with normal flow
+    logger.info("User selected Inference mode")
 
     # Load configuration
     LoadingScreen.show("Loading configuration...")

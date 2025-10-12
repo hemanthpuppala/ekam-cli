@@ -6,7 +6,7 @@ from loguru import logger
 
 from ..cli.tui_manager import tui
 from ..quantization.manager import QuantizationManager
-from ..quantization.workflow import run_quantization_workflow, show_background_jobs_monitor
+from ..quantization.ui import run_quantization_workflow, show_background_jobs_monitor
 from ..services.session import SessionManager
 
 
