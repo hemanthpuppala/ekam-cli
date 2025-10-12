@@ -34,11 +34,11 @@ def run_quantization_workflow(
         # Step 2: Get all available models
         all_models = model_discovery.discover_all_models()
 
-        # Step 3: Filter to quantizable models (GGUF only for Phase 1)
+        # Step 3: Filter to quantizable models (GGUF and HuggingFace)
         quantizable_models = quantization_manager.get_quantizable_models(all_models)
 
-        # Step 4: Select model
-        selected_model = select_model_to_quantize(quantizable_models)
+        # Step 4: Select model (pass manager for manual path compatibility checking)
+        selected_model = select_model_to_quantize(quantizable_models, quantization_manager)
         if not selected_model:
             logger.info("User cancelled model selection")
             return

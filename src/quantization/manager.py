@@ -37,7 +37,9 @@ class QuantizationManager:
     def get_quantizable_models(self, all_models: list[ModelInfo]) -> list[ModelInfo]:
         """Filter models that can be quantized.
 
-        For Phase 1, only GGUF models are supported.
+        Supports:
+        - GGUF models: Direct quantization (Q4/Q5/Q6/Q8)
+        - HuggingFace models: Via GGUF conversion or generic quantization (FP16/INT8/INT4)
 
         Args:
             all_models: List of all available models
@@ -49,11 +51,14 @@ class QuantizationManager:
 
         quantizable = []
         for model in all_models:
-            # Phase 1: Only GGUF models
+            # GGUF models: Direct quantization
             if model.provider == ProviderType.GGUF:
                 quantizable.append(model)
+            # HuggingFace models: GGUF conversion + quantization OR generic quantization
+            elif model.provider == ProviderType.HUGGINGFACE:
+                quantizable.append(model)
 
-        logger.info(f"Found {len(quantizable)} quantizable models (GGUF only)")
+        logger.info(f"Found {len(quantizable)} quantizable models (GGUF: {sum(1 for m in quantizable if m.provider == ProviderType.GGUF)}, HF: {sum(1 for m in quantizable if m.provider == ProviderType.HUGGINGFACE)})")
         return quantizable
 
     def get_recommendations(
@@ -70,13 +75,26 @@ class QuantizationManager:
         Returns:
             List of recommendations
         """
-        # Phase 1: Only GGUF recommendations
-        return get_quantization_recommendations(
-            model_info=model_info,
-            system_specs=self.system_specs,
-            method_family="GGUF",
-            use_gpu=use_gpu,
-        )
+        from ..models.provider import ProviderType
+
+        # GGUF models: Direct quantization
+        if model_info.provider == ProviderType.GGUF:
+            return get_quantization_recommendations(
+                model_info=model_info,
+                system_specs=self.system_specs,
+                method_family="GGUF",
+                use_gpu=use_gpu,
+            )
+        # HuggingFace models: Generic quantization (FP16/INT8/INT4)
+        elif model_info.provider == ProviderType.HUGGINGFACE:
+            return get_quantization_recommendations(
+                model_info=model_info,
+                system_specs=self.system_specs,
+                method_family="Generic",
+                use_gpu=use_gpu,
+            )
+
+        return []
 
     def create_task(
         self,
@@ -228,3 +246,73 @@ class QuantizationManager:
             return [QuantizationModule.LLAMA_CPP]
 
         return []
+
+    def check_model_path_compatibility(self, model_path: Path) -> dict:
+        """Check if a model path is compatible with quantization.
+
+        Args:
+            model_path: Path to model directory or file
+
+        Returns:
+            Dictionary with compatibility info:
+            {
+                "compatible": bool,
+                "reason": str,
+                "model_type": str,  # "gguf", "huggingface", "unknown"
+                "can_convert_to_gguf": bool,
+                "can_quantize_generic": bool,
+                "available_methods": list[str]
+            }
+        """
+        result = {
+            "compatible": False,
+            "reason": "",
+            "model_type": "unknown",
+            "can_convert_to_gguf": False,
+            "can_quantize_generic": False,
+            "available_methods": []
+        }
+
+        # Check if path exists
+        if not model_path.exists():
+            result["reason"] = f"Path does not exist: {model_path}"
+            return result
+
+        # Check if it's a GGUF file
+        if model_path.is_file() and model_path.suffix == ".gguf":
+            result["compatible"] = True
+            result["model_type"] = "gguf"
+            result["can_quantize_generic"] = False
+            result["can_convert_to_gguf"] = False
+            result["available_methods"] = ["GGUF Quantization (Q4/Q5/Q6/Q8)"]
+            result["reason"] = "GGUF model - can be quantized directly"
+            return result
+
+        # Check if it's a HuggingFace model directory
+        if model_path.is_dir():
+            # Look for HF model files
+            has_safetensors = list(model_path.glob("*.safetensors")) or list(model_path.glob("model.safetensors*"))
+            has_bin = list(model_path.glob("*.bin")) or list(model_path.glob("pytorch_model*.bin"))
+            has_config = (model_path / "config.json").exists()
+
+            # HuggingFace models typically have model files (.safetensors or .bin)
+            # config.json is nice to have but not strictly required for quantization
+            if has_safetensors or has_bin:
+                result["compatible"] = True
+                result["model_type"] = "huggingface"
+                result["can_convert_to_gguf"] = True
+                result["can_quantize_generic"] = True
+                result["available_methods"] = [
+                    "Generic Quantization (FP16/INT8/INT4)",
+                    "GGUF Conversion → GGUF Quantization (Q4/Q5/Q6/Q8)"
+                ]
+
+                if has_config:
+                    result["reason"] = "HuggingFace model - can be quantized generically or converted to GGUF"
+                else:
+                    result["reason"] = "HuggingFace model (no config.json found, but model files detected) - can be quantized generically or converted to GGUF"
+
+                return result
+
+        result["reason"] = "Not a recognized model format (expected GGUF file or HuggingFace directory with safetensors/bin files)"
+        return result

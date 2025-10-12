@@ -1,15 +1,17 @@
 """UI components for quantization workflow."""
 
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 
 from ...cli.prompts import UserExitException, prompt_yes_no
 from ...cli.tui_manager import tui
 from ...models.model import ModelInfo
-from ..manager import QuantizationManager
 from ..models import QuantizationModule, QuantizationRecommendation, QuantizationType
+
+if TYPE_CHECKING:
+    from ..manager import QuantizationManager
 
 
 def show_quantization_intro():
@@ -41,11 +43,13 @@ lower-precision numbers (4-bit, 5-bit, 6-bit, 8-bit instead of 16/32-bit).
 
 def select_model_to_quantize(
     quantizable_models: list[ModelInfo],
+    quantization_manager: Optional["QuantizationManager"] = None,
 ) -> Optional[ModelInfo]:
     """Show model selection menu.
 
     Args:
         quantizable_models: List of models that can be quantized
+        quantization_manager: Manager for compatibility checking
 
     Returns:
         Selected model, or None if user wants to go back
@@ -55,56 +59,205 @@ def select_model_to_quantize(
     """
     tui.clear_screen()
 
-    if not quantizable_models:
+    # Show available models (even if empty, show manual option)
+    tui.console.print("[bold cyan]Select Model to Quantize[/bold cyan]\n")
+
+    if quantizable_models:
+        from ..models.endpoints import ProviderType
+
+        # Group by provider
+        gguf_models = [m for m in quantizable_models if m.provider == ProviderType.GGUF]
+        hf_models = [m for m in quantizable_models if m.provider == ProviderType.HUGGINGFACE]
+
+        if gguf_models:
+            tui.console.print("[dim]GGUF models (direct quantization):[/dim]\n")
+            for idx, model in enumerate(gguf_models, 1):
+                size_str = f"{model.size_gb:.1f}GB" if model.size_gb else "Unknown size"
+                tui.console.print(f"  [{idx}] [cyan]{model.name}[/cyan] ({size_str})")
+                tui.console.print(f"      [dim]Provider: {model.provider}[/dim]")
+
+        if hf_models:
+            tui.console.print("\n[dim]HuggingFace models (generic quantization or GGUF conversion):[/dim]\n")
+            start_idx = len(gguf_models) + 1
+            for idx, model in enumerate(hf_models, start_idx):
+                size_str = f"{model.size_gb:.1f}GB" if model.size_gb else "Unknown size"
+                tui.console.print(f"  [{idx}] [cyan]{model.name}[/cyan] ({size_str})")
+                tui.console.print(f"      [dim]Provider: {model.provider}[/dim]")
+
+        tui.console.print(f"\n  [m] [yellow]Manually specify model path[/yellow]")
+        tui.console.print(f"  [b] [dim]Go back[/dim]")
+        tui.console.print()
+
+        while True:
+            choice = tui.prompt(f"Choose [1-{len(quantizable_models)}/m/b]:", style="cyan").strip().lower()
+
+            if choice in ["b", "back", "exit", "quit"]:
+                return None
+
+            if choice == "m":
+                return handle_manual_model_path(quantization_manager)
+
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(quantizable_models):
+                    return quantizable_models[idx - 1]
+                else:
+                    tui.show_error(f"Invalid choice. Enter 1-{len(quantizable_models)}, 'm', or 'b'")
+            except ValueError:
+                tui.show_error("Invalid input. Enter a number, 'm', or 'b'")
+    else:
+        # No models found - show manual option only
         tui.show_panel(
-            """[bold yellow]No Quantizable Models Found[/bold yellow]
+            """[bold yellow]No Quantizable Models in Registry[/bold yellow]
 
-Currently, only [cyan]GGUF[/cyan] models can be quantized.
+No GGUF or HuggingFace models found in your model registry.
 
-[bold]To add quantizable models:[/bold]
-  1. Load a GGUF model using the main menu
-  2. Or install a GGUF model first
+[bold]Options:[/bold]
+  • Use the manual path option below to specify a model
+  • Or install models first using the main menu
 
-[dim]Press Enter to go back...[/dim]""",
+[dim]Supported formats:[/dim]
+  • GGUF files (.gguf)
+  • HuggingFace model directories (with config.json + model files)""",
             title="No Models Available",
             border_style="yellow",
         )
-        tui.prompt("", style="dim")
-        return None
 
-    # Show model list
-    tui.console.print("[bold cyan]Select Model to Quantize[/bold cyan]\n")
-    tui.console.print("[dim]Available GGUF models:[/dim]\n")
+        tui.console.print(f"\n  [m] [yellow]Manually specify model path[/yellow]")
+        tui.console.print(f"  [b] [dim]Go back[/dim]")
+        tui.console.print()
 
-    for idx, model in enumerate(quantizable_models, 1):
-        size_str = f"{model.size_gb:.1f}GB" if model.size_gb else "Unknown size"
-        tui.console.print(f"  [{idx}] [cyan]{model.name}[/cyan] ({size_str})")
-        tui.console.print(f"      [dim]Provider: {model.provider} | ID: {model.model_id}[/dim]")
+        while True:
+            choice = tui.prompt("Choose [m/b]:", style="cyan").strip().lower()
 
-    tui.console.print(f"\n  [i] [yellow]Install a new GGUF model[/yellow]")
-    tui.console.print(f"  [b] [dim]Go back[/dim]")
-    tui.console.print()
+            if choice in ["b", "back", "exit", "quit"]:
+                return None
+
+            if choice == "m":
+                return handle_manual_model_path(quantization_manager)
+
+            tui.show_error("Invalid choice. Enter 'm' or 'b'")
+
+
+def handle_manual_model_path(quantization_manager: Optional["QuantizationManager"]) -> Optional[ModelInfo]:
+    """Handle manual model path input with compatibility checking.
+
+    Args:
+        quantization_manager: Manager for compatibility checking
+
+    Returns:
+        ModelInfo if compatible, None otherwise
+    """
+    from pathlib import Path as PathLib
+    from ..models.endpoints import ProviderType
+
+    tui.clear_screen()
+    tui.show_panel(
+        """[bold cyan]Manual Model Path[/bold cyan]
+
+Provide the path to a model directory or file.
+
+[bold]Supported formats:[/bold]
+  • GGUF files: /path/to/model.gguf
+  • HuggingFace directories: /path/to/model/ (with config.json)
+
+[bold]Examples:[/bold]
+  • ~/models/llama-7b-q4.gguf
+  • ~/models/minicpm-2b-fp16/
+  • /Users/name/.cache/huggingface/hub/models--model-name/
+
+[dim]Press Enter with empty input to cancel[/dim]""",
+        title="Manual Path Input",
+        border_style="cyan",
+    )
 
     while True:
-        choice = tui.prompt(f"Choose [1-{len(quantizable_models)}/i/b]:", style="cyan").strip().lower()
+        model_path_str = tui.prompt("Model path:", style="cyan").strip()
 
-        if choice in ["b", "back", "exit", "quit"]:
+        if not model_path_str:
             return None
 
-        if choice == "i":
-            # TODO: Redirect to model installation
-            tui.console.print("[yellow]Model installation not yet connected. Use main menu for now.[/yellow]")
-            tui.prompt("Press Enter to continue...", style="dim")
-            continue
+        # Expand ~ and resolve path
+        model_path = PathLib(model_path_str).expanduser().resolve()
 
-        try:
-            idx = int(choice)
-            if 1 <= idx <= len(quantizable_models):
-                return quantizable_models[idx - 1]
+        # Check compatibility
+        if not quantization_manager:
+            tui.show_error("Quantization manager not available")
+            return None
+
+        tui.console.print("\n[dim]Checking compatibility...[/dim]\n")
+
+        compat = quantization_manager.check_model_path_compatibility(model_path)
+
+        # Show compatibility results
+        tui.clear_screen()
+        if compat["compatible"]:
+            # Compatible - show options
+            methods_str = "\n  • ".join(compat["available_methods"])
+
+            tui.show_panel(
+                f"""[bold green]✓ Compatible Model Found[/bold green]
+
+[bold]Path:[/bold] {model_path}
+[bold]Type:[/bold] {compat["model_type"].upper()}
+
+[bold]Reason:[/bold]
+{compat["reason"]}
+
+[bold]Available Quantization Methods:[/bold]
+  • {methods_str}
+
+[dim]Proceeding to quantization options...[/dim]""",
+                title="Compatibility Check",
+                border_style="green",
+            )
+            tui.prompt("Press Enter to continue...", style="dim")
+
+            # Create ModelInfo for this manual path
+            file_size = 0
+            if model_path.is_file():
+                file_size = model_path.stat().st_size
             else:
-                tui.show_error(f"Invalid choice. Enter 1-{len(quantizable_models)}, 'i', or 'b'")
-        except ValueError:
-            tui.show_error("Invalid input. Enter a number, 'i', or 'b'")
+                # Sum all files in directory
+                file_size = sum(f.stat().st_size for f in model_path.rglob("*") if f.is_file())
+
+            size_gb = file_size / (1024 ** 3)
+
+            # Determine provider type
+            provider = ProviderType.GGUF if compat["model_type"] == "gguf" else ProviderType.HUGGINGFACE
+
+            # Create ModelInfo
+            manual_model = ModelInfo(
+                model_id=f"manual/{model_path.name}",
+                name=f"{model_path.name} (manual)",
+                provider=provider,
+                model_type="llm",  # Assume LLM for now
+                size_gb=size_gb,
+                file_path=str(model_path),
+                compatibility="perfect_fit",  # Will be rechecked by system
+                is_installed=True,
+                metadata={"manual_path": True}
+            )
+
+            return manual_model
+        else:
+            # Not compatible - show reason
+            tui.show_panel(
+                f"""[bold red]✗ Incompatible Model[/bold red]
+
+[bold]Path:[/bold] {model_path}
+
+[bold]Reason:[/bold]
+{compat["reason"]}
+
+[dim]Press Enter to try again or 'b' to go back[/dim]""",
+                title="Compatibility Check Failed",
+                border_style="red",
+            )
+
+            retry = tui.prompt("Try again? [y/n]:", style="yellow").strip().lower()
+            if retry not in ["y", "yes"]:
+                return None
 
 
 def ask_gpu_preference() -> bool:
