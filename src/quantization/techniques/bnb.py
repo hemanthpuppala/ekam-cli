@@ -47,8 +47,9 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             List of supported types
         """
         return [
-            QuantizationType.BNB_4BIT,
             QuantizationType.BNB_8BIT,
+            QuantizationType.BNB_4BIT_NF4,
+            QuantizationType.BNB_4BIT_FP4,
         ]
 
     def quantize(

@@ -12,6 +12,11 @@ from ..models.model import ModelInfo
 class QuantizationType(Enum):
     """Available quantization types."""
 
+    # Generic/Standard quantizations (HuggingFace/PyTorch)
+    FP16 = "fp16"  # Half precision (float16)
+    INT8 = "int8"  # 8-bit integer quantization
+    INT4 = "int4"  # 4-bit integer quantization
+
     # GGUF quantizations (llama.cpp)
     GGUF_Q4_K_M = "q4_k_m"
     GGUF_Q4_K_S = "q4_k_s"
@@ -23,6 +28,7 @@ class QuantizationType(Enum):
     # GPTQ quantizations (GPU-optimized)
     GPTQ_4BIT = "gptq_4bit"
     GPTQ_3BIT = "gptq_3bit"
+    GPTQ_8BIT = "gptq_8bit"
 
     # AWQ quantizations (better quality than GPTQ)
     AWQ_4BIT = "awq_4bit"
@@ -30,22 +36,33 @@ class QuantizationType(Enum):
     # BitsAndBytes quantizations (HuggingFace integrated)
     BNB_8BIT = "bnb_8bit"
     BNB_4BIT_NF4 = "bnb_4bit_nf4"
+    BNB_4BIT_FP4 = "bnb_4bit_fp4"
 
     @property
     def display_name(self) -> str:
         """Human-readable name."""
         names = {
+            # Generic
+            self.FP16: "FP16 - Half Precision",
+            self.INT8: "INT8 - 8-bit Integer",
+            self.INT4: "INT4 - 4-bit Integer",
+            # GGUF
             self.GGUF_Q4_K_M: "Q4_K_M - 4-bit Medium",
             self.GGUF_Q4_K_S: "Q4_K_S - 4-bit Small",
             self.GGUF_Q5_K_M: "Q5_K_M - 5-bit Medium",
             self.GGUF_Q5_K_S: "Q5_K_S - 5-bit Small",
             self.GGUF_Q6_K: "Q6_K - 6-bit",
             self.GGUF_Q8_0: "Q8_0 - 8-bit",
+            # GPTQ
+            self.GPTQ_8BIT: "GPTQ 8-bit",
             self.GPTQ_4BIT: "GPTQ 4-bit",
             self.GPTQ_3BIT: "GPTQ 3-bit",
+            # AWQ
             self.AWQ_4BIT: "AWQ 4-bit",
+            # BitsAndBytes
             self.BNB_8BIT: "BitsAndBytes 8-bit",
             self.BNB_4BIT_NF4: "BitsAndBytes 4-bit NF4",
+            self.BNB_4BIT_FP4: "BitsAndBytes 4-bit FP4",
         }
         return names.get(self, self.value)
 
@@ -54,6 +71,8 @@ class QuantizationType(Enum):
         """File extension for this quantization type."""
         if self.value.startswith("q"):  # GGUF
             return ".gguf"
+        elif self.value in ["fp16", "int8", "int4"]:  # Generic PyTorch/HF
+            return ".safetensors"
         elif "gptq" in self.value:
             return ".safetensors"
         elif "awq" in self.value:
@@ -63,8 +82,10 @@ class QuantizationType(Enum):
 
     @property
     def method_family(self) -> str:
-        """Quantization method family (GGUF, GPTQ, AWQ, BNB)."""
-        if self.value.startswith("q"):
+        """Quantization method family (Generic, GGUF, GPTQ, AWQ, BNB)."""
+        if self.value in ["fp16", "int8", "int4"]:
+            return "Generic"
+        elif self.value.startswith("q"):
             return "GGUF"
         elif "gptq" in self.value:
             return "GPTQ"
@@ -77,6 +98,7 @@ class QuantizationType(Enum):
 class QuantizationModule(Enum):
     """Quantization modules/tools."""
 
+    PYTORCH = "pytorch"  # Generic PyTorch/HuggingFace quantization
     LLAMA_CPP = "llama_cpp"
     AUTO_GPTQ = "auto_gptq"
     AUTO_AWQ = "auto_awq"
@@ -86,6 +108,7 @@ class QuantizationModule(Enum):
     def display_name(self) -> str:
         """Human-readable name."""
         names = {
+            self.PYTORCH: "PyTorch/Transformers",
             self.LLAMA_CPP: "llama.cpp",
             self.AUTO_GPTQ: "AutoGPTQ",
             self.AUTO_AWQ: "AutoAWQ",
@@ -97,6 +120,7 @@ class QuantizationModule(Enum):
     def pip_package(self) -> str:
         """PyPI package name."""
         packages = {
+            self.PYTORCH: "torch",
             self.LLAMA_CPP: "llama-cpp-python",
             self.AUTO_GPTQ: "auto-gptq",
             self.AUTO_AWQ: "autoawq",

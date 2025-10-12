@@ -47,6 +47,7 @@ class GPTQQuantizer(BaseQuantizer):
             List of supported types
         """
         return [
+            QuantizationType.GPTQ_8BIT,
             QuantizationType.GPTQ_4BIT,
             QuantizationType.GPTQ_3BIT,
         ]

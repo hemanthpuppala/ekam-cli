@@ -9,7 +9,14 @@ from .models import (
 )
 from .manager import QuantizationManager
 from .core import BackgroundJobManager, get_quantization_recommendations, check_can_quantize_multiple
-from .techniques import BaseQuantizer, GGUFQuantizer
+from .techniques import (
+    BaseQuantizer,
+    GenericQuantizer,
+    GGUFQuantizer,
+    GPTQQuantizer,
+    AWQQuantizer,
+    BitsAndBytesQuantizer,
+)
 
 __all__ = [
     # Data models
@@ -25,5 +32,9 @@ __all__ = [
     "check_can_quantize_multiple",
     # Techniques
     "BaseQuantizer",
+    "GenericQuantizer",
     "GGUFQuantizer",
+    "GPTQQuantizer",
+    "AWQQuantizer",
+    "BitsAndBytesQuantizer",
 ]

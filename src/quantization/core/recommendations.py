@@ -26,7 +26,9 @@ def get_quantization_recommendations(
     """
     recommendations = []
 
-    if method_family == "GGUF":
+    if method_family == "Generic":
+        recommendations = _get_generic_recommendations(model_info, system_specs, use_gpu)
+    elif method_family == "GGUF":
         recommendations = _get_gguf_recommendations(model_info, system_specs)
     elif method_family == "GPTQ":
         recommendations = _get_gptq_recommendations(model_info, system_specs, use_gpu)
@@ -41,6 +43,85 @@ def get_quantization_recommendations(
     # Mark the best one as recommended
     if recommendations:
         recommendations[0].is_recommended = True
+
+    return recommendations
+
+
+def _get_generic_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs, use_gpu: bool
+) -> list[QuantizationRecommendation]:
+    """Get generic quantization recommendations (FP16, INT8, INT4)."""
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    # FP16: Half precision (50% size reduction, minimal quality loss)
+    fp16_size = original_size_gb * 0.5
+    fp16_time = original_size_gb * 1.0  # Fast conversion
+
+    reason_fp16 = "FP16 (Half Precision): Simple dtype conversion. "
+    if fp16_size < system_specs.memory.available_gb * 0.7:
+        reason_fp16 += f"Fits in RAM ({fp16_size:.1f}GB / {system_specs.memory.available_gb:.1f}GB). "
+    reason_fp16 += "Minimal quality loss, widely supported."
+
+    recommendations.append(
+        QuantizationRecommendation(
+            quant_type=QuantizationType.FP16,
+            module=QuantizationModule.PYTORCH,
+            reason=reason_fp16,
+            estimated_size_gb=fp16_size,
+            estimated_time_minutes=fp16_time,
+            quality_score=10,  # No quality loss
+            speed_score=10,  # Very fast
+            best_for="Quick size reduction, all devices",
+            requires_gpu=False,
+        )
+    )
+
+    # INT8: 8-bit integer (75% size reduction, small quality loss)
+    int8_size = original_size_gb * 0.25
+    int8_time = original_size_gb * 2.0  # Requires calibration
+
+    reason_int8 = "INT8 Quantization: 8-bit integer weights. "
+    if int8_size < system_specs.memory.available_gb * 0.7:
+        reason_int8 += f"Fits in RAM ({int8_size:.1f}GB / {system_specs.memory.available_gb:.1f}GB). "
+    reason_int8 += "Good balance of size and quality."
+
+    recommendations.append(
+        QuantizationRecommendation(
+            quant_type=QuantizationType.INT8,
+            module=QuantizationModule.PYTORCH,
+            reason=reason_int8,
+            estimated_size_gb=int8_size,
+            estimated_time_minutes=int8_time,
+            quality_score=9,  # Minimal loss
+            speed_score=9,  # Fast inference
+            best_for="Production, edge devices",
+            requires_gpu=False,
+        )
+    )
+
+    # INT4: 4-bit integer (87.5% size reduction, moderate quality loss)
+    int4_size = original_size_gb * 0.125
+    int4_time = original_size_gb * 3.0  # More complex quantization
+
+    reason_int4 = "INT4 Quantization: 4-bit integer weights. "
+    if int4_size < system_specs.memory.available_gb * 0.7:
+        reason_int4 += f"Fits in RAM ({int4_size:.1f}GB / {system_specs.memory.available_gb:.1f}GB). "
+    reason_int4 += "Maximum compression, acceptable quality."
+
+    recommendations.append(
+        QuantizationRecommendation(
+            quant_type=QuantizationType.INT4,
+            module=QuantizationModule.PYTORCH,
+            reason=reason_int4,
+            estimated_size_gb=int4_size,
+            estimated_time_minutes=int4_time,
+            quality_score=8,  # Moderate loss
+            speed_score=10,  # Very fast
+            best_for="Memory-constrained devices, Raspberry Pi",
+            requires_gpu=False,
+        )
+    )
 
     return recommendations
 
@@ -138,6 +219,7 @@ def _get_gptq_recommendations(
     original_size_gb = model_info.size_gb
 
     gptq_configs = [
+        (QuantizationType.GPTQ_8BIT, 0.5, 9, 8, "GPU inference, high quality"),
         (QuantizationType.GPTQ_4BIT, 0.35, 8, 9, "GPU inference, good quality"),
         (QuantizationType.GPTQ_3BIT, 0.25, 6, 10, "GPU inference, maximum compression"),
     ]
@@ -216,7 +298,8 @@ def _get_bnb_recommendations(
 
     bnb_configs = [
         (QuantizationType.BNB_8BIT, 0.5, 9, 8, "HuggingFace, good quality", False),
-        (QuantizationType.BNB_4BIT_NF4, 0.35, 8, 9, "HuggingFace, balanced", True),
+        (QuantizationType.BNB_4BIT_NF4, 0.35, 8, 9, "HuggingFace, NormalFloat4 (recommended)", True),
+        (QuantizationType.BNB_4BIT_FP4, 0.35, 7, 10, "HuggingFace, Float4 (faster)", True),
     ]
 
     for quant_type, factor, quality, speed, best_for, requires_gpu in bnb_configs:

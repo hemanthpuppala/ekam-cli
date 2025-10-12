@@ -9,6 +9,10 @@ from typing import Callable, Dict, Optional
 from loguru import logger
 
 from ..techniques.gguf import GGUFQuantizer
+from ..techniques.generic import GenericQuantizer
+from ..techniques.gptq import GPTQQuantizer
+from ..techniques.awq import AWQQuantizer
+from ..techniques.bnb import BitsAndBytesQuantizer
 from ..models import QuantizationTask, TaskStatus
 
 
@@ -27,7 +31,11 @@ class BackgroundJobManager:
         self.lock = threading.Lock()
 
         # Initialize quantizers
+        self.generic_quantizer = GenericQuantizer()
         self.gguf_quantizer = GGUFQuantizer()
+        self.gptq_quantizer = GPTQQuantizer()
+        self.awq_quantizer = AWQQuantizer()
+        self.bnb_quantizer = BitsAndBytesQuantizer()
 
         # Load saved state
         self._load_state()
@@ -63,11 +71,21 @@ class BackgroundJobManager:
                         progress_callback(task.task_id, progress, eta)
 
                 # Execute quantization based on method family
-                if task.quant_type.method_family == "GGUF":
+                method_family = task.quant_type.method_family
+
+                if method_family == "Generic":
+                    success = self.generic_quantizer.quantize(task, progress_wrapper)
+                elif method_family == "GGUF":
                     success = self.gguf_quantizer.quantize(task, progress_wrapper)
+                elif method_family == "GPTQ":
+                    success = self.gptq_quantizer.quantize(task, progress_wrapper)
+                elif method_family == "AWQ":
+                    success = self.awq_quantizer.quantize(task, progress_wrapper)
+                elif method_family == "BitsAndBytes":
+                    success = self.bnb_quantizer.quantize(task, progress_wrapper)
                 else:
                     task.status = TaskStatus.FAILED
-                    task.error = f"Quantization method {task.quant_type.method_family} not yet implemented"
+                    task.error = f"Quantization method {method_family} not yet implemented"
                     success = False
 
                 # Update completion time
