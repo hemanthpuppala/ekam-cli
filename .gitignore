@@ -48,6 +48,13 @@ results/
 logs/
 *.log
 
+# Development & Documentation
+specs/
+CLAUDE.md
+PRODUCTION_CHAT_TEMPLATES.md
+.specify/
+test_images/
+
 # Model Caches (large files)
 *.gguf
 *.bin
