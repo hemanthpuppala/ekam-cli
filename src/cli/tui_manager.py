@@ -2,9 +2,9 @@
 
 import os
 import shutil
-from typing import Callable, Optional
+from typing import Optional
 
-from rich.console import Console, Group
+from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -45,7 +45,7 @@ class TUIManager:
         """
         self.clear_screen()
 
-        width, height = self.get_terminal_size()
+        width, _ = self.get_terminal_size()
 
         # Create panel with dynamic sizing
         panel = Panel(

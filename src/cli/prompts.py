@@ -1,8 +1,7 @@
 """Input validation utilities for user prompts."""
 
+from datetime import datetime
 from pathlib import Path
-
-from rich.prompt import Confirm, Prompt
 
 from .tui_manager import tui
 
@@ -447,7 +446,7 @@ def select_or_create_session(
             tui.show_error(f"Invalid input. Enter a number (1-{len(existing_sessions)}) or 'n'")
 
 
-def _format_time_ago(dt: "datetime") -> str:
+def _format_time_ago(dt: datetime) -> str:
     """Format datetime as human-readable 'time ago' string.
 
     Args:
@@ -456,8 +455,6 @@ def _format_time_ago(dt: "datetime") -> str:
     Returns:
         Human-readable string like "2 minutes ago"
     """
-    from datetime import datetime
-
     now = datetime.now()
     diff = (now - dt).total_seconds()
 
