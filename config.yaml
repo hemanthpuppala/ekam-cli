@@ -18,6 +18,11 @@ providers:
     models_dir: "~/models/gguf/"
     device_preference: ["cuda", "mps", "cpu"]
 
+  quantized:
+    enabled: true
+    models_dir: "results/quantizations/"
+    device_preference: ["cuda", "mps", "cpu"]
+
 system:
   max_image_dimension: 1920
   memory_safety_margin_gb: 1.0

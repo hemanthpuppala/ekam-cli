@@ -92,6 +92,9 @@ class BackgroundJobManager:
                 if success:
                     task.completed_at = datetime.now()
                     logger.info(f"Task {task.task_id} completed successfully")
+
+                    # Save quantization metadata
+                    self._save_quantization_metadata(task)
                 else:
                     logger.error(f"Task {task.task_id} failed: {task.error}")
 
@@ -268,3 +271,46 @@ class BackgroundJobManager:
 
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
+
+    def _save_quantization_metadata(self, task: QuantizationTask):
+        """Save metadata file for quantized model.
+
+        This allows the QuantizedProvider to discover and display info about
+        quantized models.
+
+        Args:
+            task: Completed quantization task
+        """
+        try:
+            metadata = {
+                "quant_type": task.quant_type.value,
+                "quant_display_name": task.quant_type.display_name,
+                "method_family": task.quant_type.method_family,
+                "module": task.module.value,
+                "original_model": task.model_info.model_id,
+                "original_model_name": task.model_info.name,
+                "original_provider": str(task.model_info.provider),
+                "original_size_gb": task.model_info.size_gb,
+                "quantized_size_gb": task.output_path.stat().st_size / (1024 ** 3) if task.output_path.exists() else 0,
+                "task_id": task.task_id,
+                "started_at": task.started_at.isoformat() if task.started_at else None,
+                "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                "elapsed_seconds": task.elapsed_seconds,
+                "use_gpu": task.use_gpu,
+            }
+
+            # Determine metadata file path based on output type
+            if task.output_path.is_file():
+                # GGUF file - save metadata as .json next to it
+                metadata_file = task.output_path.with_suffix(".json")
+            else:
+                # Directory (HF format) - save inside directory
+                metadata_file = task.output_path / "quantization_metadata.json"
+
+            with open(metadata_file, "w") as f:
+                json.dump(metadata, f, indent=2)
+
+            logger.info(f"Saved quantization metadata: {metadata_file}")
+
+        except Exception as e:
+            logger.error(f"Failed to save quantization metadata: {e}")

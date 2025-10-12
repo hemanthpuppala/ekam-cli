@@ -38,6 +38,7 @@ from ..models.system import SystemSpecs
 from ..providers.gguf import GGUFProvider
 from ..providers.huggingface import HuggingFaceProvider
 from ..providers.ollama import OllamaProvider
+from ..providers.quantized import QuantizedProvider
 from ..services.session import SessionManager
 from ..utils.ollama_manager import ensure_ollama_running
 from .config_loader import load_config
@@ -807,6 +808,11 @@ def main() -> None:
                 provider = GGUFProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered GGUF provider at {provider_config.models_dir}")
+
+            elif provider_type == ProviderType.QUANTIZED:
+                provider = QuantizedProvider(provider_config, system_specs)
+                session_manager.register_provider(provider_type, provider_config, provider)
+                logger.info(f"Registered Quantized provider at {provider_config.models_dir}")
 
             # LM Studio not yet implemented
             elif provider_type == ProviderType.LM_STUDIO:
