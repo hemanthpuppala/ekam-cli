@@ -2,11 +2,11 @@
 
 from loguru import logger
 
-from ..cli.prompts import UserExitException
-from ..cli.tui_manager import tui
-from ..services.model_discovery import ModelDiscovery
-from .manager import QuantizationManager
-from .ui import (
+from ...cli.prompts import UserExitException
+from ...cli.tui_manager import tui
+from ...services.model_discovery import ModelDiscovery
+from ..manager import QuantizationManager
+from .display import (
     ask_background_mode,
     ask_gpu_preference,
     confirm_quantization,

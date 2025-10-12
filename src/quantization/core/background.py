@@ -8,8 +8,8 @@ from typing import Callable, Dict, Optional
 
 from loguru import logger
 
-from .gguf_quantizer import GGUFQuantizer
-from .models import QuantizationTask, TaskStatus
+from ..techniques.gguf import GGUFQuantizer
+from ..models import QuantizationTask, TaskStatus
 
 
 class BackgroundJobManager:

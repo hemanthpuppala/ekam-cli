@@ -5,11 +5,11 @@ from typing import Optional
 
 from loguru import logger
 
-from ..cli.prompts import UserExitException, prompt_yes_no
-from ..cli.tui_manager import tui
-from ..models.model import ModelInfo
-from .manager import QuantizationManager
-from .models import QuantizationModule, QuantizationRecommendation, QuantizationType
+from ...cli.prompts import UserExitException, prompt_yes_no
+from ...cli.tui_manager import tui
+from ...models.model import ModelInfo
+from ..manager import QuantizationManager
+from ..models import QuantizationModule, QuantizationRecommendation, QuantizationType
 
 
 def show_quantization_intro():

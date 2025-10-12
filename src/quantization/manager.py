@@ -9,9 +9,9 @@ from loguru import logger
 
 from ..models.model import ModelInfo
 from ..models.system import SystemSpecs
-from .background import BackgroundJobManager
+from .core.background import BackgroundJobManager
+from .core.recommendations import get_quantization_recommendations
 from .models import QuantizationModule, QuantizationTask, QuantizationType
-from .recommendations import get_quantization_recommendations
 
 
 class QuantizationManager:
