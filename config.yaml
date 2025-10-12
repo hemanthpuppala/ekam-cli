@@ -1,0 +1,112 @@
+# VLM Testing Configuration
+
+# Model Providers
+providers:
+  ollama:
+    host: "http://localhost:11434"
+    timeout: 300
+
+  huggingface:
+    cache_dir: "~/.cache/huggingface"
+    device: "cuda"  # cuda, cpu, or mps
+    use_fp16: true
+    max_memory: "7GB"
+
+# Available Models
+models:
+  # Ollama Models
+  qwen2vl-3b:
+    provider: ollama
+    name: "qwen2.5vl:3b"
+    size_gb: 3.2
+    capabilities: [qa, caption, detect]
+    description: "Lightweight Qwen2 Vision 3B"
+
+  qwen2vl-7b:
+    provider: ollama
+    name: "qwen2-vl:7b"
+    size_gb: 4.4
+    capabilities: [qa, caption, detect]
+    description: "Qwen2 Vision 7B"
+
+  llama-vision:
+    provider: ollama
+    name: "llama3.2-vision:11b"
+    size_gb: 7.0
+    capabilities: [qa, caption, detect]
+    description: "Llama 3.2 Vision 11B"
+
+  llava-13b:
+    provider: ollama
+    name: "llava:13b"
+    size_gb: 8.0
+    capabilities: [qa, caption, detect]
+    description: "LLaVA 13B"
+
+  # HuggingFace Models (moondream2 disabled due to tokenizer compatibility issues)
+  # moondream2:
+  #   provider: huggingface
+  #   name: "vikhyatk/moondream2"
+  #   size_gb: 1.6
+  #   capabilities: [qa, caption, detect, point]
+  #   description: "Moondream2 - Lightweight 1.6GB VLM"
+  #   special_methods: true  # Has specific API methods
+
+  florence-2:
+    provider: huggingface
+    name: "microsoft/Florence-2-base"
+    size_gb: 0.2
+    capabilities: [qa, caption, detect, point]
+    description: "Florence-2 - Ultra-lightweight 0.2GB"
+
+  blip2:
+    provider: huggingface
+    name: "Salesforce/blip2-opt-2.7b"
+    size_gb: 2.7
+    capabilities: [qa, caption, detect]
+    description: "BLIP-2 2.7B"
+
+# Default Model (change this to your preferred model)
+default_model: qwen2vl-3b
+
+# Inference Parameters
+inference:
+  temperature: 0.3
+  top_p: 0.9
+  top_k: 40
+  max_tokens: 500
+  seed: 42
+
+# Endpoint Configurations
+endpoints:
+  qa:
+    prompt_template: "Question: {question}\nAnswer:"
+    description: "Ask questions about the image"
+
+  caption:
+    prompt_template: "Describe this image in detail."
+    description: "Generate detailed image captions"
+    short_caption_template: "Describe this image briefly in one sentence."
+
+  detect:
+    prompt_template: "Detect and locate all instances of '{object}' in this image. Provide their locations."
+    description: "Detect specific objects in the image"
+
+  point:
+    prompt_template: "Where is the '{object}' in this image? Provide the coordinates."
+    description: "Get coordinates for specific objects"
+
+# Output Configuration
+output:
+  save_results: true
+  results_dir: "./results"
+  timestamp_format: "%Y%m%d_%H%M%S"
+  pretty_print: true
+  show_timing: true
+  show_metadata: true
+
+# Image Processing
+image:
+  max_size: 1920
+  supported_formats: [jpg, jpeg, png, bmp, webp]
+  auto_resize: true
