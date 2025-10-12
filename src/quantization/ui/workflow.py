@@ -4,7 +4,7 @@ from loguru import logger
 
 from ...cli.prompts import UserExitException
 from ...cli.tui_manager import tui
-from ...services.model_discovery import ModelDiscovery
+from ...services.model_discovery import ModelDiscoveryService
 from ..manager import QuantizationManager
 from .display import (
     ask_background_mode,
@@ -18,7 +18,7 @@ from .display import (
 
 
 def run_quantization_workflow(
-    model_discovery: ModelDiscovery,
+    model_discovery: ModelDiscoveryService,
     quantization_manager: QuantizationManager,
 ) -> None:
     """Run the complete quantization workflow.

@@ -2,9 +2,9 @@
 
 from typing import Optional
 
-from ..models.model import ModelInfo
-from ..models.system import SystemSpecs
-from .models import QuantizationModule, QuantizationRecommendation, QuantizationType
+from ...models.model import ModelInfo
+from ...models.system import SystemSpecs
+from ..models import QuantizationModule, QuantizationRecommendation, QuantizationType
 
 
 def get_quantization_recommendations(
