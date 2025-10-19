@@ -1099,6 +1099,21 @@ class ModelMetadataCache:
             self.cache_file.unlink()
         logger.info("Cleared model metadata cache")
 
+    def invalidate_model(self, model_path: str) -> None:
+        """Invalidate (remove) metadata for a specific model from cache.
+
+        This is useful after installing/updating a model to force re-inspection.
+
+        Args:
+            model_path: Path to the model to invalidate
+        """
+        if model_path in self.cache:
+            del self.cache[model_path]
+            self._save_cache()
+            logger.debug(f"Invalidated cache for {model_path}")
+        else:
+            logger.debug(f"Model {model_path} not in cache, nothing to invalidate")
+
     def refresh_all(self, model_paths: list[str], provider: str = "auto") -> None:
         """Refresh metadata for multiple models.
 
