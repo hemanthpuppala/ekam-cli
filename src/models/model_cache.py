@@ -329,11 +329,14 @@ class ModelMetadataCache:
             # Detect model type (LLM, VLM, embedding, etc.)
             model_type = self._detect_model_type(config)
 
-            # Calculate parameter count (NO weight loading!)
-            params_billions = self._calculate_params_from_config(config)
+            # Get snapshot directory for metadata files
+            snapshot_dir = config_path.parent if config_path.parent.name != model_path else config_path.parent
 
-            # Detect quantization
-            quantization = self._detect_quantization_hf(config)
+            # Calculate parameter count - Use accurate methods
+            params_billions = self._get_accurate_param_count(snapshot_dir, config)
+
+            # Detect actual quantization from safetensors (not config)
+            quantization = self._detect_actual_quantization(snapshot_dir, config)
 
             # Extract context length
             context_length = config.get(
@@ -467,14 +470,112 @@ class ModelMetadataCache:
         # Default to LLM
         return "llm"
 
+    def _get_accurate_param_count(self, snapshot_dir: Path, config: dict) -> float:
+        """Get accurate parameter count using best available method.
+
+        Priority:
+        1. safetensors.index.json metadata.total_size (most accurate)
+        2. config.json direct fields (if present)
+        3. Estimation from file sizes (fallback)
+        4. Formula-based estimation (last resort, deprecated)
+
+        Args:
+            snapshot_dir: Path to model snapshot directory
+            config: Loaded config.json
+
+        Returns:
+            Parameter count in billions
+        """
+        # METHOD 1: Check safetensors.index.json (BEST - exact count)
+        index_path = snapshot_dir / "model.safetensors.index.json"
+        if index_path.exists():
+            try:
+                with open(index_path, "r") as f:
+                    index = json.load(f)
+                    total_params = index.get("metadata", {}).get("total_size")
+                    if total_params:
+                        logger.debug(f"Got param count from safetensors index: {total_params / 1e9:.2f}B")
+                        return total_params / 1e9
+            except Exception as e:
+                logger.debug(f"Could not read safetensors index: {e}")
+
+        # METHOD 2: Check config.json for direct count
+        param_fields = ["num_parameters", "_num_parameters", "n_params", "total_params"]
+        for field in param_fields:
+            if field in config and isinstance(config[field], (int, float)):
+                logger.debug(f"Got param count from config.{field}: {config[field] / 1e9:.2f}B")
+                return config[field] / 1e9
+
+        # METHOD 3: Estimate from safetensors file sizes
+        safetensors_files = list(snapshot_dir.glob("*.safetensors"))
+        if safetensors_files:
+            total_size_bytes = sum([f.stat().st_size for f in safetensors_files])
+            total_size_gb = total_size_bytes / (1024**3)
+
+            # Estimate based on typical quantization (assume bf16/fp16 = 2 bytes per param)
+            params_billions = total_size_gb / 2.0
+            logger.debug(f"Estimated params from file size: {params_billions:.2f}B (assuming fp16/bf16)")
+            return params_billions
+
+        # METHOD 4: Formula-based estimation (DEPRECATED - last resort)
+        logger.warning(f"Using deprecated formula-based estimation for {snapshot_dir.name}")
+        return self._calculate_params_from_config(config)
+
+    def _detect_actual_quantization(self, snapshot_dir: Path, config: dict) -> str:
+        """Detect actual quantization from tensor dtypes in safetensors.
+
+        This checks the ACTUAL storage format, not what config claims.
+
+        Args:
+            snapshot_dir: Path to model snapshot directory
+            config: Loaded config.json
+
+        Returns:
+            Quantization type string
+        """
+        # Try to read actual dtype from first safetensors file
+        safetensors_files = list(snapshot_dir.glob("*.safetensors"))
+        if safetensors_files:
+            try:
+                from safetensors import safe_open
+
+                with safe_open(safetensors_files[0], framework="pt", device="cpu") as f:
+                    # Check first tensor's dtype
+                    keys = list(f.keys())
+                    if keys:
+                        first_tensor = f.get_tensor(keys[0])
+                        dtype = str(first_tensor.dtype).replace("torch.", "")
+
+                        # Map torch dtypes to standard quantization names
+                        dtype_map = {
+                            "float32": "fp32",
+                            "float16": "fp16",
+                            "bfloat16": "bf16",
+                            "int8": "int8",
+                            "uint8": "uint8",
+                        }
+
+                        quant = dtype_map.get(dtype, dtype)
+                        logger.debug(f"Detected actual quantization from tensors: {quant}")
+                        return quant
+
+            except Exception as e:
+                logger.debug(f"Could not read safetensors dtype: {e}")
+
+        # Fallback to config-based detection
+        return self._detect_quantization_hf(config)
+
     def _calculate_params_from_config(self, config: dict) -> float:
-        """Calculate parameter count from config (NO model loading!).
+        """Calculate parameter count from config using estimation formula.
+
+        ⚠️ DEPRECATED: This is a rough approximation that fails for modern architectures.
+        Use _get_accurate_param_count() instead.
 
         Args:
             config: Loaded config.json
 
         Returns:
-            Parameter count in billions
+            Parameter count in billions (estimated, may be inaccurate)
         """
         # Try direct field (some models have this)
         if "num_parameters" in config:
