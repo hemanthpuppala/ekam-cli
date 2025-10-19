@@ -85,3 +85,6 @@ htmlcov/
 Thumbs.db
 .DS_Store
 .claude/
+
+# Ignore macOS AppleDouble files
+._*
