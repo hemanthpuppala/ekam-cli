@@ -39,10 +39,13 @@ class ModelInfo(BaseModel):
         default=True, description="False if model is available but not downloaded"
     )
 
-    # Optional extended metadata
+    # Optional extended metadata (from metadata cache)
     architecture: Optional[str] = None  # "llava", "moondream", "llama", etc.
     quantization: Optional[str] = None  # "Q4_K_M", "Q8_0", "fp16", etc.
-    parameter_count: Optional[str] = None  # "7B", "13B", etc.
+    parameter_count: Optional[str] = None  # "7B", "13B", etc. (deprecated, use params_billions)
+    params_billions: Optional[float] = None  # Parameter count in billions (e.g., 3.2, 7.0)
+    ram_gb: Optional[float] = None  # Estimated RAM requirement in GB
+    vram_gb: Optional[float] = None  # Estimated VRAM requirement in GB
 
     @computed_field
     @property
