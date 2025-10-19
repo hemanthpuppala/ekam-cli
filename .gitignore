@@ -56,6 +56,9 @@ PRODUCTION_CHAT_TEMPLATES.md
 .specify/
 test_images/
 
+# External Dependencies
+llama.cpp/
+
 # Model Caches (large files)
 *.gguf
 *.bin
@@ -81,3 +84,4 @@ htmlcov/
 # OS
 Thumbs.db
 .DS_Store
+.claude/

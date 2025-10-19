@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Tuple
 
 from .tui_manager import tui
 
@@ -218,6 +219,23 @@ def prompt_model_name(provider: str = "ollama") -> str:
         tui.console.print("  • [cyan]qwen2.5:7b[/cyan] - Text model (4GB)")
         tui.console.print("\n[dim]See https://ollama.com/library for all models[/dim]\n")
 
+    elif provider.lower() == "gguf":
+        tui.console.print("\n[bold cyan]Install GGUF Models from HuggingFace[/bold cyan]\n")
+        tui.console.print("[bold]Examples:[/bold]")
+        tui.console.print("  • [cyan]TheBloke/Llama-2-7B-GGUF[/cyan] - Llama 2 quantized")
+        tui.console.print("  • [cyan]bartowski/Qwen3-0.6B-GGUF[/cyan] - Qwen3 quantized")
+        tui.console.print("  • [cyan]ai21labs/AI21-Jamba-Reasoning-3B-GGUF[/cyan] - Jamba quantized")
+        tui.console.print("\n[dim]Tip: Copy model IDs from HuggingFace provider list or search on huggingface.co[/dim]")
+        tui.console.print("[dim]Note: Only models with -GGUF suffix will work. Regular models won't install.[/dim]\n")
+
+    elif provider.lower() == "huggingface":
+        tui.console.print("\n[bold]Examples:[/bold]")
+        tui.console.print("  • [cyan]microsoft/DialoGPT-small[/cyan] - Small conversational model")
+        tui.console.print("  • [cyan]Qwen/Qwen3-0.6B[/cyan] - Compact LLM")
+        tui.console.print("  • [cyan]deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B[/cyan] - Reasoning model")
+        tui.console.print("\n[dim]Or install GGUF repos (models ending with -GGUF)[/dim]")
+        tui.console.print("[dim]See https://huggingface.co/models for all models[/dim]\n")
+
     tui.console.print("[dim]Type 'back' or 'q' to cancel[/dim]")
     while True:
         model_name = tui.prompt("Enter model name to install:", style="cyan").strip()
@@ -376,7 +394,7 @@ def select_or_create_session(
     endpoint_name: str,
     existing_sessions: list,
     show_image_path: bool = False
-) -> tuple[str, str | None]:
+) -> Tuple[str, Optional[str]]:
     """Prompt user to select existing session or create new one.
 
     Args:

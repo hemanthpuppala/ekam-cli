@@ -35,12 +35,25 @@ class AWQQuantizer(BaseQuantizer):
         Returns:
             (available, message)
         """
-        # Phase 2: Check for autoawq library
+        # Check for autoawq library
         try:
             import awq
-            return True, "AutoAWQ available"
         except ImportError:
             return False, "AutoAWQ not installed. Run: pip install autoawq"
+
+        # Check if CUDA is available (required for AWQ quantization)
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False, (
+                    "AWQ requires CUDA GPU. "
+                    "Your system doesn't have CUDA available. "
+                    "For CPU/Mac, use Generic quantization (FP16/INT8/INT4) or GGUF instead."
+                )
+        except ImportError:
+            return False, "PyTorch not installed"
+
+        return True, "AutoAWQ available (CUDA detected)"
 
     def get_supported_types(self) -> list[QuantizationType]:
         """Get supported quantization types.
@@ -67,9 +80,14 @@ class AWQQuantizer(BaseQuantizer):
         if model_info.provider != ProviderType.HUGGINGFACE:
             return None
 
-        if model_info.file_path:
-            return Path(model_info.file_path)
+        # Check if model_id is a local path (from ./models directory or manual path)
+        if model_info.model_id:
+            model_path = Path(model_info.model_id)
+            # If it's an absolute path and exists, it's a local model
+            if model_path.exists() and model_path.is_absolute():
+                return model_path
 
+        # model_id is HuggingFace ID - return None (transformers will find it)
         return None
 
     def estimate_output_size(
@@ -103,17 +121,161 @@ class AWQQuantizer(BaseQuantizer):
         Returns:
             True if successful
         """
-        logger.warning("AWQ quantization not yet implemented (Phase 2)")
+        try:
+            from transformers import AutoTokenizer
+            from awq import AutoAWQForCausalLM
 
-        # Phase 2 implementation will:
-        # 1. Load model with transformers
-        # 2. Prepare calibration dataset
-        # 3. Compute activation statistics
-        # 4. Run AWQ quantization with autoawq
-        # 5. Save quantized model
-        # 6. Update progress via callback
+            from ..models import TaskStatus
 
-        from ..models import TaskStatus
-        task.status = TaskStatus.FAILED
-        task.error = "AWQ quantization not yet implemented (Phase 2)"
-        return False
+            task.status = TaskStatus.RUNNING
+            logger.info(f"Starting AWQ {task.quant_type.display_name} quantization")
+
+            # Check if autoawq is available
+            available, message = self.check_availability()
+            if not available:
+                task.status = TaskStatus.FAILED
+                task.error = message
+                logger.error(f"AutoAWQ not available: {message}")
+                return False
+
+            # Update progress: Validating
+            if progress_callback:
+                progress_callback(5.0, None)
+            task.progress = 5.0
+
+            # Get model identifier (can be local path or HF model ID)
+            # For HuggingFace models, use model_id directly - transformers will find cached version
+            model_path = self.get_source_model_path(task.model_info)
+            if model_path and model_path.exists():
+                # Local path exists - use it
+                model_identifier = str(model_path)
+                logger.info(f"Quantizing model from local path: {model_path}")
+            else:
+                # Use model_id (HF will find cached model or download)
+                model_identifier = task.model_info.model_id
+                logger.info(f"Quantizing model using HF model ID: {model_identifier}")
+
+            # Update progress: Configuring
+            if progress_callback:
+                progress_callback(10.0, None)
+            task.progress = 10.0
+
+            logger.info("Configuring AWQ 4-bit quantization")
+
+            # AWQ quantization config
+            quant_config = {
+                "zero_point": True,
+                "q_group_size": 128,
+                "w_bit": 4,
+                "version": "GEMM"
+            }
+
+            # Load tokenizer
+            logger.info("Loading tokenizer...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_identifier,
+                trust_remote_code=True,
+            )
+
+            # Update progress: Loading model
+            if progress_callback:
+                progress_callback(20.0, None)
+            task.progress = 20.0
+
+            # Load model for quantization
+            logger.info("Loading model for AWQ quantization...")
+
+            # Check if model is a VLM
+            from ...models.model import ModelType
+            is_vlm = task.model_info.model_type == ModelType.VLM
+
+            if is_vlm:
+                # VLMs are not well-supported by AutoAWQ
+                # Provide helpful error message
+                raise RuntimeError(
+                    f"AWQ quantization is not well-supported for VLMs.\n\n"
+                    f"Model: {model_identifier}\n"
+                    f"Type: Vision-Language Model (VLM)\n\n"
+                    f"AutoAWQ is designed for pure language models.\n"
+                    f"For VLMs, please use:\n"
+                    f"  • BitsAndBytes 4-bit (BnB 4-bit NF4)\n"
+                    f"  • Generic quantization (FP16/INT8/INT4)\n\n"
+                    f"Go back and select a different quantization method."
+                )
+
+            model = AutoAWQForCausalLM.from_pretrained(
+                model_identifier,
+                trust_remote_code=True,
+            )
+
+            logger.info("Model loaded successfully")
+
+            # Update progress: Preparing calibration data
+            if progress_callback:
+                progress_callback(30.0, None)
+            task.progress = 30.0
+
+            # Prepare simple calibration dataset
+            logger.info("Preparing calibration dataset...")
+            calibration_samples = [
+                "The quick brown fox jumps over the lazy dog.",
+                "Machine learning is a subset of artificial intelligence.",
+                "Python is a high-level programming language.",
+                "The sky is blue and the grass is green.",
+                "Artificial intelligence is transforming the world.",
+                "Deep learning models require large amounts of data.",
+            ]
+
+            # Update progress: Quantizing
+            if progress_callback:
+                progress_callback(40.0, None)
+            task.progress = 40.0
+
+            # Run quantization
+            logger.info("Running AWQ quantization (this may take several minutes)...")
+            model.quantize(
+                tokenizer,
+                quant_config=quant_config,
+                calib_data=calibration_samples,
+            )
+
+            logger.info("Quantization completed")
+
+            # Update progress: Saving
+            if progress_callback:
+                progress_callback(80.0, None)
+            task.progress = 80.0
+
+            # Ensure output directory exists
+            task.output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # For AWQ, we save as a directory (HuggingFace format)
+            output_dir = task.output_path.parent / task.output_path.stem
+            logger.info(f"Saving quantized model to: {output_dir}")
+
+            # Save model and tokenizer
+            model.save_quantized(output_dir)
+            tokenizer.save_pretrained(output_dir)
+
+            # Update task output_path to the directory
+            task.output_path = output_dir
+
+            # Update progress: Complete
+            if progress_callback:
+                progress_callback(100.0, 0)
+            task.progress = 100.0
+            task.status = TaskStatus.COMPLETED
+
+            # Calculate actual size
+            total_size = sum(f.stat().st_size for f in output_dir.rglob("*") if f.is_file())
+            size_gb = total_size / (1024 ** 3)
+
+            logger.info(f"AWQ quantization completed: {output_dir} ({size_gb:.2f}GB)")
+            return True
+
+        except Exception as e:
+            error_msg = f"AWQ quantization failed: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            task.status = TaskStatus.FAILED
+            task.error = error_msg
+            return False

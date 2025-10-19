@@ -1,9 +1,10 @@
 """OSC 8 hyperlink generation for clickable file paths in terminal."""
 
 from pathlib import Path
+from typing import Optional
 
 
-def make_hyperlink(path: Path, text: str | None = None) -> str:
+def make_hyperlink(path: Path, text: Optional[str] = None) -> str:
     """Generate OSC 8 hyperlink for clickable terminal paths.
 
     Supported terminals: iTerm2, WezTerm, kitty, Windows Terminal
@@ -26,7 +27,7 @@ def make_hyperlink(path: Path, text: str | None = None) -> str:
     return f"\033]8;;file://{abs_path}\033\\{text}\033]8;;\033\\"
 
 
-def make_hyperlink_fallback(path: Path, text: str | None = None) -> str:
+def make_hyperlink_fallback(path: Path, text: Optional[str] = None) -> str:
     """Generate hyperlink with graceful fallback for non-supporting terminals.
 
     Args:

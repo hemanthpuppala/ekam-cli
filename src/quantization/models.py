@@ -170,6 +170,8 @@ class QuantizationTask:
     error: Optional[str] = None
     use_gpu: bool = False
     background: bool = False
+    intermediate_file: Optional[Path] = None  # For GGUF: FP16 intermediate file
+    vlm_components: Optional[str] = None  # For VLMs: "vision", "language", "both", or None
 
     @property
     def elapsed_seconds(self) -> Optional[float]:
@@ -195,7 +197,13 @@ class QuantizationTask:
             "task_id": self.task_id,
             "model_id": self.model_info.model_id,
             "model_name": self.model_info.name,
+            "model_type": str(self.model_info.model_type) if hasattr(self.model_info, 'model_type') else "unknown",
+            "model_size_gb": self.model_info.size_gb if hasattr(self.model_info, 'size_gb') else 0.0,
             "provider": str(self.model_info.provider),
+            # Save ModelInfo required fields for Pydantic validation
+            "capabilities": [str(cap) for cap in self.model_info.capabilities] if hasattr(self.model_info, 'capabilities') else [],
+            "compatibility": str(self.model_info.compatibility) if hasattr(self.model_info, 'compatibility') else "perfect_fit",
+            "compatibility_message": self.model_info.compatibility_message if hasattr(self.model_info, 'compatibility_message') else "",
             "quant_type": self.quant_type.value,
             "module": self.module.value,
             "output_path": str(self.output_path),
@@ -207,7 +215,110 @@ class QuantizationTask:
             "error": self.error,
             "use_gpu": self.use_gpu,
             "background": self.background,
+            "intermediate_file": str(self.intermediate_file) if self.intermediate_file else None,
+            "vlm_components": self.vlm_components,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "QuantizationTask":
+        """Reconstruct QuantizationTask from dictionary.
+
+        Args:
+            data: Dictionary from to_dict()
+
+        Returns:
+            QuantizationTask instance
+        """
+        from ..models.model import ModelInfo
+        from ..models.endpoints import ModelType, ProviderType, EndpointType, CompatibilityStatus
+
+        # Parse model_type safely (could be string or enum value)
+        model_type_str = data.get("model_type", "unknown")
+        try:
+            # Try to extract just the value if it's in format "ModelType.VLM"
+            if "." in str(model_type_str):
+                model_type_str = str(model_type_str).split(".")[-1].lower()
+
+            # Attempt to create enum
+            model_type = ModelType(model_type_str.lower())
+        except (ValueError, AttributeError):
+            # Fallback: keep as string or use "unknown"
+            model_type = model_type_str if model_type_str else "unknown"
+
+        # Parse provider safely
+        provider_str = data.get("provider", "unknown")
+        try:
+            if "." in str(provider_str):
+                provider_str = str(provider_str).split(".")[-1].lower()
+            provider = ProviderType(provider_str.lower())
+        except (ValueError, AttributeError):
+            provider = provider_str if provider_str else "unknown"
+
+        # Parse capabilities (required for ModelInfo)
+        capabilities_data = data.get("capabilities", [])
+        capabilities = []
+        for cap_str in capabilities_data:
+            try:
+                # Remove enum prefix if present
+                if "." in str(cap_str):
+                    cap_str = str(cap_str).split(".")[-1].lower()
+                capabilities.append(EndpointType(cap_str.lower()))
+            except (ValueError, AttributeError):
+                # Skip invalid capabilities
+                pass
+
+        # If no capabilities saved, default to text generation
+        if not capabilities:
+            capabilities = [EndpointType.TEXT]
+
+        # Parse compatibility (required for ModelInfo)
+        compatibility_str = data.get("compatibility", "perfect_fit")
+        try:
+            if "." in str(compatibility_str):
+                compatibility_str = str(compatibility_str).split(".")[-1].lower()
+            compatibility = CompatibilityStatus(compatibility_str.lower())
+        except (ValueError, AttributeError):
+            compatibility = CompatibilityStatus.PERFECT_FIT
+
+        # Get compatibility message
+        compatibility_message = data.get("compatibility_message", "Quantized model")
+
+        # Reconstruct ModelInfo with all required fields
+        model_info = ModelInfo(
+            model_id=data["model_id"],
+            name=data["model_name"],
+            model_type=model_type,
+            provider=provider,
+            size_gb=data.get("model_size_gb", 0.0),
+            capabilities=capabilities,
+            compatibility=compatibility,
+            compatibility_message=compatibility_message,
+        )
+
+        # Create task
+        task = cls(
+            task_id=data["task_id"],
+            model_info=model_info,
+            quant_type=QuantizationType(data["quant_type"]),
+            module=QuantizationModule(data["module"]),
+            output_path=Path(data["output_path"]),
+            status=TaskStatus(data["status"]),
+            progress=data["progress"],
+            eta_seconds=data.get("eta_seconds"),
+            error=data.get("error"),
+            use_gpu=data.get("use_gpu", False),
+            background=data.get("background", False),
+            intermediate_file=Path(data["intermediate_file"]) if data.get("intermediate_file") else None,
+            vlm_components=data.get("vlm_components"),
+        )
+
+        # Restore timestamps
+        if data.get("started_at"):
+            task.started_at = datetime.fromisoformat(data["started_at"])
+        if data.get("completed_at"):
+            task.completed_at = datetime.fromisoformat(data["completed_at"])
+
+        return task
 
 
 @dataclass
@@ -224,6 +335,8 @@ class QuantizationRecommendation:
     best_for: str  # "Edge", "Desktop", "Server", etc.
     is_recommended: bool = False
     requires_gpu: bool = False
+    is_available: bool = True  # New: whether this option can be selected on current system
+    unavailable_reason: str = ""  # New: why this option is not available
 
     @property
     def overall_score(self) -> float:

@@ -45,7 +45,9 @@ def display_system_specs(specs: SystemSpecs) -> None:
 
 
 def display_model_table(models: list[ModelInfo]) -> Table:
-    """Create Rich Table for model list with compatibility icons.
+    """Create Rich Table for model list with compatibility icons and metadata.
+
+    Shows: Status, Name, Type, Params, Quantization, RAM estimate, Size, Provider
 
     Args:
         models: List of ModelInfo to display
@@ -55,19 +57,50 @@ def display_model_table(models: list[ModelInfo]) -> Table:
     """
     table = Table(title="Available Models", show_header=True, header_style="bold magenta")
 
-    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("#", style="dim", width=3, justify="right")
     table.add_column("Status", justify="center", width=6)
-    table.add_column("Model Name", style="cyan", width=30)
-    table.add_column("Type", justify="center", width=8)
-    table.add_column("Size", justify="right", width=8)
-    table.add_column("Provider", justify="center", width=12)
+    table.add_column("Model Name", style="cyan", width=25)
+    table.add_column("Type", justify="center", width=6)
+    table.add_column("Params", justify="right", width=7)
+    table.add_column("Quant", justify="center", width=8)
+    table.add_column("RAM", justify="right", width=7)
+    table.add_column("Size", justify="right", width=7)
+    table.add_column("Provider", justify="center", width=10)
 
     for idx, model in enumerate(models, 1):
         # Format model type (already string due to use_enum_values=True)
         model_type = str(model.model_type).upper()
 
-        # Format size
-        size_str = f"{model.size_gb:.1f} GB"
+        # Format parameters (new field from metadata)
+        # Show ~ prefix if approximate
+        if model.params_billions and model.params_billions > 0:
+            prefix = "" if model.params_exact else "~"
+            params_str = f"{prefix}{model.params_billions:.1f}B"
+        else:
+            params_str = "[dim]?[/dim]"
+
+        # Format quantization (new field from metadata)
+        if model.quantization and model.quantization != "unknown":
+            # Shorten common quantization names
+            quant_display = model.quantization
+            if quant_display.startswith("q") and "_" in quant_display:
+                # Q4_K_M -> Q4KM
+                quant_display = quant_display.replace("_", "").upper()
+            elif quant_display in ["fp32", "fp16", "bf16"]:
+                quant_display = quant_display.upper()
+            quant_str = f"[yellow]{quant_display}[/yellow]"
+        else:
+            quant_str = "[dim]?[/dim]"
+
+        # Format RAM estimate (new field from metadata)
+        # RAM is always approximate (~), never exact
+        if model.ram_gb and model.ram_gb > 0:
+            ram_str = f"~{model.ram_gb:.1f}GB"
+        else:
+            ram_str = "[dim]?[/dim]"
+
+        # Format file size
+        size_str = f"{model.size_gb:.1f}GB"
 
         # Style row based on compatibility (already string due to use_enum_values=True)
         if model.compatibility == "perfect_fit":
@@ -85,6 +118,9 @@ def display_model_table(models: list[ModelInfo]) -> Table:
             status_icon,
             f"[{name_style}]{model.name}[/{name_style}]",
             model_type,
+            params_str,
+            quant_str,
+            ram_str,
             size_str,
             str(model.provider),
         )

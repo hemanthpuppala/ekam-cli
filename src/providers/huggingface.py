@@ -10,6 +10,7 @@ from PIL import Image
 
 from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
+from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..utils.history_formatter import format_conversation_history, format_qa_history
 from .base import BaseProvider
@@ -31,6 +32,10 @@ class HuggingFaceProvider(BaseProvider):
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # Initialize metadata cache for efficient model inspection
+        self.metadata_cache = ModelMetadataCache()
+        logger.debug("Initialized model metadata cache")
+
         # Determine best available device
         self.device = self._get_best_device()
         logger.info(f"HuggingFace provider initialized on device: {self.device}")
@@ -49,55 +54,179 @@ class HuggingFaceProvider(BaseProvider):
         return "cpu"
 
     def discover_models(self) -> list[ModelInfo]:
-        """Discover cached HuggingFace models.
+        """Discover cached HuggingFace models using metadata cache.
+
+        Scans two locations:
+        1. HuggingFace cache directory (~/.cache/huggingface/hub/)
+        2. Local models directory (./models/)
 
         Returns:
             List of ModelInfo objects for cached models
         """
         models = []
 
-        # Scan cache directory for model directories
-        if not self.cache_dir.exists():
+        # Location 1: Scan HuggingFace cache directory for model directories
+        if self.cache_dir.exists():
+            try:
+                # Look for model directories (models--<org>--<name> format)
+                for model_dir in self.cache_dir.glob("models--*"):
+                    if not model_dir.is_dir():
+                        continue
+
+                    # Parse model name from directory (models--org--name -> org/name)
+                    dir_name = model_dir.name
+                    if dir_name.startswith("models--"):
+                        parts = dir_name[8:].split("--")
+                        if len(parts) >= 2:
+                            model_id = "/".join(parts)
+
+                            # Get metadata from cache (reads config.json only, no weight loading)
+                            metadata = self.metadata_cache.get_metadata(str(model_dir), provider="huggingface")
+
+                            # Convert metadata to ModelInfo
+                            if metadata:
+                                # Map metadata model_type to ModelType enum
+                                if metadata.model_type == "vlm":
+                                    model_type = ModelType.VLM
+                                    capabilities = [
+                                        EndpointType.QA,
+                                        EndpointType.CAPTION,
+                                        EndpointType.DETECT,
+                                        EndpointType.POINT,
+                                        EndpointType.TEXT,
+                                    ]
+                                elif metadata.model_type == "embedding":
+                                    model_type = ModelType.EMBEDDING
+                                    capabilities = []
+                                else:  # llm or unknown
+                                    model_type = ModelType.LLM
+                                    capabilities = [EndpointType.TEXT]
+
+                                model_info = ModelInfo(
+                                    model_id=model_id,
+                                    name=model_id,
+                                    provider="huggingface",
+                                    size_gb=metadata.file_size_gb,
+                                    architecture=metadata.architecture,
+                                    quantization=metadata.quantization,
+                                    params_billions=metadata.params_billions,
+                                    ram_gb=metadata.ram_gb,
+                                    vram_gb=metadata.vram_gb,
+                                    params_exact=metadata.params_exact,
+                                    ram_exact=metadata.ram_exact,
+                                    model_type=model_type,
+                                    capabilities=capabilities,
+                                    compatibility=CompatibilityStatus.PERFECT_FIT,  # Will be assessed later
+                                    compatibility_message="Compatibility not yet assessed",
+                                    is_installed=True,
+                                )
+                            else:
+                                # Fallback: metadata inspection failed, use basic info
+                                logger.warning(f"Could not get metadata for {model_id}, using fallback")
+                                size_gb = self._estimate_cached_model_size(model_dir)
+                                model_info = ModelInfo(
+                                    model_id=model_id,
+                                    name=model_id,
+                                    provider="huggingface",
+                                    size_gb=size_gb,
+                                    model_type=ModelType.LLM,
+                                    capabilities=[EndpointType.TEXT],
+                                    compatibility=CompatibilityStatus.PERFECT_FIT,
+                                    compatibility_message="Compatibility not yet assessed",
+                                    is_installed=True,
+                                )
+
+                            models.append(model_info)
+                            logger.debug(f"Discovered HF model: {model_id} ({metadata.model_type if metadata else 'unknown'}, {metadata.quantization if metadata else 'unknown'})")
+
+                logger.info(f"Discovered {len(models)} HuggingFace models from HF cache")
+            except Exception as e:
+                logger.error(f"Error discovering HuggingFace cache models: {e}")
+        else:
             logger.warning(f"HuggingFace cache directory not found: {self.cache_dir}")
-            return models
 
-        try:
-            # Look for model directories (models--<org>--<name> format)
-            for model_dir in self.cache_dir.glob("models--*"):
-                if not model_dir.is_dir():
-                    continue
+        # Location 2: Scan local ./models directory for HuggingFace format models
+        local_models_dir = Path.cwd() / "models"
+        if local_models_dir.exists():
+            try:
+                logger.info(f"Scanning local models directory: {local_models_dir}")
+                for model_dir in local_models_dir.iterdir():
+                    if not model_dir.is_dir():
+                        continue
 
-                # Parse model name from directory (models--org--name -> org/name)
-                dir_name = model_dir.name
-                if dir_name.startswith("models--"):
-                    parts = dir_name[8:].split("--")
-                    if len(parts) >= 2:
-                        model_id = "/".join(parts)
+                    # Check if it's a valid HuggingFace model (has config.json or safetensors)
+                    has_config = (model_dir / "config.json").exists()
+                    has_weights = list(model_dir.glob("*.safetensors")) or list(model_dir.glob("*.bin"))
 
-                        # Estimate size and classify model
-                        size_gb = self._estimate_cached_model_size(model_dir)
-                        model_type, capabilities = self._classify_hf_model(model_id)
+                    if has_config or has_weights:
+                        # Use directory name as model_id
+                        model_id = model_dir.name
+                        logger.info(f"Found local model: {model_id}")
 
-                        model_info = ModelInfo(
-                            model_id=model_id,
-                            name=model_id,
-                            provider="huggingface",
-                            size_gb=size_gb,
-                            model_type=model_type,
-                            capabilities=capabilities,
-                            compatibility=CompatibilityStatus.PERFECT_FIT,  # Will be assessed later
-                            compatibility_message="Compatibility not yet assessed",
-                            is_installed=True,
-                        )
+                        # Get metadata
+                        metadata = self.metadata_cache.get_metadata(str(model_dir), provider="huggingface")
+
+                        if metadata:
+                            # Map metadata model_type to ModelType enum
+                            if metadata.model_type == "vlm":
+                                model_type = ModelType.VLM
+                                capabilities = [
+                                    EndpointType.QA,
+                                    EndpointType.CAPTION,
+                                    EndpointType.DETECT,
+                                    EndpointType.POINT,
+                                    EndpointType.TEXT,
+                                ]
+                            elif metadata.model_type == "embedding":
+                                model_type = ModelType.EMBEDDING
+                                capabilities = []
+                            else:  # llm or unknown
+                                model_type = ModelType.LLM
+                                capabilities = [EndpointType.TEXT]
+
+                            model_info = ModelInfo(
+                                model_id=str(model_dir),  # Use full path as model_id for local models
+                                name=f"{model_id} (local)",
+                                provider="huggingface",
+                                size_gb=metadata.file_size_gb,
+                                architecture=metadata.architecture,
+                                quantization=metadata.quantization,
+                                params_billions=metadata.params_billions,
+                                ram_gb=metadata.ram_gb,
+                                vram_gb=metadata.vram_gb,
+                                params_exact=metadata.params_exact,
+                                ram_exact=metadata.ram_exact,
+                                model_type=model_type,
+                                capabilities=capabilities,
+                                compatibility=CompatibilityStatus.PERFECT_FIT,
+                                compatibility_message="Compatibility not yet assessed",
+                                is_installed=True,
+                            )
+                        else:
+                            # Fallback: metadata inspection failed, use basic info
+                            logger.warning(f"Could not get metadata for local model {model_id}, using fallback")
+                            size_gb = self._estimate_cached_model_size(model_dir)
+                            model_info = ModelInfo(
+                                model_id=str(model_dir),  # Use full path as model_id
+                                name=f"{model_id} (local)",
+                                provider="huggingface",
+                                size_gb=size_gb,
+                                model_type=ModelType.LLM,
+                                capabilities=[EndpointType.TEXT],
+                                compatibility=CompatibilityStatus.PERFECT_FIT,
+                                compatibility_message="Compatibility not yet assessed",
+                                is_installed=True,
+                            )
+
                         models.append(model_info)
-                        logger.debug(f"Discovered HF model: {model_id}")
+                        logger.debug(f"Discovered local model: {model_id}")
 
-            logger.info(f"Discovered {len(models)} HuggingFace models from cache")
-            return models
+                logger.info(f"Discovered {len([m for m in models if '(local)' in m.name])} models from ./models directory")
+            except Exception as e:
+                logger.error(f"Error discovering local models: {e}")
 
-        except Exception as e:
-            logger.error(f"Error discovering HuggingFace models: {e}")
-            return models
+        logger.info(f"Total HuggingFace models discovered: {len(models)}")
+        return models
 
     def _estimate_cached_model_size(self, model_dir: Path) -> float:
         """Estimate size of cached model in GB.
@@ -118,8 +247,13 @@ class HuggingFaceProvider(BaseProvider):
             logger.warning(f"Could not estimate size for {model_dir}: {e}")
             return 4.0  # Default estimate
 
+    # DEPRECATED: This method is no longer used - metadata cache provides dynamic detection
+    # Keeping for backward compatibility only (used in fallback scenarios)
     def _classify_hf_model(self, model_id: str) -> tuple[ModelType, list[EndpointType]]:
-        """Classify HuggingFace model by name patterns.
+        """[DEPRECATED] Classify HuggingFace model by name patterns.
+
+        This method is deprecated in favor of metadata cache which reads actual model config.
+        Only used as a fallback when metadata inspection fails.
 
         Args:
             model_id: Model identifier (e.g., "llava-hf/llava-1.5-7b-hf")
@@ -129,7 +263,7 @@ class HuggingFaceProvider(BaseProvider):
         """
         model_lower = model_id.lower()
 
-        # VLM keywords
+        # VLM keywords (fallback only)
         vlm_keywords = [
             "llava", "blip", "instructblip", "clip", "vision", "vit",
             "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl",
@@ -168,67 +302,119 @@ class HuggingFaceProvider(BaseProvider):
         logger.info(f"Loading HuggingFace model: {model_id}")
 
         try:
-            from transformers import (
-                AutoModelForCausalLM,
-                AutoModelForVision2Seq,
-                AutoProcessor,
-                AutoTokenizer,
-            )
+            # Import base classes (always available)
+            from transformers import AutoModel, AutoTokenizer
 
-            model_lower = model_id.lower()
+            # Determine if this is a VLM using metadata cache
+            # This checks the actual model config, not just keywords
+            model_dir = self.cache_dir / ("models--" + model_id.replace("/", "--"))
+            metadata = self.metadata_cache.get_metadata(str(model_dir), provider="huggingface")
 
-            # Determine if this is a VLM based on model name
-            vlm_keywords = [
-                "llava", "blip", "instructblip", "clip", "vision",
-                "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl",
-                "cogvlm", "internvl", "minicpm-v", "phi-3-vision"
-            ]
-            is_vlm = any(keyword in model_lower for keyword in vlm_keywords)
+            is_vlm = False
+            if metadata:
+                is_vlm = metadata.model_type == "vlm"
+                logger.debug(f"Metadata indicates model type: {metadata.model_type}")
+            else:
+                # Fallback to keyword detection if metadata not available
+                logger.debug("Metadata not available, using keyword fallback")
+                model_lower = model_id.lower()
+                vlm_keywords = [
+                    "llava", "blip", "instructblip", "clip", "vision", "vl",
+                    "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl", "qwen3-vl",
+                    "cogvlm", "internvl", "minicpm-v", "phi-3-vision"
+                ]
+                is_vlm = any(keyword in model_lower for keyword in vlm_keywords)
 
             if is_vlm:
-                # Try to load as VLM with processor
+                # Try to load as VLM with processor (only import if needed)
                 try:
+                    # Import VLM-specific classes (may not be available in all versions)
+                    from transformers import AutoProcessor
+
                     processor = AutoProcessor.from_pretrained(
                         model_id,
                         cache_dir=str(self.cache_dir),
                         trust_remote_code=True
                     )
-                    # Try vision-to-seq model first
-                    try:
-                        model = AutoModelForVision2Seq.from_pretrained(
-                            model_id,
-                            cache_dir=str(self.cache_dir),
-                            trust_remote_code=True,
-                            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+
+                    # Prepare loading kwargs with proper dtype parameter
+                    vlm_load_kwargs = {
+                        "cache_dir": str(self.cache_dir),
+                        "trust_remote_code": True,
+                        "dtype": torch.float16 if self.device == "cuda" else torch.float32
+                    }
+
+                    # FUTURE-PROOF: Use AutoModel (auto-detects correct class)
+                    # Works for: Qwen3-VL, LLaVA, BLIP, InstructBLIP, any future VLM
+                    model = AutoModel.from_pretrained(model_id, **vlm_load_kwargs)
+
+                    # Determine target device - some models have MPS compatibility issues
+                    target_device = self.device
+                    if "qwen3" in model_id.lower() and self.device == "mps":
+                        target_device = "cpu"
+                        logger.warning(
+                            f"Qwen3 has MPS compatibility issues. Using CPU instead. "
+                            f"This may be slower but will work correctly."
                         )
-                    except Exception:
-                        # Fall back to generic causal LM for some VLMs
-                        model = AutoModelForCausalLM.from_pretrained(
-                            model_id,
-                            cache_dir=str(self.cache_dir),
-                            trust_remote_code=True,
-                            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-                        )
-                    model.to(self.device)
-                    logger.info(f"Loaded VLM model {model_id} on {self.device}")
+
+                    model.to(target_device)
+                    logger.info(f"Loaded VLM model {model_id} on {target_device}")
                     return (model, processor)
                 except Exception as e:
                     logger.warning(f"Failed to load as VLM: {e}, trying as LLM...")
 
-            # Load as LLM with causal language modeling head
+            # Load as LLM
             tokenizer = AutoTokenizer.from_pretrained(
                 model_id,
                 cache_dir=str(self.cache_dir),
                 trust_remote_code=True
             )
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                cache_dir=str(self.cache_dir),
-                trust_remote_code=True,
-                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-            )
-            model.to(self.device)
-            logger.info(f"Loaded LLM model {model_id} on {self.device}")
+
+            # Prepare loading kwargs with proper dtype parameter
+            load_kwargs = {
+                "cache_dir": str(self.cache_dir),
+                "trust_remote_code": True,
+            }
+
+            # Use 'dtype' instead of deprecated 'torch_dtype'
+            if self.device == "cuda":
+                load_kwargs["dtype"] = torch.float16
+            else:
+                load_kwargs["dtype"] = torch.float32
+
+            try:
+                # FUTURE-PROOF: Use AutoModel (auto-detects correct class)
+                # This automatically picks the right model class from config.json
+                # Works for: LLMs, VLMs, future architectures, any transformers model
+                model = AutoModel.from_pretrained(model_id, **load_kwargs)
+            except Exception as e:
+                # Fallback: try without trust_remote_code for standard models
+                logger.warning(f"Failed with trust_remote_code=True, trying standard loading: {e}")
+                load_kwargs["trust_remote_code"] = False
+                try:
+                    model = AutoModel.from_pretrained(model_id, **load_kwargs)
+                except Exception as e2:
+                    # Final fallback: minimal loading
+                    logger.warning(f"Failed with dtype, trying default loading: {e2}")
+                    model = AutoModel.from_pretrained(
+                        model_id,
+                        cache_dir=str(self.cache_dir)
+                    )
+
+            # Determine target device - some models have MPS compatibility issues
+            target_device = self.device
+
+            # Qwen3 has known MPS compatibility issues with torch 2.5.1
+            # Force CPU for Qwen3 on MPS devices to avoid matrix dimension errors
+            if "qwen3" in model_id.lower() and self.device == "mps":
+                target_device = "cpu"
+                logger.warning(
+                    f"Qwen3 has MPS compatibility issues. Using CPU instead. "
+                    f"This may be slower but will work correctly."
+                )
+
+            model.to(target_device)
+            logger.info(f"Loaded LLM model {model_id} on {target_device}")
             return (model, tokenizer)
 
         except Exception as e:
@@ -236,7 +422,7 @@ class HuggingFaceProvider(BaseProvider):
             raise RuntimeError(f"Failed to load model {model_id}: {e}")
 
     def unload_model(self, handle: Any) -> None:
-        """Unload model and free GPU memory.
+        """Unload model and free GPU memory universally across all platforms.
 
         Args:
             handle: Tuple of (model, processor/tokenizer)
@@ -247,8 +433,19 @@ class HuggingFaceProvider(BaseProvider):
         try:
             model, _ = handle
             del model
+
+            # Universal GPU memory cleanup - works on all platforms
             if torch.cuda.is_available():
+                # NVIDIA CUDA (Windows, Linux, Jetson)
                 torch.cuda.empty_cache()
+                logger.debug("Cleared CUDA cache")
+            elif torch.backends.mps.is_available():
+                # Apple Metal (macOS with M-series)
+                torch.mps.empty_cache()
+                logger.debug("Cleared MPS cache")
+            # Note: ROCm (AMD) uses same API as CUDA
+            # CPU doesn't need explicit cache clearing
+
             logger.info("HuggingFace model unloaded")
         except Exception as e:
             logger.warning(f"Error unloading HuggingFace model: {e}")
@@ -274,6 +471,11 @@ class HuggingFaceProvider(BaseProvider):
         model, processor = handle
 
         try:
+            # UNIVERSAL DEVICE DETECTION - get actual device model is on
+            # Works on all platforms: CUDA, MPS, CPU, ROCm, Jetson, etc.
+            model_device = next(model.parameters()).device
+            logger.debug(f"Model is on device: {model_device}")
+
             # Use unified Q&A history formatter (shared across all providers)
             full_question = format_qa_history(
                 conversation_history=conversation_history,
@@ -281,16 +483,16 @@ class HuggingFaceProvider(BaseProvider):
                 max_turns=5
             )
 
-            # Prepare inputs
+            # Prepare inputs and move to SAME device as model
             inputs = processor(
                 text=full_question,
                 images=image,
                 return_tensors="pt"
-            ).to(self.device)
+            ).to(model_device)
 
             # Generate response
             with torch.no_grad():
-                output = model.generate(**inputs, max_new_tokens=512)
+                output = model.generate(**inputs, max_new_tokens=1024)  # Increased for more detailed responses
 
             # Decode response
             response = processor.batch_decode(output, skip_special_tokens=True)[0]
@@ -416,6 +618,12 @@ class HuggingFaceProvider(BaseProvider):
         model, tokenizer = handle
 
         try:
+            # UNIVERSAL DEVICE DETECTION - works on all platforms
+            # Get the actual device the model is on (not self.device which may differ)
+            # This handles: CUDA (Windows/Linux), MPS (Mac), CPU (all platforms)
+            model_device = next(model.parameters()).device
+            logger.debug(f"Model is on device: {model_device}")
+
             # Set padding token if not present (needed for some models like DialoGPT)
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
@@ -460,12 +668,13 @@ class HuggingFaceProvider(BaseProvider):
                     model_name=model_name
                 )
 
-            # Tokenize input
-            inputs = tokenizer(formatted_prompt, return_tensors="pt", padding=True).to(self.device)
+            # Tokenize input and move to the SAME device as the model
+            # This works universally: CUDA (NVIDIA), MPS (Apple), CPU (all), ROCm (AMD), etc.
+            inputs = tokenizer(formatted_prompt, return_tensors="pt", padding=True).to(model_device)
 
             # Build generation parameters with defaults
             gen_params = {
-                "max_new_tokens": 512,
+                "max_new_tokens": 1024,  # Increased for more detailed responses
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "top_k": 50,
@@ -521,17 +730,73 @@ class HuggingFaceProvider(BaseProvider):
                 else:
                     response = full_response.strip()
 
+            # Apply response cleaning to remove artifacts and meta-commentary
+            from ..utils.response_cleaner import clean_model_response
+            if response:
+                response = clean_model_response(response, aggressive=True)
+
             return response if response else "I don't have a response."
 
         except Exception as e:
             logger.error(f"Text generation failed: {e}")
             raise RuntimeError(f"Text generation failed: {e}")
 
+    def get_model_info(self, model_id: str) -> dict:
+        """Get detailed model information for HuggingFace models.
+
+        Args:
+            model_id: Model identifier (e.g., "llava-hf/llava-1.5-7b-hf")
+
+        Returns:
+            Dict with model metadata including default_parameters
+        """
+        # Find the model in discovered models
+        models = self.discover_models()
+        model = next((m for m in models if m.model_id == model_id), None)
+
+        if not model:
+            # Return minimal info if not found
+            return {
+                "model_id": model_id,
+                "name": model_id,
+                "provider": "huggingface",
+                "default_parameters": {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "top_k": 50,
+                    "max_tokens": 1024,  # Increased for more detailed responses
+                    "repeat_penalty": 1.0,
+                }
+            }
+
+        # Return full model info
+        return {
+            "model_id": model.model_id,
+            "name": model.name,
+            "provider": "huggingface",
+            "architecture": model.architecture or "Unknown",
+            "quantization": model.quantization or "None",
+            "size_gb": model.size_gb,
+            "model_type": str(model.model_type).upper() if hasattr(model.model_type, 'value') else str(model.model_type).upper(),
+            "capabilities": [str(cap) for cap in model.capabilities] if model.capabilities else ["text"],
+            "default_parameters": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 50,
+                "max_tokens": 1024,  # Increased for more detailed responses
+                "repeat_penalty": 1.0,
+            }
+        }
+
     def install_model(self, model_name: str, progress_callback=None) -> bool:
         """Download model from HuggingFace Hub.
 
+        Handles both regular transformers models and GGUF models:
+        - GGUF repos: Downloads .gguf files directly (no transformers validation)
+        - Regular models: Downloads via transformers (requires valid config.json)
+
         Args:
-            model_name: Model identifier (e.g., "llava-hf/llava-1.5-7b-hf")
+            model_name: Model identifier (e.g., "llava-hf/llava-1.5-7b-hf" or "TheBloke/Llama-2-7B-GGUF")
             progress_callback: Optional progress callback (not implemented)
 
         Returns:
@@ -540,47 +805,162 @@ class HuggingFaceProvider(BaseProvider):
         logger.info(f"Downloading HuggingFace model: {model_name}")
 
         try:
-            from transformers import (
-                AutoModelForCausalLM,
-                AutoProcessor,
-                AutoTokenizer,
-            )
+            from huggingface_hub import list_repo_files, hf_hub_download
+
+            # STEP 1: Check if this is a GGUF repository
+            # GGUF repos contain .gguf files and should be downloaded directly
+            try:
+                repo_files = list_repo_files(model_name)
+                gguf_files = [f for f in repo_files if f.endswith('.gguf')]
+
+                if gguf_files:
+                    logger.info(f"Detected GGUF repository with {len(gguf_files)} .gguf file(s)")
+                    logger.info(f"Downloading GGUF files directly (skipping transformers validation)")
+
+                    # Get file sizes for better UX
+                    from huggingface_hub import HfFileSystem
+                    fs = HfFileSystem()
+                    file_sizes = {}
+                    try:
+                        files_info = fs.ls(model_name, detail=True)
+                        for finfo in files_info:
+                            fname = finfo['name'].split('/')[-1]
+                            if fname.endswith('.gguf'):
+                                file_sizes[fname] = finfo['size'] / (1024**3)  # GB
+                    except:
+                        pass
+
+                    # Smart file selection: prioritize smaller quantized versions
+                    # Download order: Q4_K_M > Q5_K_M > Q8_0 > F16 (smallest to largest)
+                    quantization_priority = {
+                        'q2_k': 1, 'q3_k_m': 2, 'q4_k_m': 3, 'q4_k_s': 4,
+                        'q5_k_m': 5, 'q5_k_s': 6, 'q6_k': 7, 'q8_0': 8,
+                        'f16': 99, 'f32': 100  # Full precision last
+                    }
+
+                    def get_priority(filename):
+                        fname_lower = filename.lower()
+                        for quant_type, priority in quantization_priority.items():
+                            if quant_type in fname_lower:
+                                return priority
+                        return 50  # Unknown quantization
+
+                    # Sort files by priority (download best quantized version first)
+                    sorted_files = sorted(gguf_files, key=get_priority)
+
+                    # Determine download directory: use GGUF models directory from config
+                    # Read from config.yaml to get the correct GGUF models directory
+                    from pathlib import Path
+                    import yaml
+
+                    gguf_dir = Path.home() / "models" / "gguf"  # Default
+                    try:
+                        config_path = Path("config.yaml")
+                        if config_path.exists():
+                            with open(config_path) as f:
+                                cfg = yaml.safe_load(f)
+                                if cfg and 'providers' in cfg and 'gguf' in cfg['providers']:
+                                    gguf_models_dir = cfg['providers']['gguf'].get('models_dir', '~/models/gguf/')
+                                    gguf_dir = Path(gguf_models_dir).expanduser()
+                    except Exception as e:
+                        logger.debug(f"Could not read GGUF models_dir from config, using default: {e}")
+
+                    # Download to GGUF provider's directory so it can be discovered
+                    download_dir = gguf_dir / model_name.replace("/", "--")
+                    download_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"Downloading to GGUF models directory: {download_dir}")
+
+                    # Download the recommended file (smallest good quantization)
+                    best_file = sorted_files[0]
+                    file_size_str = f" ({file_sizes.get(best_file, 0):.2f} GB)" if best_file in file_sizes else ""
+                    logger.info(f"Downloading recommended quantization: {best_file}{file_size_str}")
+
+                    if len(sorted_files) > 1:
+                        logger.info(f"Note: {len(sorted_files)-1} other quantization(s) available but not downloaded to save space")
+                        other_files = [f"{f} ({file_sizes.get(f, 0):.1f}GB)" if f in file_sizes else f
+                                     for f in sorted_files[1:]]
+                        logger.info(f"Other versions: {', '.join(other_files)}")
+
+                    # Download with progress (hf_hub_download shows progress by default)
+                    downloaded_path = hf_hub_download(
+                        repo_id=model_name,
+                        filename=best_file,
+                        local_dir=str(download_dir),
+                        local_dir_use_symlinks=False
+                    )
+                    logger.info(f"Downloaded {best_file} successfully")
+                    logger.info(f"Location: {downloaded_path}")
+                    logger.info(f"Use the GGUF or Quantized provider to load this model")
+
+                    # Invalidate metadata cache for GGUF provider (will be re-inspected on discovery)
+                    # This ensures the new model shows up with correct metadata
+                    self.metadata_cache.invalidate_model(str(download_dir))
+                    logger.debug(f"Invalidated GGUF metadata cache for {model_name}")
+
+                    return True
+
+            except Exception as e:
+                # If we can't check repo files, assume it's a regular model
+                logger.debug(f"Could not check for GGUF files: {e}")
+
+            # STEP 2: Regular transformers model download
+            # Import base classes (always available)
+            from transformers import AutoModel, AutoTokenizer
 
             model_lower = model_name.lower()
 
-            # Check if VLM
+            # Check if VLM (vision-language model)
             vlm_keywords = [
-                "llava", "blip", "instructblip", "vision",
-                "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl"
+                "llava", "blip", "instructblip", "vision", "vl", "clip",
+                "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl", "qwen3-vl"
             ]
             is_vlm = any(keyword in model_lower for keyword in vlm_keywords)
 
             if is_vlm:
-                # Download processor for VLM
+                # Download processor for VLM (only import if needed)
                 try:
+                    from transformers import AutoProcessor
                     AutoProcessor.from_pretrained(
                         model_name,
                         cache_dir=str(self.cache_dir),
                         trust_remote_code=True
                     )
-                except Exception:
-                    pass
+                    logger.info("Downloaded VLM processor")
+                except Exception as e:
+                    logger.debug(f"Could not download processor: {e}")
 
             # Download tokenizer (for all models)
-            AutoTokenizer.from_pretrained(
-                model_name,
-                cache_dir=str(self.cache_dir),
-                trust_remote_code=True
-            )
+            try:
+                AutoTokenizer.from_pretrained(
+                    model_name,
+                    cache_dir=str(self.cache_dir),
+                    trust_remote_code=True
+                )
+                logger.info("Downloaded tokenizer")
+            except Exception as e:
+                logger.debug(f"Could not download tokenizer: {e}")
 
-            # Download model with causal LM head
-            AutoModelForCausalLM.from_pretrained(
+            # FUTURE-PROOF: Use AutoModel (generic) instead of AutoModelForCausalLM
+            # AutoModel automatically detects the correct model class from config.json
+            # This works for:
+            # - New architectures (Qwen3-VL, future models)
+            # - VLMs (LLaVA, BLIP, InstructBLIP, etc.)
+            # - LLMs (GPT, Llama, Qwen, DeepSeek, etc.)
+            # - Any model type transformers supports
+            AutoModel.from_pretrained(
                 model_name,
                 cache_dir=str(self.cache_dir),
-                trust_remote_code=True
+                trust_remote_code=True  # Allow custom model code
             )
 
             logger.info(f"Successfully downloaded {model_name}")
+
+            # Invalidate cache for this model so it gets re-inspected on next discovery
+            model_dir = self.cache_dir / ("models--" + model_name.replace("/", "--"))
+            if model_dir.exists():
+                self.metadata_cache.invalidate_model(str(model_dir))
+                logger.debug(f"Invalidated metadata cache for {model_name}")
+
             return True
 
         except Exception as e:

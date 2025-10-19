@@ -31,6 +31,9 @@ def show_quantization_or_inference_menu() -> str:
     Reduce model size through quantization
     Create optimized models for faster inference
 
+[bold]Navigation:[/bold]
+  [q] Quit application
+
 [dim]Quantization Phase 1: GGUF models only
 Future: HuggingFace and Ollama model conversion[/dim]""",
         title="Operation Mode",
@@ -38,7 +41,7 @@ Future: HuggingFace and Ollama model conversion[/dim]""",
     )
 
     while True:
-        choice = tui.prompt("Choose [1/2] or 'q' to quit:", style="cyan").strip().lower()
+        choice = tui.prompt("Choose [1/2/q]:", style="cyan").strip().lower()
 
         if choice in ["q", "quit", "exit"]:
             return "quit"
@@ -71,46 +74,77 @@ def initialize_quantization_manager(session_manager: SessionManager) -> Quantiza
     return quant_manager
 
 
-def run_quantization_mode(session_manager: SessionManager) -> bool:
+def run_quantization_mode(session_manager: SessionManager) -> str:
     """Run quantization mode.
 
     Args:
         session_manager: Session manager
 
     Returns:
-        True to continue app, False to quit
+        "quit" to quit app
+        "main_menu" to return to main menu
+        "switch_inference" to switch to inference mode
     """
     # Initialize quantization manager
     quant_manager = initialize_quantization_manager(session_manager)
 
+    # Register globally for /background command and notifications
+    from . import app
+    app._global_quantization_manager = quant_manager
+
+    # Track completed jobs for notifications
+    completed_tasks = set()
+
     while True:
-        # Show quantization menu
-        tui.clear_screen()
-        tui.console.print("[bold cyan]Quantization Mode[/bold cyan]\n")
-        tui.console.print("[1] [green]Start New Quantization[/green]")
-        tui.console.print("[2] [yellow]Monitor Background Jobs[/yellow]")
-        tui.console.print("[b] [dim]Back to main menu[/dim]")
-        tui.console.print("[q] [dim]Quit application[/dim]\n")
+        # Check for notifications using global notification system
+        from . import app
+        app.check_and_show_completion_notifications()
 
-        # Show status bar if there are active jobs
+        # Build menu content
+        menu_content = """[bold cyan]Quantization Mode[/bold cyan]
+
+[1] [green]Start New Quantization[/green]
+[2] [yellow]Monitor Background Jobs[/yellow]
+[3] [blue]Switch to Inference Mode[/blue]
+
+[bold]Navigation:[/bold]
+  [h] Main menu (home)
+  [b] Back to main menu
+  [q] Quit application
+
+[bold]Commands:[/bold]
+  [yellow]/background[/yellow] - Monitor background jobs (if running)
+"""
+
+        # Get status for status bar
+        status_text = ""
         if quant_manager.has_active_jobs():
-            status = quant_manager.get_status_summary()
-            tui.console.print(f"[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]")
-            tui.console.print(f"[bold yellow]{status}[/bold yellow]")
-            tui.console.print(f"[dim]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/dim]\n")
+            status_text = quant_manager.get_status_summary()
 
-        choice = tui.prompt("Choose:", style="cyan").strip().lower()
+        # Show menu with status bar
+        tui.clear_and_show_with_status(menu_content, status_text)
+
+        choice = tui.prompt("\nChoose [1-3/h/b/q or /background]:", style="cyan").strip().lower()
+
+        # Handle /background command
+        if choice.startswith("/background") or choice == "/bg":
+            from . import app
+            app.handle_background_command()
+            continue
 
         if choice in ["q", "quit", "exit"]:
-            return False  # Quit app
-        elif choice in ["b", "back"]:
-            return True  # Back to main menu
+            return "quit"
+        elif choice in ["b", "back", "h", "home", "main_menu"]:
+            return "main_menu"
         elif choice == "1":
             # Start new quantization
             run_quantization_workflow(session_manager.model_discovery, quant_manager)
         elif choice == "2":
             # Monitor jobs
             show_background_jobs_monitor(quant_manager)
+        elif choice == "3":
+            # Switch to inference mode
+            return "switch_inference"
         else:
-            tui.show_error("Invalid choice. Enter 1, 2, 'b', or 'q'")
+            tui.show_error("Invalid choice. Enter 1, 2, 3, 'b', 'm', or 'q'")
             tui.prompt("Press Enter to continue...", style="dim")

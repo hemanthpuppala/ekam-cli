@@ -18,6 +18,7 @@ from ...models.model import ModelInfo
 from ...models.provider import ProviderType
 from ..models import QuantizationTask, QuantizationType, TaskStatus
 from .base import BaseQuantizer
+from .model_validator import ModelValidator
 
 
 class GGUFConverter(BaseQuantizer):
@@ -108,8 +109,11 @@ class GGUFConverter(BaseQuantizer):
         if model_info.provider != ProviderType.HUGGINGFACE:
             return None
 
-        if model_info.file_path:
-            return Path(model_info.file_path)
+        # For manual models, model_id is the full path
+        if model_info.model_id:
+            model_path = Path(model_info.model_id)
+            if model_path.exists():
+                return model_path
 
         return None
 
@@ -149,9 +153,24 @@ class GGUFConverter(BaseQuantizer):
             logger.info(f"Starting GGUF conversion for {task.model_info.name}")
 
             # Get source model path
-            source_path = task.model_info.file_path
-            if not source_path or not Path(source_path).exists():
-                raise ValueError(f"Source model not found: {source_path}")
+            source_path = self.get_source_model_path(task.model_info)
+            if not source_path or not source_path.exists():
+                raise ValueError(f"Source model not found: {task.model_info.model_id}")
+
+            # Validate model directory
+            logger.info(f"Validating model directory: {source_path}")
+            is_valid, error_msg, validation_info = ModelValidator.validate_model_directory(source_path)
+
+            if not is_valid:
+                # Try to repair
+                logger.warning("Model validation failed, attempting auto-repair...")
+                if ModelValidator.attempt_config_repair(source_path):
+                    # Re-validate
+                    is_valid, error_msg, validation_info = ModelValidator.validate_model_directory(source_path)
+
+                if not is_valid:
+                    helpful_msg = ModelValidator.get_helpful_error_message(source_path, validation_info)
+                    raise ValueError(helpful_msg)
 
             # Update progress: Preparing
             if progress_callback:

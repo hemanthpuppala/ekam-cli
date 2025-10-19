@@ -35,6 +35,8 @@ class ModelMetadata:
         file_size_gb: float = 0.0,
         file_mtime: float = 0.0,
         inspected_at: str = None,
+        params_exact: bool = False,
+        ram_exact: bool = False,
     ):
         """Initialize model metadata.
 
@@ -51,6 +53,8 @@ class ModelMetadata:
             file_size_gb: Actual file size in GB
             file_mtime: File modification timestamp
             inspected_at: ISO timestamp when metadata was extracted
+            params_exact: True if params_billions is exact (from metadata), False if estimated
+            ram_exact: True if ram_gb is exact (from actual measurement), False if estimated
         """
         self.model_id = model_id
         self.architecture = architecture
@@ -64,6 +68,8 @@ class ModelMetadata:
         self.file_size_gb = file_size_gb
         self.file_mtime = file_mtime
         self.inspected_at = inspected_at or datetime.now().isoformat()
+        self.params_exact = params_exact
+        self.ram_exact = ram_exact
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -80,6 +86,8 @@ class ModelMetadata:
             "file_size_gb": self.file_size_gb,
             "file_mtime": self.file_mtime,
             "inspected_at": self.inspected_at,
+            "params_exact": self.params_exact,
+            "ram_exact": self.ram_exact,
         }
 
     @classmethod
@@ -98,6 +106,10 @@ class ModelMetadataCache:
     - Total overhead: <100ms for entire model library
     """
 
+    # Increment this when metadata extraction logic changes
+    # This will auto-invalidate old cache to prevent stale data
+    CACHE_VERSION = 2  # v2: Fixed param count calculation (bytes → params)
+
     def __init__(self, cache_file: str = ".cache/model_metadata.json"):
         """Initialize metadata cache.
 
@@ -109,7 +121,7 @@ class ModelMetadataCache:
         self._load_cache()
 
     def _load_cache(self) -> None:
-        """Load cache from disk."""
+        """Load cache from disk with version checking."""
         if not self.cache_file.exists():
             logger.debug(f"No cache file found at {self.cache_file}, starting fresh")
             return
@@ -118,25 +130,36 @@ class ModelMetadataCache:
             with open(self.cache_file, "r") as f:
                 data = json.load(f)
 
+            # Check cache version - auto-invalidate if outdated
+            cache_version = data.get("version_number", 1)
+            if cache_version != self.CACHE_VERSION:
+                logger.info(
+                    f"Cache version mismatch (found v{cache_version}, need v{self.CACHE_VERSION}). "
+                    f"Clearing cache to refresh with updated metadata extraction logic."
+                )
+                self.cache = {}
+                return
+
             # Load models from cache
             for model_id, metadata_dict in data.get("models", {}).items():
                 self.cache[model_id] = ModelMetadata.from_dict(metadata_dict)
 
-            logger.info(f"Loaded {len(self.cache)} models from cache")
+            logger.info(f"Loaded {len(self.cache)} models from cache (v{cache_version})")
 
         except Exception as e:
             logger.warning(f"Failed to load cache: {e}, starting fresh")
             self.cache = {}
 
     def _save_cache(self) -> None:
-        """Save cache to disk."""
+        """Save cache to disk with version."""
         try:
             # Ensure cache directory exists
             self.cache_file.parent.mkdir(parents=True, exist_ok=True)
 
             # Convert to serializable format
             data = {
-                "version": "1.0",
+                "version": "1.0",  # File format version
+                "version_number": self.CACHE_VERSION,  # Logic version (for auto-invalidation)
                 "last_updated": datetime.now().isoformat(),
                 "models": {
                     model_id: metadata.to_dict()
@@ -150,7 +173,7 @@ class ModelMetadataCache:
                 json.dump(data, f, indent=2)
 
             temp_file.replace(self.cache_file)
-            logger.debug(f"Saved {len(self.cache)} models to cache")
+            logger.debug(f"Saved {len(self.cache)} models to cache (v{self.CACHE_VERSION})")
 
         except Exception as e:
             logger.error(f"Failed to save cache: {e}")
@@ -333,25 +356,35 @@ class ModelMetadataCache:
             snapshot_dir = config_path.parent if config_path.parent.name != model_path else config_path.parent
 
             # Calculate parameter count - Use accurate methods
-            params_billions = self._get_accurate_param_count(snapshot_dir, config)
+            params_billions, params_exact = self._get_accurate_param_count(snapshot_dir, config)
 
             # Detect actual quantization from safetensors (not config)
             quantization = self._detect_actual_quantization(snapshot_dir, config)
 
-            # Extract context length
-            context_length = config.get(
-                "max_position_embeddings",
-                config.get("n_positions", config.get("max_seq_len", 2048)),
-            )
+            # Extract context length - check both text_config and root config
+            context_length = 2048  # Default
+            if "text_config" in config:
+                # VLMs often have text_config sub-object
+                text_config = config["text_config"]
+                context_length = text_config.get(
+                    "max_position_embeddings",
+                    text_config.get("n_positions", text_config.get("max_seq_len", 2048)),
+                )
+            else:
+                # Standard models have it at root level
+                context_length = config.get(
+                    "max_position_embeddings",
+                    config.get("n_positions", config.get("max_seq_len", 2048)),
+                )
 
-            # Estimate RAM/VRAM
+            # Estimate RAM/VRAM - RAM is always estimated, never exact
             ram_gb = self._estimate_ram(params_billions, quantization)
             vram_gb = self._estimate_vram(params_billions, quantization)
 
             # Detect capabilities
             capabilities = self._detect_capabilities(model_type, config)
 
-            # Get file info
+            # Get file info - use actual disk size for file_size_gb
             model_dir = Path(model_path)
             file_size_gb = self._get_directory_size(model_dir)
             file_mtime = model_dir.stat().st_mtime
@@ -368,6 +401,8 @@ class ModelMetadataCache:
                 capabilities=capabilities,
                 file_size_gb=file_size_gb,
                 file_mtime=file_mtime,
+                params_exact=params_exact,
+                ram_exact=False,  # RAM is always estimated
             )
 
         except Exception as e:
@@ -470,7 +505,7 @@ class ModelMetadataCache:
         # Default to LLM
         return "llm"
 
-    def _get_accurate_param_count(self, snapshot_dir: Path, config: dict) -> float:
+    def _get_accurate_param_count(self, snapshot_dir: Path, config: dict) -> tuple[float, bool]:
         """Get accurate parameter count using best available method.
 
         Priority:
@@ -484,7 +519,7 @@ class ModelMetadataCache:
             config: Loaded config.json
 
         Returns:
-            Parameter count in billions
+            Tuple of (parameter count in billions, is_exact: bool)
         """
         # METHOD 1: Check safetensors.index.json (BEST - exact count)
         index_path = snapshot_dir / "model.safetensors.index.json"
@@ -492,10 +527,24 @@ class ModelMetadataCache:
             try:
                 with open(index_path, "r") as f:
                     index = json.load(f)
-                    total_params = index.get("metadata", {}).get("total_size")
-                    if total_params:
-                        logger.debug(f"Got param count from safetensors index: {total_params / 1e9:.2f}B")
-                        return total_params / 1e9
+                    total_size_bytes = index.get("metadata", {}).get("total_size")
+                    if total_size_bytes:
+                        # total_size is in BYTES, need to convert to parameter count
+                        # Must know the quantization to calculate params from bytes
+                        # Get quantization first
+                        quant = self._detect_actual_quantization(snapshot_dir, config)
+
+                        # Bytes per parameter
+                        bytes_per_param = {
+                            "fp32": 4.0, "fp16": 2.0, "bf16": 2.0,
+                            "int8": 1.0, "int4": 0.5,
+                        }
+                        bpp = bytes_per_param.get(quant, 2.0)  # Default to fp16/bf16
+
+                        # Calculate parameter count from bytes
+                        param_count = total_size_bytes / bpp / 1e9
+                        logger.debug(f"Got param count from safetensors index: {param_count:.2f}B ({total_size_bytes:,} bytes ÷ {bpp} bytes/param)")
+                        return (param_count, True)  # Exact
             except Exception as e:
                 logger.debug(f"Could not read safetensors index: {e}")
 
@@ -503,8 +552,9 @@ class ModelMetadataCache:
         param_fields = ["num_parameters", "_num_parameters", "n_params", "total_params"]
         for field in param_fields:
             if field in config and isinstance(config[field], (int, float)):
-                logger.debug(f"Got param count from config.{field}: {config[field] / 1e9:.2f}B")
-                return config[field] / 1e9
+                param_count = config[field] / 1e9
+                logger.debug(f"Got param count from config.{field}: {param_count:.2f}B")
+                return (param_count, True)  # Exact
 
         # METHOD 3: Estimate from safetensors file sizes
         safetensors_files = list(snapshot_dir.glob("*.safetensors"))
@@ -514,17 +564,18 @@ class ModelMetadataCache:
 
             # Estimate based on typical quantization (assume bf16/fp16 = 2 bytes per param)
             params_billions = total_size_gb / 2.0
-            logger.debug(f"Estimated params from file size: {params_billions:.2f}B (assuming fp16/bf16)")
-            return params_billions
+            logger.debug(f"Estimated params from file size: ~{params_billions:.2f}B (assuming fp16/bf16)")
+            return (params_billions, False)  # Approximate
 
         # METHOD 4: Formula-based estimation (DEPRECATED - last resort)
         logger.warning(f"Using deprecated formula-based estimation for {snapshot_dir.name}")
-        return self._calculate_params_from_config(config)
+        return (self._calculate_params_from_config(config), False)  # Approximate
 
     def _detect_actual_quantization(self, snapshot_dir: Path, config: dict) -> str:
         """Detect actual quantization from tensor dtypes in safetensors.
 
         This checks the ACTUAL storage format, not what config claims.
+        Uses lightweight header parsing to avoid loading model weights.
 
         Args:
             snapshot_dir: Path to model snapshot directory
@@ -537,30 +588,41 @@ class ModelMetadataCache:
         safetensors_files = list(snapshot_dir.glob("*.safetensors"))
         if safetensors_files:
             try:
-                from safetensors import safe_open
+                # Read safetensors header WITHOUT loading weights (memory efficient)
+                # Safetensors format: 8 bytes (header size) + JSON header + tensors
+                with open(safetensors_files[0], "rb") as f:
+                    # Read header size (first 8 bytes, little-endian uint64)
+                    import struct
+                    header_size_bytes = f.read(8)
+                    header_size = struct.unpack("<Q", header_size_bytes)[0]
 
-                with safe_open(safetensors_files[0], framework="pt", device="cpu") as f:
-                    # Check first tensor's dtype
-                    keys = list(f.keys())
-                    if keys:
-                        first_tensor = f.get_tensor(keys[0])
-                        dtype = str(first_tensor.dtype).replace("torch.", "")
+                    # Read JSON header (doesn't load tensor data!)
+                    header_json = f.read(header_size).decode("utf-8")
+                    header = json.loads(header_json)
 
-                        # Map torch dtypes to standard quantization names
+                    # Extract dtype from first tensor in header
+                    # Header structure: {"tensor_name": {"dtype": "BF16", "shape": [...], ...}, ...}
+                    for tensor_name, tensor_info in header.items():
+                        if tensor_name.startswith("__"):  # Skip metadata keys
+                            continue
+
+                        dtype_str = tensor_info.get("dtype", "").upper()
+
+                        # Map safetensors dtypes to standard names
                         dtype_map = {
-                            "float32": "fp32",
-                            "float16": "fp16",
-                            "bfloat16": "bf16",
-                            "int8": "int8",
-                            "uint8": "uint8",
+                            "F32": "fp32",
+                            "F16": "fp16",
+                            "BF16": "bf16",
+                            "I8": "int8",
+                            "U8": "uint8",
                         }
 
-                        quant = dtype_map.get(dtype, dtype)
-                        logger.debug(f"Detected actual quantization from tensors: {quant}")
+                        quant = dtype_map.get(dtype_str, dtype_str.lower())
+                        logger.debug(f"Detected actual quantization from safetensors header: {quant} (memory efficient)")
                         return quant
 
             except Exception as e:
-                logger.debug(f"Could not read safetensors dtype: {e}")
+                logger.debug(f"Could not read safetensors header: {e}")
 
         # Fallback to config-based detection
         return self._detect_quantization_hf(config)
@@ -634,14 +696,20 @@ class ModelMetadataCache:
         return mapping.get(torch_dtype, "fp32")
 
     def _estimate_ram(self, params_billions: float, quantization: str) -> float:
-        """Estimate RAM needed for model loading.
+        """Estimate RAM needed for model loading (weights + overhead).
+
+        Formula: RAM = (params × bytes_per_param) + overhead
+        Overhead accounts for:
+        - KV cache (context-dependent, assume 2K tokens = ~10-15% of model)
+        - Activation memory during inference (~5-10% of model)
+        - Python/framework overhead (~5%)
 
         Args:
             params_billions: Parameter count in billions
             quantization: Quantization type
 
         Returns:
-            Estimated RAM in GB
+            Estimated RAM in GB (always approximate)
         """
         # Bytes per parameter based on quantization
         bytes_per_param = {
@@ -658,13 +726,14 @@ class ModelMetadataCache:
 
         # Extract base quantization if specific variant
         base_quant = quantization.split("_")[0] if "_" in quantization else quantization
-        bpp = bytes_per_param.get(quantization, bytes_per_param.get(base_quant, 4.0))
+        bpp = bytes_per_param.get(quantization, bytes_per_param.get(base_quant, 2.0))
 
-        # Calculate base RAM
-        base_ram_gb = (params_billions * 1e9 * bpp) / 1e9
+        # Calculate base model size in GB
+        base_ram_gb = (params_billions * bpp)
 
-        # Add 20% overhead for KV cache, activations, etc.
-        total_ram_gb = base_ram_gb * 1.2
+        # Add 25% overhead for KV cache + activations + framework
+        # This is conservative to avoid OOM errors
+        total_ram_gb = base_ram_gb * 1.25
 
         return round(total_ram_gb, 2)
 

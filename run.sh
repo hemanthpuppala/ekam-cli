@@ -127,8 +127,27 @@ if python3 -c "import llama_cpp" 2>/dev/null; then
     GGUF_STATUS="installed"
 else
     echo -e "${YELLOW}⚠ Not installed${NC}"
-    echo -e "  ${BLUE}→${NC} Optional provider (not required)"
+    echo -e "  ${BLUE}→${NC} Run: ${YELLOW}pip install -r requirements.txt${NC}"
     GGUF_STATUS="missing"
+fi
+
+echo -n "GGUF Quantization Tools: "
+if command -v llama-quantize &> /dev/null; then
+    echo -e "${GREEN}✓ Available${NC}"
+    echo -e "  ${BLUE}→${NC} llama.cpp tools installed"
+    GGUF_QUANT_STATUS="available"
+elif python3 -c "import llama_cpp; exit(0 if hasattr(llama_cpp, 'llama_model_quantize') else 1)" 2>/dev/null; then
+    echo -e "${YELLOW}⚠ Partial support${NC}"
+    echo -e "  ${BLUE}→${NC} llama-cpp-python installed but llama.cpp CLI tools missing"
+    echo -e "  ${BLUE}→${NC} HF→GGUF conversion requires: ${YELLOW}brew install llama.cpp${NC}"
+    echo -e "  ${BLUE}→${NC} Use Generic quantization for HF models instead"
+    GGUF_QUANT_STATUS="partial"
+else
+    echo -e "${YELLOW}⚠ Not available${NC}"
+    echo -e "  ${BLUE}→${NC} GGUF quantization will not be available"
+    echo -e "  ${BLUE}→${NC} Install: ${YELLOW}brew install llama.cpp${NC}"
+    echo -e "  ${BLUE}→${NC} Or use Generic quantization instead"
+    GGUF_QUANT_STATUS="missing"
 fi
 
 echo

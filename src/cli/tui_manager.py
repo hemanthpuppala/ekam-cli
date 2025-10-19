@@ -200,6 +200,41 @@ class TUIManager:
 
         return layout
 
+    def show_status_bar(self, status_text: str) -> None:
+        """Show a persistent status bar at the bottom of the screen.
+
+        Args:
+            status_text: Status text to display
+        """
+        if not status_text:
+            return
+
+        width, height = self.get_terminal_size()
+
+        # Move cursor to bottom, show status bar
+        status_panel = Panel(
+            status_text,
+            border_style="yellow",
+            width=width,
+            expand=False
+        )
+
+        # Print status at bottom
+        self.console.print(f"\n{status_panel}")
+
+    def clear_and_show_with_status(self, content, status_text: str = "") -> None:
+        """Clear screen, show content, and add status bar at bottom.
+
+        Args:
+            content: Content to display
+            status_text: Status bar text (optional)
+        """
+        self.clear_screen()
+        self.console.print(content)
+
+        if status_text:
+            self.show_status_bar(status_text)
+
 
 # Global TUI instance
 tui = TUIManager()

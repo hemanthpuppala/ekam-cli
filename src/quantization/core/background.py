@@ -65,8 +65,18 @@ class BackgroundJobManager:
             try:
                 logger.info(f"Starting quantization task {task.task_id}")
 
-                # Define progress wrapper
+                # Define progress wrapper that updates task AND saves state
                 def progress_wrapper(progress: float, eta: Optional[float]):
+                    task.progress = progress
+                    task.eta_seconds = eta
+                    task.status = TaskStatus.RUNNING
+
+                    # Save state periodically (every 5% progress)
+                    if int(progress) % 5 == 0:
+                        with self.lock:
+                            self._save_state()
+
+                    # Call external callback if provided
                     if progress_callback:
                         progress_callback(task.task_id, progress, eta)
 
@@ -170,6 +180,32 @@ class BackgroundJobManager:
             logger.info(f"Task {task_id} marked for cancellation")
             return True
 
+    def remove_task(self, task_id: str) -> bool:
+        """Remove a completed or failed task from the job list.
+
+        Args:
+            task_id: Task ID to remove
+
+        Returns:
+            True if removed, False if not found or still active
+        """
+        with self.lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return False
+
+            # Only allow removal of finished tasks
+            if not task.is_finished:
+                logger.warning(f"Cannot remove active task {task_id}")
+                return False
+
+            # Remove from tasks dict
+            del self.tasks[task_id]
+            self._save_state()
+
+            logger.info(f"Task {task_id} removed from job list")
+            return True
+
     def has_active_jobs(self) -> bool:
         """Check if there are any active jobs.
 
@@ -252,7 +288,7 @@ class BackgroundJobManager:
             logger.error(f"Failed to save state: {e}")
 
     def _load_state(self):
-        """Load state from disk."""
+        """Load state from disk and reconstruct tasks."""
         if not self.state_file.exists():
             logger.debug("No state file found, starting fresh")
             return
@@ -261,13 +297,41 @@ class BackgroundJobManager:
             with open(self.state_file, "r") as f:
                 state = json.load(f)
 
-            # Load tasks (but don't restart them - just for history)
+            # Reconstruct tasks from saved state
+            tasks_loaded = 0
             for task_dict in state.get("tasks", []):
-                # TODO: Reconstruct QuantizationTask from dict
-                # For now, skip loading old tasks
-                pass
+                try:
+                    task = QuantizationTask.from_dict(task_dict)
+                    self.tasks[task.task_id] = task
+                    tasks_loaded += 1
 
-            logger.info(f"Loaded state from {self.state_file}")
+                    # Log active tasks that were reloaded
+                    if task.is_active:
+                        logger.info(
+                            f"Reloaded active task {task.task_id}: "
+                            f"{task.model_info.name} → {task.quant_type.display_name} "
+                            f"({task.status.value}, {task.progress:.1f}%)"
+                        )
+                    elif task.is_finished:
+                        logger.debug(
+                            f"Reloaded finished task {task.task_id}: {task.status.value}"
+                        )
+
+                except Exception as e:
+                    logger.error(f"Failed to reconstruct task from dict: {e}")
+                    continue
+
+            logger.info(f"Loaded {tasks_loaded} tasks from {self.state_file}")
+
+            # Note: Background threads can't be restored (Python limitation)
+            # Active tasks will show their last saved state, but can't be rejoined
+            active_count = len([t for t in self.tasks.values() if t.is_active])
+            if active_count > 0:
+                logger.warning(
+                    f"{active_count} active tasks found in state, but their "
+                    f"background threads cannot be restored. They may still be "
+                    f"running in the background and will complete normally."
+                )
 
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
@@ -282,6 +346,20 @@ class BackgroundJobManager:
             task: Completed quantization task
         """
         try:
+            # Calculate actual size (handle both files and directories)
+            quantized_size_gb = 0.0
+            if task.output_path.exists():
+                if task.output_path.is_file():
+                    # Single file (e.g., GGUF)
+                    quantized_size_gb = task.output_path.stat().st_size / (1024 ** 3)
+                elif task.output_path.is_dir():
+                    # Directory (e.g., HuggingFace format) - sum all files
+                    total_bytes = 0
+                    for file_path in task.output_path.rglob("*"):
+                        if file_path.is_file():
+                            total_bytes += file_path.stat().st_size
+                    quantized_size_gb = total_bytes / (1024 ** 3)
+
             metadata = {
                 "quant_type": task.quant_type.value,
                 "quant_display_name": task.quant_type.display_name,
@@ -291,7 +369,7 @@ class BackgroundJobManager:
                 "original_model_name": task.model_info.name,
                 "original_provider": str(task.model_info.provider),
                 "original_size_gb": task.model_info.size_gb,
-                "quantized_size_gb": task.output_path.stat().st_size / (1024 ** 3) if task.output_path.exists() else 0,
+                "quantized_size_gb": quantized_size_gb,
                 "task_id": task.task_id,
                 "started_at": task.started_at.isoformat() if task.started_at else None,
                 "completed_at": task.completed_at.isoformat() if task.completed_at else None,

@@ -9,6 +9,7 @@ from PIL import Image
 
 from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
+from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..utils.history_formatter import format_conversation_history, format_qa_history
 from .base import BaseProvider
@@ -29,6 +30,10 @@ class GGUFProvider(BaseProvider):
 
         # Ensure models directory exists
         self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize metadata cache for efficient model inspection
+        self.metadata_cache = ModelMetadataCache()
+        logger.debug("Initialized model metadata cache")
 
         # Determine if GPU is available
         self.use_gpu = self._check_gpu_availability()
@@ -51,7 +56,7 @@ class GGUFProvider(BaseProvider):
         return False
 
     def discover_models(self) -> list[ModelInfo]:
-        """Discover GGUF models in models directory.
+        """Discover GGUF models in models directory using metadata cache.
 
         Returns:
             List of ModelInfo objects for found GGUF files
@@ -68,26 +73,70 @@ class GGUFProvider(BaseProvider):
                 if not gguf_file.is_file():
                     continue
 
+                # Skip macOS metadata files (._filename)
+                if gguf_file.name.startswith('._'):
+                    continue
+
                 # Use file name as model ID (without extension)
                 model_id = gguf_file.stem
-                size_gb = gguf_file.stat().st_size / (1024**3)
 
-                # Classify model type by name
-                model_type, capabilities = self._classify_gguf_model(model_id)
+                # Get metadata from cache (reads GGUF header only, no full model loading)
+                metadata = self.metadata_cache.get_metadata(str(gguf_file), provider="gguf")
 
-                model_info = ModelInfo(
-                    model_id=str(gguf_file),  # Use full path as ID
-                    name=model_id,  # Use filename as display name
-                    provider="gguf",
-                    size_gb=size_gb,
-                    model_type=model_type,
-                    capabilities=capabilities,
-                    compatibility=CompatibilityStatus.PERFECT_FIT,
-                    compatibility_message="Compatibility not yet assessed",
-                    is_installed=True,
-                )
+                # Convert metadata to ModelInfo
+                if metadata:
+                    # Map metadata model_type to ModelType enum
+                    if metadata.model_type == "vlm":
+                        model_type = ModelType.VLM
+                        capabilities = [
+                            EndpointType.QA,
+                            EndpointType.CAPTION,
+                            EndpointType.DETECT,
+                            EndpointType.POINT,
+                            EndpointType.TEXT,
+                        ]
+                    elif metadata.model_type == "embedding":
+                        model_type = ModelType.EMBEDDING
+                        capabilities = []
+                    else:  # llm or unknown
+                        model_type = ModelType.LLM
+                        capabilities = [EndpointType.TEXT]
+
+                    model_info = ModelInfo(
+                        model_id=str(gguf_file),  # Use full path as ID
+                        name=model_id,  # Use filename as display name
+                        provider="gguf",
+                        size_gb=metadata.file_size_gb,
+                        architecture=metadata.architecture,
+                        quantization=metadata.quantization,
+                        params_billions=metadata.params_billions,
+                        ram_gb=metadata.ram_gb,
+                        vram_gb=metadata.vram_gb,
+                        model_type=model_type,
+                        capabilities=capabilities,
+                        compatibility=CompatibilityStatus.PERFECT_FIT,
+                        compatibility_message="Compatibility not yet assessed",
+                        is_installed=True,
+                    )
+                else:
+                    # Fallback: metadata inspection failed, use basic info
+                    logger.warning(f"Could not get metadata for {model_id}, using fallback")
+                    size_gb = gguf_file.stat().st_size / (1024**3)
+                    model_type, capabilities = self._classify_gguf_model(model_id)
+                    model_info = ModelInfo(
+                        model_id=str(gguf_file),
+                        name=model_id,
+                        provider="gguf",
+                        size_gb=size_gb,
+                        model_type=model_type,
+                        capabilities=capabilities,
+                        compatibility=CompatibilityStatus.PERFECT_FIT,
+                        compatibility_message="Compatibility not yet assessed",
+                        is_installed=True,
+                    )
+
                 models.append(model_info)
-                logger.debug(f"Discovered GGUF model: {model_id}")
+                logger.debug(f"Discovered GGUF model: {model_id} ({metadata.model_type if metadata else 'unknown'}, {metadata.quantization if metadata else 'unknown'})")
 
             logger.info(f"Discovered {len(models)} GGUF models")
             return models
@@ -96,8 +145,13 @@ class GGUFProvider(BaseProvider):
             logger.error(f"Error discovering GGUF models: {e}")
             return models
 
+    # DEPRECATED: This method is no longer used - metadata cache provides dynamic detection
+    # Keeping for backward compatibility only (used in fallback scenarios)
     def _classify_gguf_model(self, model_name: str) -> tuple[ModelType, list[EndpointType]]:
-        """Classify GGUF model by name patterns.
+        """[DEPRECATED] Classify GGUF model by name patterns.
+
+        This method is deprecated in favor of metadata cache which reads actual GGUF header.
+        Only used as a fallback when metadata inspection fails.
 
         Args:
             model_name: Model filename (without .gguf)
@@ -107,7 +161,7 @@ class GGUFProvider(BaseProvider):
         """
         name_lower = model_name.lower()
 
-        # VLM keywords
+        # VLM keywords (fallback only)
         vlm_keywords = [
             "llava", "bakllava", "obsidian", "vision", "clip",
             "moondream", "cogvlm", "minicpm-v"
@@ -147,19 +201,56 @@ class GGUFProvider(BaseProvider):
         try:
             from llama_cpp import Llama
 
-            # Configure GPU layers based on device preference
-            n_gpu_layers = -1 if self.use_gpu else 0
+            # Check if this is a Jamba/Mamba model - needs special handling
+            model_name_lower = str(model_id).lower()
+            is_jamba = any(keyword in model_name_lower for keyword in ['jamba', 'mamba'])
+
+            # Jamba/Mamba models have compatibility issues with MPS (Apple Metal)
+            # Force CPU mode for stability on macOS
+            if is_jamba and self.use_gpu:
+                # Check if we're on MPS (Apple Silicon)
+                import torch
+                if torch.backends.mps.is_available():
+                    logger.warning(
+                        "Jamba/Mamba models have compatibility issues with MPS (Apple Metal). "
+                        "Forcing CPU mode for stability. This will be slower but more reliable."
+                    )
+                    n_gpu_layers = 0  # Force CPU
+                else:
+                    # CUDA is more stable for Jamba
+                    n_gpu_layers = -1 if self.use_gpu else 0
+            else:
+                # Standard GPU configuration for other models
+                n_gpu_layers = -1 if self.use_gpu else 0
+
+            # Determine optimal context size based on model
+            # Larger context for newer/hybrid architectures that may need more space
+            if is_jamba:
+                # Jamba and other hybrid models may need larger context
+                n_ctx = 4096
+                logger.info(f"Using extended context window (4096) for hybrid architecture model")
+            else:
+                # Standard context for most models
+                n_ctx = 2048
 
             # Load model
             llama = Llama(
                 model_path=model_id,
-                n_ctx=2048,  # Context window
+                n_ctx=n_ctx,  # Context window (auto-adjusted)
                 n_gpu_layers=n_gpu_layers,
                 n_threads=os.cpu_count() or 4,
                 verbose=False,
             )
 
-            logger.info(f"Loaded GGUF model (GPU layers: {n_gpu_layers})")
+            logger.info(f"Loaded GGUF model (GPU layers: {n_gpu_layers}, context: {n_ctx})")
+
+            # Warn about experimental architecture support
+            if 'jamba' in model_name_lower:
+                logger.warning(
+                    "Jamba uses a hybrid Mamba+Transformer architecture. "
+                    "If you encounter generation errors, try: (1) shorter prompts, "
+                    "(2) /clear to reset history, or (3) CPU mode (set GPU layers to 0)"
+                )
             return llama
 
         except Exception as e:
@@ -214,7 +305,7 @@ class GGUFProvider(BaseProvider):
 
             response = handle.create_completion(
                 prompt=prompt,
-                max_tokens=512,
+                max_tokens=1024,  # Increased for more detailed responses
                 temperature=0.7,
                 stop=["Q:", "\n\n"]
             )
@@ -339,13 +430,31 @@ class GGUFProvider(BaseProvider):
             # Build generation parameters with defaults
             gen_params = {
                 "prompt": full_prompt,
-                "max_tokens": 512,
+                "max_tokens": 1024,  # Increased for more detailed responses
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "top_k": 40,
                 "repeat_penalty": 1.1,
-                "stop": ["\n\n", "User:"]
+                "stop": ["\n\n", "User:"]  # Default stop tokens
             }
+
+            # Model-specific stop tokens for better generation control
+            # DeepSeek-R1 reasoning models need special handling
+            model_id_str = str(getattr(handle, "model_path", "")).lower()
+            if "deepseek" in model_id_str or "r1" in model_id_str:
+                # DeepSeek-R1 uses Chain-of-Thought reasoning with <think> tags
+                # Add stop tokens to prevent over-generation and reasoning leakage
+                gen_params["stop"] = [
+                    "\n\n",           # Standard paragraph break
+                    "User:",          # Chat template boundary
+                    "<think>",        # Start of reasoning (shouldn't appear in output)
+                    "</think>",       # End of reasoning (shouldn't appear in output)
+                    "\n\nUser:",      # Combined boundary
+                    "\n\n---",        # Section break
+                    "Human:",         # Alternative template
+                    "Assistant:",     # Alternative template boundary
+                ]
+                logger.debug("Using DeepSeek-R1 stop tokens to prevent over-generation")
 
             # Override with custom parameters from session
             if custom_parameters:
@@ -362,9 +471,54 @@ class GGUFProvider(BaseProvider):
                 if "seed" in custom_parameters:
                     gen_params["seed"] = custom_parameters["seed"]
 
-            response = handle.create_completion(**gen_params)
+            try:
+                response = handle.create_completion(**gen_params)
+            except Exception as gen_error:
+                # llama_decode errors (-1, -2) indicate generation failures
+                error_str = str(gen_error)
+                if "llama_decode" in error_str or "returned -1" in error_str:
+                    # Context or generation failure - try with reduced parameters
+                    logger.warning(f"Generation failed, retrying with reduced parameters: {gen_error}")
 
-            return response["choices"][0]["text"].strip()
+                    # Retry with smaller max_tokens and shorter history
+                    retry_prompt = format_conversation_history(
+                        conversation_history=conversation_history[-2:] if conversation_history else None,  # Only last 2 turns
+                        current_prompt=prompt,
+                        max_turns=2,
+                        system_prompt=None,
+                        model_name=None
+                    )
+
+                    retry_params = {
+                        "prompt": retry_prompt,
+                        "max_tokens": 512,  # Reduced from 1024
+                        "temperature": gen_params["temperature"],
+                        "top_p": gen_params["top_p"],
+                        "top_k": gen_params["top_k"],
+                        "repeat_penalty": gen_params["repeat_penalty"],
+                        "stop": gen_params["stop"]
+                    }
+
+                    try:
+                        response = handle.create_completion(**retry_params)
+                        logger.info("Retry successful with reduced parameters")
+                    except Exception as retry_error:
+                        logger.error(f"Retry also failed: {retry_error}")
+                        raise RuntimeError(
+                            f"Text generation failed. This model may have compatibility issues with long responses. "
+                            f"Try: (1) shorter prompts, (2) /clear to reset history, or (3) a different model. "
+                            f"Error: {error_str}"
+                        )
+                else:
+                    # Other error - re-raise
+                    raise
+
+            # Clean response to remove artifacts and meta-commentary
+            from ..utils.response_cleaner import clean_model_response
+            response_text = response["choices"][0]["text"]
+            cleaned_response = clean_model_response(response_text, aggressive=True)
+
+            return cleaned_response
 
         except Exception as e:
             logger.error(f"Text generation failed: {e}")
@@ -407,6 +561,53 @@ class GGUFProvider(BaseProvider):
         except Exception as e:
             logger.error(f"Failed to delete GGUF model: {e}")
             return False
+
+    def get_model_info(self, model_id: str) -> dict:
+        """Get detailed model information for GGUF models.
+
+        Args:
+            model_id: Model identifier (file path)
+
+        Returns:
+            Dict with model metadata including default_parameters
+        """
+        # Find the model in discovered models
+        models = self.discover_models()
+        model = next((m for m in models if m.model_id == model_id), None)
+
+        if not model:
+            # Return minimal info if not found
+            return {
+                "model_id": model_id,
+                "name": model_id,
+                "provider": "gguf",
+                "default_parameters": {
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                    "max_tokens": 1024,  # Increased for more detailed responses
+                    "repeat_penalty": 1.1,
+                }
+            }
+
+        # Return full model info
+        return {
+            "model_id": model.model_id,
+            "name": model.name,
+            "provider": "gguf",
+            "architecture": model.architecture or "Unknown",
+            "quantization": model.quantization or "Unknown",
+            "size_gb": model.size_gb,
+            "model_type": str(model.model_type).upper() if hasattr(model.model_type, 'value') else str(model.model_type).upper(),
+            "capabilities": [str(cap) for cap in model.capabilities] if model.capabilities else ["text"],
+            "default_parameters": {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 40,
+                "max_tokens": 1024,  # Increased for more detailed responses
+                "repeat_penalty": 1.1,
+            }
+        }
 
     def estimate_model_size(self, model_name: str) -> float:
         """Estimate GGUF model size.

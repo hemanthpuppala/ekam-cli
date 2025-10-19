@@ -10,6 +10,7 @@ from .display import (
     show_quantization_intro,
 )
 from .workflow import run_quantization_workflow, show_background_jobs_monitor
+from .workflow_steps import run_step_based_workflow
 
 __all__ = [
     "show_quantization_intro",
@@ -20,5 +21,6 @@ __all__ = [
     "ask_background_mode",
     "show_live_progress",
     "run_quantization_workflow",
+    "run_step_based_workflow",
     "show_background_jobs_monitor",
 ]

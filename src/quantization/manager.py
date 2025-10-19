@@ -65,12 +65,14 @@ class QuantizationManager:
         self,
         model_info: ModelInfo,
         use_gpu: bool = False,
+        method: str = "generic",
     ) -> list:
         """Get quantization recommendations for a model.
 
         Args:
             model_info: Model to quantize
             use_gpu: Whether GPU will be used
+            method: Quantization method ("generic", "advanced", "gguf", "gguf_conversion")
 
         Returns:
             List of recommendations
@@ -85,14 +87,32 @@ class QuantizationManager:
                 method_family="GGUF",
                 use_gpu=use_gpu,
             )
-        # HuggingFace models: Generic quantization (FP16/INT8/INT4)
+        # HuggingFace models: Support Generic, Advanced, and GGUF conversion
         elif model_info.provider == ProviderType.HUGGINGFACE:
-            return get_quantization_recommendations(
-                model_info=model_info,
-                system_specs=self.system_specs,
-                method_family="Generic",
-                use_gpu=use_gpu,
-            )
+            if method == "gguf_conversion":
+                # GGUF conversion + quantization
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="GGUF",  # Will convert to GGUF first
+                    use_gpu=use_gpu,
+                )
+            elif method == "advanced":
+                # Advanced 4-bit quantization (GPTQ/AWQ/BnB)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Advanced",
+                    use_gpu=use_gpu,
+                )
+            else:
+                # Generic quantization (FP16/INT8/INT4)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Generic",
+                    use_gpu=use_gpu,
+                )
 
         return []
 
@@ -103,6 +123,7 @@ class QuantizationManager:
         module: QuantizationModule,
         use_gpu: bool = False,
         background: bool = False,
+        vlm_components: Optional[str] = None,
     ) -> QuantizationTask:
         """Create a quantization task.
 
@@ -112,6 +133,7 @@ class QuantizationManager:
             module: Quantization module to use
             use_gpu: Whether to use GPU
             background: Whether to run in background
+            vlm_components: For VLMs, which components to quantize ("vision", "language", "both", or None)
 
         Returns:
             Created task
@@ -133,6 +155,7 @@ class QuantizationManager:
             output_path=output_path,
             use_gpu=use_gpu,
             background=background,
+            vlm_components=vlm_components,
         )
 
         logger.info(f"Created quantization task {task_id}: {model_info.name} → {quant_type.display_name}")
@@ -186,6 +209,17 @@ class QuantizationManager:
             True if cancelled
         """
         return self.job_manager.cancel_task(task_id)
+
+    def remove_task(self, task_id: str) -> bool:
+        """Remove a completed or failed task from the job list.
+
+        Args:
+            task_id: Task ID
+
+        Returns:
+            True if removed
+        """
+        return self.job_manager.remove_task(task_id)
 
     def has_active_jobs(self) -> bool:
         """Check if there are active jobs.

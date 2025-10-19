@@ -11,6 +11,7 @@ from PIL import Image
 
 from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
+from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..utils.history_formatter import format_qa_history
 from .base import BaseProvider
@@ -29,6 +30,10 @@ class OllamaProvider(BaseProvider):
         self.base_url = str(config.host).rstrip("/")
         self.timeout = config.timeout_seconds
         self.client = httpx.Client(timeout=self.timeout)
+
+        # Initialize metadata cache for efficient model inspection
+        self.metadata_cache = ModelMetadataCache()
+        logger.debug("Initialized model metadata cache")
 
     def discover_models(self) -> list[ModelInfo]:
         """Discover available models from Ollama server.
@@ -63,7 +68,7 @@ class OllamaProvider(BaseProvider):
             raise RuntimeError(f"Failed to discover Ollama models: {e}")
 
     def _parse_model_info(self, model_data: dict) -> ModelInfo:
-        """Parse Ollama model data into ModelInfo.
+        """Parse Ollama model data into ModelInfo using metadata cache.
 
         Args:
             model_data: Raw model data from Ollama API
@@ -72,24 +77,63 @@ class OllamaProvider(BaseProvider):
             ModelInfo instance with capabilities
         """
         name = model_data.get("name", "unknown")
-        size_bytes = model_data.get("size", 0)
-        size_gb = size_bytes / (1024**3)
 
-        # Dynamically classify model type using API introspection
-        model_type, capabilities = self._classify_model_dynamic(name)
+        # Get metadata from cache (uses ollama show --json command)
+        metadata = self.metadata_cache.get_metadata(name, provider="ollama")
 
-        # Create ModelInfo (compatibility will be assessed later by ResourceManager)
-        return ModelInfo(
-            model_id=name,
-            name=name,
-            provider="ollama",
-            size_gb=size_gb,
-            model_type=model_type,
-            capabilities=capabilities,
-            compatibility=CompatibilityStatus.PERFECT_FIT,  # Placeholder
-            compatibility_message="Compatibility not yet assessed",
-            is_installed=True,
-        )
+        if metadata:
+            # Map metadata model_type to ModelType enum
+            if metadata.model_type == "vlm":
+                model_type = ModelType.VLM
+                capabilities = [
+                    EndpointType.QA,
+                    EndpointType.CAPTION,
+                    EndpointType.DETECT,
+                    EndpointType.POINT,
+                    EndpointType.TEXT,
+                ]
+            elif metadata.model_type == "embedding":
+                model_type = ModelType.EMBEDDING
+                capabilities = []
+            else:  # llm or unknown
+                model_type = ModelType.LLM
+                capabilities = [EndpointType.TEXT]
+
+            # Create ModelInfo with metadata
+            return ModelInfo(
+                model_id=name,
+                name=name,
+                provider="ollama",
+                size_gb=metadata.file_size_gb,
+                architecture=metadata.architecture,
+                quantization=metadata.quantization,
+                params_billions=metadata.params_billions,
+                ram_gb=metadata.ram_gb,
+                vram_gb=metadata.vram_gb,
+                model_type=model_type,
+                capabilities=capabilities,
+                compatibility=CompatibilityStatus.PERFECT_FIT,
+                compatibility_message="Compatibility not yet assessed",
+                is_installed=True,
+            )
+        else:
+            # Fallback: metadata inspection failed, use API introspection
+            logger.warning(f"Could not get metadata for {name}, using API fallback")
+            size_bytes = model_data.get("size", 0)
+            size_gb = size_bytes / (1024**3)
+            model_type, capabilities = self._classify_model_dynamic(name)
+
+            return ModelInfo(
+                model_id=name,
+                name=name,
+                provider="ollama",
+                size_gb=size_gb,
+                model_type=model_type,
+                capabilities=capabilities,
+                compatibility=CompatibilityStatus.PERFECT_FIT,
+                compatibility_message="Compatibility not yet assessed",
+                is_installed=True,
+            )
 
     def _classify_model_dynamic(self, name: str) -> tuple[ModelType, list[EndpointType]]:
         """Dynamically classify model type by inspecting model details via API.
@@ -387,7 +431,7 @@ class OllamaProvider(BaseProvider):
                     "temperature": 0.7,
                     "top_p": 0.9,
                     "top_k": 40,
-                    "max_tokens": 512,
+                    "max_tokens": 1024,  # Increased for more detailed responses
                     "repeat_penalty": 1.1,
                 }
             }
@@ -713,7 +757,11 @@ class OllamaProvider(BaseProvider):
             logger.warning(f"Empty response from {model_id}")
             return "No response generated."
 
-        return message_content
+        # Apply response cleaning to remove artifacts and meta-commentary
+        from ..utils.response_cleaner import clean_model_response
+        cleaned_response = clean_model_response(message_content, aggressive=True)
+
+        return cleaned_response
 
     def install_model(
         self, model_name: str, progress_callback: Optional[Callable[[str, int, int], None]] = None

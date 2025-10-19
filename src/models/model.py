@@ -46,6 +46,8 @@ class ModelInfo(BaseModel):
     params_billions: Optional[float] = None  # Parameter count in billions (e.g., 3.2, 7.0)
     ram_gb: Optional[float] = None  # Estimated RAM requirement in GB
     vram_gb: Optional[float] = None  # Estimated VRAM requirement in GB
+    params_exact: Optional[bool] = None  # True if params_billions is exact, False if estimated
+    ram_exact: Optional[bool] = None  # True if ram_gb is exact, False if estimated
 
     @computed_field
     @property
