@@ -3,7 +3,7 @@
 import errno
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from loguru import logger
 from PIL import Image, UnidentifiedImageError
@@ -180,7 +180,7 @@ def save_annotated_image(
     image: Image.Image,
     detections: list[dict],
     output_path: Path,
-    original_size: tuple[int, int] | None = None
+    original_size: Optional[Tuple[int, int]] = None
 ) -> Path:
     """Draw bounding boxes or points on image and save.
 

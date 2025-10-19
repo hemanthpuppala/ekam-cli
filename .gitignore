@@ -44,7 +44,8 @@ env/
 
 # Application Specific
 results/
-!results/.gitkeep
+!results/quantizations/
+!results/quantizations/.gitkeep
 logs/
 *.log
 
@@ -54,6 +55,9 @@ CLAUDE.md
 PRODUCTION_CHAT_TEMPLATES.md
 .specify/
 test_images/
+
+# External Dependencies
+llama.cpp/
 
 # Model Caches (large files)
 *.gguf
@@ -80,3 +84,7 @@ htmlcov/
 # OS
 Thumbs.db
 .DS_Store
+.claude/
+
+# Ignore macOS AppleDouble files
+._*

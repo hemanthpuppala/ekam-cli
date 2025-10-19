@@ -1,5 +1,7 @@
 """Menu classes for dynamic TUI interface."""
 
+from typing import Optional
+
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
@@ -55,7 +57,7 @@ class ProviderSelectionMenu:
     """Provider selection menu."""
 
     @staticmethod
-    def show(providers: list[str]) -> str | None:
+    def show(providers: list[str]) -> Optional[str]:
         """Display provider selection menu.
 
         Args:
@@ -91,11 +93,30 @@ class ProviderSelectionMenu:
         tui.console.print(panel)
         tui.console.print()
 
+        # Show navigation
+        tui.console.print("[bold]Navigation:[/bold]")
+        tui.console.print("  [cyan bold]h[/cyan bold] = Main Menu (Home)")
+        tui.console.print("  [cyan bold]q[/cyan bold] = Quit application")
+        tui.console.print()
+
+        # Show special commands
+        tui.console.print("[bold]Commands:[/bold]")
+        tui.console.print("  [yellow]/background[/yellow] = Monitor quantization jobs")
+        tui.console.print()
+
         # Get user selection
-        choice = tui.prompt(f"Select provider [1-{len(providers)}] or 'q' to quit:", style="cyan")
+        choice = tui.prompt(f"Select provider [1-{len(providers)}/h/q]:", style="cyan")
+
+        # Check for /background command
+        if choice.strip().lower().startswith("/background") or choice.strip().lower() == "/bg":
+            from ..core import app
+            if app.handle_background_command():
+                return ProviderSelectionMenu.show(providers)  # Refresh menu
 
         if choice.lower() == 'q':
             return "QUIT"
+        if choice.lower() == 'h':
+            return "HOME"
 
         try:
             idx = int(choice)
@@ -113,7 +134,7 @@ class ModelSelectionMenu:
     """Model selection menu with categorization by type."""
 
     @staticmethod
-    def show(models: list[ModelInfo], provider: str) -> ModelInfo | None:
+    def show(models: list[ModelInfo], provider: str) -> Optional[ModelInfo]:
         """Display categorized model selection menu.
 
         Args:
@@ -154,7 +175,7 @@ class ModelSelectionMenu:
 
             category_meta = category_info.get(category, {"name": category, "color": "white"})
 
-            # Create table for this category
+            # Create table for this category with new metadata columns
             table = Table(
                 show_header=True,
                 header_style="bold white",
@@ -162,10 +183,13 @@ class ModelSelectionMenu:
                 border_style=category_meta["color"],
             )
 
-            table.add_column("#", style="dim", width=4, justify="right")
-            table.add_column("Model Name", style="white", no_wrap=False)
-            table.add_column("Size", justify="right", width=10)
-            table.add_column("Fit", justify="center", width=12)
+            table.add_column("#", style="dim", width=3, justify="right")
+            table.add_column("Model Name", style="white", no_wrap=False, min_width=20)
+            table.add_column("Params", justify="right", width=7)
+            table.add_column("Quant", justify="center", width=8)
+            table.add_column("RAM", justify="right", width=7)
+            table.add_column("Size", justify="right", width=7)
+            table.add_column("Fit", justify="center", width=10)
 
             # Add models in this category
             for model in categorized[category]:
@@ -180,11 +204,39 @@ class ModelSelectionMenu:
                     status_text = "[red]LARGE[/red]"
                     name_style = "dim"
 
-                size_str = f"{model.size_gb:.1f} GB"
+                # Format parameters
+                if model.params_billions and model.params_billions > 0:
+                    params_str = f"{model.params_billions:.1f}B"
+                else:
+                    params_str = "[dim]?[/dim]"
+
+                # Format quantization
+                if model.quantization and model.quantization != "unknown":
+                    quant_display = model.quantization
+                    # Shorten common quantization names
+                    if quant_display.startswith("q") and "_" in quant_display:
+                        quant_display = quant_display.replace("_", "").upper()
+                    elif quant_display in ["fp32", "fp16", "bf16"]:
+                        quant_display = quant_display.upper()
+                    quant_str = f"[yellow]{quant_display}[/yellow]"
+                else:
+                    quant_str = "[dim]?[/dim]"
+
+                # Format RAM estimate
+                if model.ram_gb and model.ram_gb > 0:
+                    ram_str = f"{model.ram_gb:.1f}GB"
+                else:
+                    ram_str = "[dim]?[/dim]"
+
+                # Format file size
+                size_str = f"{model.size_gb:.1f}GB"
 
                 table.add_row(
                     str(idx),
                     f"[{name_style}]{model.name}[/{name_style}]",
+                    params_str,
+                    quant_str,
+                    ram_str,
                     size_str,
                     status_text,
                 )
@@ -221,14 +273,26 @@ class ModelSelectionMenu:
         tui.console.print("  [cyan bold]d[/cyan bold] = Delete a Model")
         tui.console.print("  [cyan bold]b[/cyan bold] = Back to Provider Selection")
         tui.console.print("  [cyan bold]bb[/cyan bold] = Back 2 Levels")
+        tui.console.print("  [cyan bold]h[/cyan bold] = Main Menu (Home)")
         tui.console.print("  [cyan bold]q[/cyan bold] = Quit Application")
+        tui.console.print()
+
+        # Show special commands
+        tui.console.print("[bold]Commands:[/bold]")
+        tui.console.print("  [yellow]/background[/yellow] = Monitor quantization jobs")
         tui.console.print()
 
         # Get user selection
         choice = tui.prompt(
-            f"Select model [1-{len(model_list)}] or option [i/d/b/bb/q]:",
+            f"Select model [1-{len(model_list)}] or option [i/d/b/bb/h/q]:",
             style="cyan"
         )
+
+        # Check for /background command
+        if choice.strip().lower().startswith("/background") or choice.strip().lower() == "/bg":
+            from ..core import app
+            if app.handle_background_command():
+                return ModelSelectionMenu.show(models, provider)  # Refresh menu
 
         if choice.lower() == 'q':
             return "QUIT"
@@ -236,6 +300,8 @@ class ModelSelectionMenu:
             return "BACK2"
         if choice.lower() == 'b':
             return "BACK"
+        if choice.lower() == 'h':
+            return "HOME"
         if choice.lower() == 'i':
             return "INSTALL"
         if choice.lower() == 'd':
@@ -284,7 +350,7 @@ class EndpointMenu:
     """Endpoint selection menu for VLM/LLM models."""
 
     @staticmethod
-    def show(model_name: str, model_type: str) -> str | None:
+    def show(model_name: str, model_type: str) -> Optional[str]:
         """Display endpoint selection menu.
 
         Args:
@@ -346,14 +412,26 @@ class EndpointMenu:
         tui.console.print("  [cyan bold]m[/cyan bold] = Switch Model")
         tui.console.print("  [cyan bold]b[/cyan bold] = Back to Provider Selection")
         tui.console.print("  [cyan bold]bb[/cyan bold] = Back 2 Levels (to Model Selection)")
+        tui.console.print("  [cyan bold]h[/cyan bold] = Main Menu (Home)")
         tui.console.print("  [cyan bold]q[/cyan bold] = Quit Application")
+        tui.console.print()
+
+        # Show special commands
+        tui.console.print("[bold]Commands:[/bold]")
+        tui.console.print("  [yellow]/background[/yellow] = Monitor quantization jobs")
         tui.console.print()
 
         # Get user selection
         choice = tui.prompt(
-            f"[bold]Choose:[/bold] Endpoint number [1-{len(endpoints)}] or option [s/m/b/bb/q]:",
+            f"[bold]Choose:[/bold] Endpoint number [1-{len(endpoints)}] or option [s/m/b/bb/h/q]:",
             style="cyan"
         )
+
+        # Check for /background command
+        if choice.strip().lower().startswith("/background") or choice.strip().lower() == "/bg":
+            from ..core import app
+            if app.handle_background_command():
+                return EndpointMenu.show(model_name, model_type)  # Refresh menu
 
         if choice.lower() == 'q':
             return "QUIT"
@@ -365,6 +443,8 @@ class EndpointMenu:
             return "STATS"
         if choice.lower() == 'm':
             return "SWITCH"
+        if choice.lower() == 'h':
+            return "HOME"
 
         try:
             idx = int(choice)

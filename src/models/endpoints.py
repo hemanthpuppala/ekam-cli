@@ -10,6 +10,7 @@ class ProviderType(str, Enum):
     HUGGINGFACE = "huggingface"
     LM_STUDIO = "lm_studio"
     GGUF = "gguf"
+    QUANTIZED = "quantized"  # Quantized models from results/quantizations/
 
 
 class EndpointType(str, Enum):

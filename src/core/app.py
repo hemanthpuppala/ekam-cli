@@ -38,6 +38,7 @@ from ..models.system import SystemSpecs
 from ..providers.gguf import GGUFProvider
 from ..providers.huggingface import HuggingFaceProvider
 from ..providers.ollama import OllamaProvider
+from ..providers.quantized import QuantizedProvider
 from ..services.session import SessionManager
 from ..utils.ollama_manager import ensure_ollama_running
 from .config_loader import load_config
@@ -45,6 +46,68 @@ from .logging_setup import setup_logging
 
 # Global session manager for cleanup on exit/signals
 _global_session_manager: Optional[SessionManager] = None
+
+# Global quantization manager for /background command and notifications
+_global_quantization_manager = None
+
+# Global notification tracker for completed jobs
+_completed_task_notifications = set()  # Set of task_ids that have been notified
+
+
+def check_and_show_completion_notifications() -> None:
+    """Check for completed quantization jobs and show notifications."""
+    global _global_quantization_manager, _completed_task_notifications
+
+    if not _global_quantization_manager:
+        return
+
+    all_tasks = _global_quantization_manager.get_all_tasks()
+
+    for task in all_tasks:
+        # Only notify for tasks that just completed and haven't been notified yet
+        if task.is_finished and task.task_id not in _completed_task_notifications:
+            _completed_task_notifications.add(task.task_id)
+
+            # Show notification
+            if task.status.value == "completed":
+                tui.console.print(
+                    f"\n[bold green]🎉 NOTIFICATION: Quantization Complete![/bold green]",
+                )
+                tui.console.print(
+                    f"[green]✓ {task.model_info.name} → {task.quant_type.display_name}[/green]"
+                )
+                tui.console.print(f"[dim]Output: {task.output_path.name}[/dim]\n")
+            elif task.status.value == "failed":
+                tui.console.print(
+                    f"\n[bold red]❌ NOTIFICATION: Quantization Failed[/bold red]",
+                )
+                tui.console.print(f"[red]✗ {task.model_info.name}[/red]")
+                tui.console.print(f"[dim]Error: {task.error}[/dim]\n")
+
+
+def handle_background_command() -> bool:
+    """Handle /background command if background jobs exist.
+
+    Returns:
+        True if command was handled, False if no background jobs
+    """
+    global _global_quantization_manager
+
+    if not _global_quantization_manager:
+        return False
+
+    if not _global_quantization_manager.has_active_jobs():
+        tui.show_error(
+            "No background quantization jobs are currently running.\n\n"
+            "Start a quantization in background mode to use this command."
+        )
+        tui.prompt("Press Enter to continue...", style="dim")
+        return True
+
+    # Show background jobs monitor
+    from ..quantization.ui.workflow import show_background_jobs_monitor
+    show_background_jobs_monitor(_global_quantization_manager)
+    return True
 
 
 def cleanup_on_exit() -> None:
@@ -137,7 +200,7 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
         model_info: Information about the loaded model
 
     Returns:
-        "QUIT" to quit app, "BACK2" to go back 2 levels, None for normal back
+        "QUIT" to quit app, "BACK2" to go back 2 levels, "HOME" to return to main menu, None for normal back
     """
     from ..models.model import ModelInfo
 
@@ -171,6 +234,11 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
             # Switch to different model (same as BACK)
             logger.info("User chose to switch model")
             return None
+
+        if endpoint == "HOME":
+            # Return to main menu
+            logger.info("User chose to return to main menu (home)")
+            return "HOME"
 
         # Handle different endpoints
         if endpoint == "qa":
@@ -448,6 +516,9 @@ def run_point_endpoint(session_manager: SessionManager, model_info: "ModelInfo")
 # Import chat endpoint from modular implementation
 from .app_chat import run_chat_endpoint
 
+# Import quantization integration
+from .app_quantization import show_quantization_or_inference_menu, run_quantization_mode
+
 
 def run_install_workflow(
     session_manager: SessionManager,
@@ -469,12 +540,20 @@ def run_install_workflow(
     tui.clear_screen()
 
     # Get provider instance
-    provider = session_manager.model_discovery.get_provider(provider_type)
+    # Special handling for GGUF: Use HuggingFace provider for installation
+    # (GGUF models are downloaded from HuggingFace Hub as .gguf files)
+    install_provider_type = provider_type
+    if provider_type == ProviderType.GGUF:
+        # GGUF models are installed via HuggingFace Hub
+        install_provider_type = ProviderType.HUGGINGFACE
+        logger.info("Using HuggingFace provider to install GGUF model from Hub")
+
+    provider = session_manager.model_discovery.get_provider(install_provider_type)
     if provider is None:
-        tui.show_error(f"Provider {provider_type.value} not registered")
+        tui.show_error(f"Provider {install_provider_type.value} not registered")
         return False
 
-    # Prompt for model name with examples
+    # Prompt for model name with examples (use original provider for examples)
     try:
         model_name = prompt_model_name(provider_type.value)
     except UserExitException:
@@ -708,39 +787,120 @@ def main() -> None:
     # Show system specs screen
     SystemSpecsScreen.show(system_specs)
 
-    # Load configuration
-    LoadingScreen.show("Loading configuration...")
-    try:
-        config = load_config()
-        enabled_providers = [p for p, c in config.items() if c.enabled]
-        logger.info(f"Configuration loaded: {len(enabled_providers)} providers enabled")
-    except Exception as e:
-        logger.error(f"Config loading failed: {e}")
-        tui.show_error(f"Failed to load configuration: {e}")
-        return
+    # Main application loop - allows switching between modes
+    operation_mode = None
+    session_manager = None
+    config = None
 
-    # Initialize session manager
-    LoadingScreen.show("Initializing session...")
-    session_manager = SessionManager(config, system_specs)
+    while True:
+        # Show mode selection if not set
+        if operation_mode is None:
+            operation_mode = show_quantization_or_inference_menu()
+            if operation_mode == "quit":
+                logger.info("User quit from operation mode selection")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
 
-    # Register global session manager for cleanup on exit/signals
-    _global_session_manager = session_manager
+        # Initialize config and session manager if needed
+        if session_manager is None:
+            LoadingScreen.show("Loading configuration...")
+            try:
+                config = load_config()
+                logger.info("Configuration loaded")
+            except Exception as e:
+                logger.error(f"Config loading failed: {e}")
+                tui.show_error(f"Failed to load configuration: {e}")
+                return
 
-    # Check if Ollama is enabled and ensure it's running (silently in background)
+            LoadingScreen.show("Initializing session...")
+            session_manager = SessionManager(config, system_specs)
+            _global_session_manager = session_manager
+
+            # Register all providers ONCE (used by both quantization and inference modes)
+            LoadingScreen.show("Registering model providers...")
+            registered_providers = register_all_providers(session_manager, config, system_specs)
+            if not registered_providers:
+                logger.warning("No providers were registered successfully")
+
+        # Run selected mode
+        if operation_mode == "quantization":
+            logger.info("Running Quantization mode")
+            result = run_quantization_mode(session_manager)
+
+            if result == "quit":
+                logger.info("User quit from quantization mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from quantization")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_inference":
+                logger.info("Switching from quantization to inference mode")
+                operation_mode = "inference"
+                continue
+
+        elif operation_mode == "inference":
+            # Run inference mode
+            logger.info("Running Inference mode")
+            result = run_inference_mode(session_manager, config, system_specs)
+
+            if result == "quit":
+                logger.info("User quit from inference mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from inference")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_quantization":
+                logger.info("Switching from inference to quantization mode")
+                operation_mode = "quantization"
+                continue
+
+
+def register_all_providers(session_manager: SessionManager, config: dict, system_specs: SystemSpecs) -> list[ProviderType]:
+    """Register all enabled providers with the session manager.
+
+    Args:
+        session_manager: Session manager
+        config: Configuration dict
+        system_specs: System specifications
+
+    Returns:
+        List of successfully registered provider types
+    """
+    enabled_providers = [p for p, c in config.items() if c.enabled]
+    registered_providers = []
+
+    # Check if Ollama is enabled and ensure it's running
     ollama_config = config.get(ProviderType.OLLAMA)
     if ollama_config and ollama_config.enabled:
         logger.info("Checking Ollama server...")
         if not ensure_ollama_running(str(ollama_config.host)):
-            logger.error("Could not start Ollama server")
-            tui.show_error(
-                "Could not start Ollama server.\n\n"
-                "Please install Ollama from: https://ollama.ai\n"
-                "Or start it manually with: ollama serve"
-            )
-            return
-        logger.info("Ollama server is running")
+            logger.warning("Could not start Ollama server - skipping Ollama provider")
+        else:
+            logger.info("Ollama server is running")
 
-    # Register enabled providers (silently)
+    # Register enabled providers
     for provider_type, provider_config in config.items():
         if not provider_config.enabled:
             continue
@@ -750,16 +910,25 @@ def main() -> None:
                 provider = OllamaProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered Ollama provider at {provider_config.host}")
+                registered_providers.append(provider_type)
 
             elif provider_type == ProviderType.HUGGINGFACE:
                 provider = HuggingFaceProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered HuggingFace provider at {provider_config.cache_dir}")
+                registered_providers.append(provider_type)
 
             elif provider_type == ProviderType.GGUF:
                 provider = GGUFProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered GGUF provider at {provider_config.models_dir}")
+                registered_providers.append(provider_type)
+
+            elif provider_type == ProviderType.QUANTIZED:
+                provider = QuantizedProvider(provider_config, system_specs)
+                session_manager.register_provider(provider_type, provider_config, provider)
+                logger.info(f"Registered Quantized provider at {provider_config.models_dir}")
+                registered_providers.append(provider_type)
 
             # LM Studio not yet implemented
             elif provider_type == ProviderType.LM_STUDIO:
@@ -771,8 +940,32 @@ def main() -> None:
         except Exception as e:
             logger.error(f"Failed to register {provider_type.value} provider: {e}")
 
+    logger.info(f"Registered {len(registered_providers)} providers successfully")
+    return registered_providers
+
+
+def run_inference_mode(session_manager: SessionManager, config: dict, system_specs: SystemSpecs) -> str:
+    """Run inference mode.
+
+    Args:
+        session_manager: Session manager
+        config: Configuration dict
+        system_specs: System specifications
+
+    Returns:
+        "quit", "main_menu", or "switch_quantization"
+    """
+    global _global_session_manager
+    _global_session_manager = session_manager
+
+    enabled_providers = [p for p, c in config.items() if c.enabled]
+    logger.info(f"Running inference mode with {len(enabled_providers)} providers enabled")
+
     # Main application loop
     while True:
+        # Check for completed quantization notifications
+        check_and_show_completion_notifications()
+
         # Show provider selection menu
         provider_names = [p.value for p in enabled_providers]
         selected_provider = ProviderSelectionMenu.show(provider_names)
@@ -780,14 +973,12 @@ def main() -> None:
         if selected_provider == "QUIT":
             # User quit - cleanup and exit
             logger.info("User initiated quit from provider selection")
-            cleanup_on_exit()
-            tui.clear_screen()
-            tui.show_message(
-                "Thank you for using VLM/LLM CLI!\nAll models unloaded.",
-                title="Goodbye",
-                style="cyan"
-            )
-            break
+            return "quit"
+
+        if selected_provider == "HOME":
+            # User wants to return to main menu
+            logger.info("User chose to return to main menu from provider selection")
+            return "main_menu"
 
         # Convert provider name to ProviderType
         provider_type = ProviderType(selected_provider)
@@ -817,24 +1008,25 @@ def main() -> None:
 
         # Show model selection menu
         while True:
+            # Check for completed quantization notifications
+            check_and_show_completion_notifications()
+
             selected_model = ModelSelectionMenu.show(models, selected_provider)
 
             if selected_model == "QUIT":
                 # User quit - cleanup and exit
                 logger.info("User initiated quit from model selection")
-                cleanup_on_exit()
-                tui.clear_screen()
-                tui.show_message(
-                    "Thank you for using VLM/LLM CLI!\nAll models unloaded.",
-                    title="Goodbye",
-                    style="cyan"
-                )
-                return
+                return "quit"
+
+            if selected_model == "HOME":
+                # User wants to return to main menu
+                logger.info("User chose to return to main menu from model selection")
+                return "main_menu"
 
             if selected_model == "BACK2":
                 # Go back 2 levels - exit to provider selection by returning
                 logger.info("User pressed bb - going back 2 levels (to provider selection)")
-                return
+                break
 
             if selected_model == "BACK":
                 # Go back to provider selection
@@ -951,20 +1143,18 @@ def main() -> None:
                 if workflow_result == "QUIT":
                     # Propagate quit signal up
                     logger.info("Propagating QUIT signal from endpoint workflow")
-                    cleanup_on_exit()
-                    tui.clear_screen()
-                    tui.show_message(
-                        "Thank you for using VLM/LLM CLI!\nAll models unloaded.",
-                        title="Goodbye",
-                        style="cyan"
-                    )
-                    return
+                    return "quit"
 
                 if workflow_result == "BACK2":
                     # Go back 2 levels from endpoint menu = back to provider selection
                     # Break from model selection loop to get to provider selection
                     logger.info("Propagating BACK2 signal - returning to provider selection")
                     break
+
+                if workflow_result == "HOME":
+                    # User wants to return to main menu
+                    logger.info("Propagating HOME signal - returning to main menu")
+                    return "main_menu"
 
             except Exception as e:
                 logger.error(f"Failed to load model {selected_model.model_id}: {e}")
