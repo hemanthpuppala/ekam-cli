@@ -105,6 +105,22 @@ class QuantizationManager:
                     method_family="Advanced",
                     use_gpu=use_gpu,
                 )
+            elif method == "mlx":
+                # MLX quantization (Apple Silicon)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="MLX",
+                    use_gpu=False,  # MLX uses Metal
+                )
+            elif method == "openvino":
+                # OpenVINO quantization (Intel CPU/iGPU)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="OpenVINO",
+                    use_gpu=False,  # OpenVINO CPU-based
+                )
             else:
                 # Generic quantization (FP16/INT8/INT4)
                 return get_quantization_recommendations(
@@ -141,10 +157,18 @@ class QuantizationManager:
         # Generate task ID
         task_id = f"quant_{uuid.uuid4().hex[:8]}"
 
-        # Generate output filename
+        # Generate output filename/directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f"{model_info.model_id.replace('/', '_')}_{quant_type.value}_{timestamp}{quant_type.file_extension}"
-        output_path = self.output_dir / output_filename
+        base_name = f"{model_info.model_id.replace('/', '_')}_{quant_type.value}_{timestamp}"
+
+        # MLX and OpenVINO output to directories, others to files
+        if module in [QuantizationModule.MLX, QuantizationModule.OPENVINO]:
+            # Directory output for MLX/OpenVINO
+            output_path = self.output_dir / base_name
+        else:
+            # File output for GGUF, Generic, etc.
+            output_filename = f"{base_name}{quant_type.file_extension}"
+            output_path = self.output_dir / output_filename
 
         # Create task
         task = QuantizationTask(

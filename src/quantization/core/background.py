@@ -13,7 +13,9 @@ from ..techniques.generic import GenericQuantizer
 from ..techniques.gptq import GPTQQuantizer
 from ..techniques.awq import AWQQuantizer
 from ..techniques.bnb import BitsAndBytesQuantizer
-from ..models import QuantizationTask, TaskStatus
+from ..techniques.mlx import MLXQuantizer
+from ..techniques.openvino import OpenVINOQuantizer
+from ..models import QuantizationTask, TaskStatus, QuantizationModule
 
 
 class BackgroundJobManager:
@@ -36,6 +38,8 @@ class BackgroundJobManager:
         self.gptq_quantizer = GPTQQuantizer()
         self.awq_quantizer = AWQQuantizer()
         self.bnb_quantizer = BitsAndBytesQuantizer()
+        self.mlx_quantizer = MLXQuantizer()
+        self.openvino_quantizer = OpenVINOQuantizer()
 
         # Load saved state
         self._load_state()
@@ -80,23 +84,30 @@ class BackgroundJobManager:
                     if progress_callback:
                         progress_callback(task.task_id, progress, eta)
 
-                # Execute quantization based on method family
-                method_family = task.quant_type.method_family
-
-                if method_family == "Generic":
-                    success = self.generic_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "GGUF":
-                    success = self.gguf_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "GPTQ":
-                    success = self.gptq_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "AWQ":
-                    success = self.awq_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "BitsAndBytes":
-                    success = self.bnb_quantizer.quantize(task, progress_wrapper)
+                # Execute quantization based on module (takes priority) or method family
+                # Check module first for platform-specific quantizers
+                if task.module == QuantizationModule.MLX:
+                    success = self.mlx_quantizer.quantize(task, progress_wrapper)
+                elif task.module == QuantizationModule.OPENVINO:
+                    success = self.openvino_quantizer.quantize(task, progress_wrapper)
                 else:
-                    task.status = TaskStatus.FAILED
-                    task.error = f"Quantization method {method_family} not yet implemented"
-                    success = False
+                    # Fall back to method family routing
+                    method_family = task.quant_type.method_family
+
+                    if method_family == "Generic":
+                        success = self.generic_quantizer.quantize(task, progress_wrapper)
+                    elif method_family == "GGUF":
+                        success = self.gguf_quantizer.quantize(task, progress_wrapper)
+                    elif method_family == "GPTQ":
+                        success = self.gptq_quantizer.quantize(task, progress_wrapper)
+                    elif method_family == "AWQ":
+                        success = self.awq_quantizer.quantize(task, progress_wrapper)
+                    elif method_family == "BitsAndBytes":
+                        success = self.bnb_quantizer.quantize(task, progress_wrapper)
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.error = f"Quantization method {method_family} not yet implemented"
+                        success = False
 
                 # Update completion time
                 if success:

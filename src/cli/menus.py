@@ -68,18 +68,89 @@ class ProviderSelectionMenu:
         """
         tui.clear_screen()
 
-        # Create provider table
+        # Detect system capabilities
+        import platform
+        system = platform.system()
+        machine = platform.machine()
+        is_macos = system == "Darwin"
+        is_apple_silicon = machine in ["arm64", "aarch64"] and is_macos
+
+        # Check for optional packages
+        has_mlx = False
+        has_openvino = False
+        try:
+            import mlx.core  # noqa
+            has_mlx = True
+        except ImportError:
+            pass
+        try:
+            import openvino  # noqa
+            has_openvino = True
+        except ImportError:
+            pass
+
+        # Show ALL possible providers (not just registered ones)
+        from ..models.endpoints import ProviderType
+        all_providers = [p.value for p in ProviderType if p != ProviderType.LM_STUDIO]  # Exclude unimplemented
+        available_providers = {}  # Track which are actually selectable
+
+        # Create provider table with compatibility info
         table = Table(title="Select Provider", show_header=True, header_style="bold magenta")
         table.add_column("#", style="dim", width=4, justify="right")
         table.add_column("Provider", style="cyan", width=20)
-        table.add_column("Status", justify="center", width=10)
+        table.add_column("Status", justify="center", width=35)
 
-        for idx, provider in enumerate(providers, 1):
-            table.add_row(
-                str(idx),
-                provider.upper(),
-                "[green]✓ Available[/green]"
-            )
+        for idx, provider in enumerate(all_providers, 1):
+            # Check if provider is registered (successfully initialized)
+            is_registered = provider in providers
+            is_available = is_registered
+            reason = ""
+
+            # Platform-specific checks
+            if provider == "mlx":
+                if not is_macos:
+                    is_available = False
+                    reason = "macOS only"
+                elif not is_apple_silicon:
+                    is_available = False
+                    reason = "Apple Silicon only"
+                elif not has_mlx:
+                    is_available = False
+                    reason = "pip install mlx mlx-lm mlx-vlm"
+                elif not is_registered:
+                    is_available = False
+                    reason = "Failed to initialize"
+
+            elif provider == "openvino":
+                if not has_openvino:
+                    is_available = False
+                    reason = "pip install openvino optimum[openvino]"
+                elif not is_registered:
+                    is_available = False
+                    reason = "Failed to initialize"
+
+            elif not is_registered:
+                # Other providers failed to register
+                is_available = False
+                reason = "Not available"
+
+            # Track available providers for selection
+            if is_available:
+                available_providers[idx] = provider
+
+            # Render row
+            if is_available:
+                table.add_row(
+                    str(idx),
+                    provider.upper(),
+                    "[green]✓ Available[/green]"
+                )
+            else:
+                table.add_row(
+                    f"[dim]{idx}[/dim]",
+                    f"[dim]{provider.upper()}[/dim]",
+                    f"[dim red]✗ {reason}[/dim red]"
+                )
 
         # Show menu in panel
         width, _ = tui.get_terminal_size()
@@ -105,7 +176,7 @@ class ProviderSelectionMenu:
         tui.console.print()
 
         # Get user selection
-        choice = tui.prompt(f"Select provider [1-{len(providers)}/h/q]:", style="cyan")
+        choice = tui.prompt(f"Select provider [1-{len(all_providers)}/h/q]:", style="cyan")
 
         # Check for /background command
         if choice.strip().lower().startswith("/background") or choice.strip().lower() == "/bg":
@@ -120,8 +191,14 @@ class ProviderSelectionMenu:
 
         try:
             idx = int(choice)
-            if 1 <= idx <= len(providers):
-                return providers[idx - 1]
+            # Check if selection is valid and available
+            if idx in available_providers:
+                return available_providers[idx]
+            elif 1 <= idx <= len(all_providers):
+                # User selected an unavailable provider
+                tui.show_error(f"Provider {all_providers[idx-1].upper()} is not available on this system.")
+                tui.prompt("Press Enter to continue...", style="dim")
+                return ProviderSelectionMenu.show(providers)  # Re-show menu
         except ValueError:
             pass
 

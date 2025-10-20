@@ -11,7 +11,7 @@ loguru>=0.7.0
 # These specific versions are tested and confirmed working together
 torch==2.5.1
 torchvision==0.20.1
-transformers==4.56.2  # Upgraded for Qwen3 support (backward compatible)
+transformers>=4.57.1  # Upgraded for Qwen3-VL support (backward compatible)
 
 # GGUF Quantization support (works on all platforms)
 llama-cpp-python>=0.2.20
@@ -28,3 +28,40 @@ sentencepiece>=0.1.99
 # These versions work with torch 2.5.1 and transformers 4.46.2
 accelerate==1.0.1
 bitsandbytes==0.42.0
+
+# ============================================
+# 2025 OPTIONAL OPTIMIZATIONS
+# ============================================
+# Install based on your hardware and needs
+
+# Flash Attention 2/3 (2-4x faster inference, 8x less memory)
+# Requires CUDA 11.6+ or ROCm 5.3+
+# Install: pip install flash-attn --no-build-isolation
+# flash-attn>=2.0.0  # Uncomment for CUDA/ROCm systems
+
+# Apple Silicon (Mac M1/M2/M3/M4) - Up to 85x faster VLM inference
+# MLX: Native Metal-accelerated ML framework
+# Install: pip install mlx mlx-lm mlx-vlm
+mlx  # Uncomment for macOS with Apple Silicon
+mlx-lm  # Uncomment for LLM support on Mac
+mlx-vlm  # Uncomment for VLM support on Mac
+
+# Intel CPU/iGPU Optimization - Optimized for AVX-512, VNNI, AMX
+# OpenVINO: Intel's inference optimization toolkit
+# Install: pip install openvino openvino-dev optimum[openvino]
+# openvino>=2025.0  # Uncomment for Intel CPU optimization
+# openvino-dev>=2025.0  # Uncomment for model conversion tools
+# optimum[openvino]>=1.16.0  # Uncomment for HuggingFace + OpenVINO
+
+# Intel CPU Extensions (Alternative to OpenVINO)
+# IPEX: Intel Extension for PyTorch
+# Install: pip install intel-extension-for-pytorch
+# intel-extension-for-pytorch>=2.3.0  # Uncomment for Intel CPUs
+
+# Production Inference Engine (Optional - for high-throughput deployments)
+# vLLM: High-performance LLM/VLM serving (requires CUDA)
+# Install: pip install vllm
+# vllm>=0.5.0  # Uncomment for production deployments with CUDA
+
+# CPU Feature Detection
+py-cpuinfo>=9.0.0

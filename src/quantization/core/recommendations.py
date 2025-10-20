@@ -32,6 +32,10 @@ def get_quantization_recommendations(
         recommendations = _get_generic_recommendations(model_info, system_specs, use_gpu)
     elif method_family == "GGUF":
         recommendations = _get_gguf_recommendations(model_info, system_specs)
+    elif method_family == "MLX":
+        recommendations = _get_mlx_recommendations(model_info, system_specs)
+    elif method_family == "OpenVINO":
+        recommendations = _get_openvino_recommendations(model_info, system_specs)
     elif method_family == "Advanced":
         # Advanced 4-bit quantization: Combine all advanced methods
         # GPTQ: GPU-optimized, good quality
@@ -468,6 +472,141 @@ def _get_bnb_recommendations(
                 speed_score=speed,
                 best_for=best_for + (" (CUDA GPU required)" if not has_cuda else ""),
                 requires_gpu=True,
+                is_available=is_available,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    return recommendations
+
+
+def _get_mlx_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs
+) -> list[QuantizationRecommendation]:
+    """Get MLX quantization recommendations (Apple Silicon only).
+    
+    MLX supports: INT2, INT3, INT4, INT6, INT8, FP16
+    NOT supported: INT5 (not available in MLX framework)
+    """
+    import platform
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    is_macos = platform.system() == "Darwin"
+    is_apple_silicon = platform.machine() in ["arm64", "aarch64"] and is_macos
+    has_mlx = False
+    try:
+        import mlx.core  # noqa
+        has_mlx = True
+    except ImportError:
+        pass
+
+    # MLX quantization configurations: (type, factor, quality, speed, best_for)
+    mlx_configs = [
+        (QuantizationType.INT4, 0.25, 8, 10, "RECOMMENDED - Best balance of quality and size"),
+        (QuantizationType.INT6, 0.375, 9, 9, "Good quality, moderate compression"),
+        (QuantizationType.INT8, 0.5, 9, 9, "Highest quality integer quantization"),
+        (QuantizationType.FP16, 0.5, 10, 10, "Baseline, minimal quality loss"),
+        (QuantizationType.INT3, 0.1875, 7, 10, "High compression, quality tradeoff"),
+        (QuantizationType.INT2, 0.125, 6, 10, "Maximum compression, significant quality loss"),
+    ]
+
+    for quant_type, factor, quality, speed, best_for in mlx_configs:
+        estimated_size = original_size_gb * factor
+        estimated_time = original_size_gb * 1.5
+
+        if is_apple_silicon and has_mlx:
+            reason = f"MLX {quant_type.display_name}: Native Apple Silicon quantization with Metal acceleration. "
+            reason += f"Estimated size: {estimated_size:.1f}GB. "
+            if quant_type == QuantizationType.INT4:
+                reason += "✓ RECOMMENDED for most use cases."
+            is_available = True
+            unavailable_reason = ""
+        else:
+            reason = f"MLX {quant_type.display_name}: NOT available on this system. "
+            if not is_macos:
+                reason += "Requires macOS."
+            elif not is_apple_silicon:
+                reason += "Requires Apple Silicon (M1/M2/M3/M4)."
+            elif not has_mlx:
+                reason += "Requires: pip install mlx mlx-lm mlx-vlm"
+            is_available = False
+            unavailable_reason = "Requires macOS with Apple Silicon + MLX installed"
+
+        recommendations.append(
+            QuantizationRecommendation(
+                quant_type=quant_type,
+                module=QuantizationModule.MLX,
+                reason=reason,
+                estimated_size_gb=estimated_size,
+                estimated_time_minutes=estimated_time,
+                quality_score=quality,
+                speed_score=speed,
+                best_for=best_for + (" (Apple Silicon Mac)" if is_apple_silicon else ""),
+                requires_gpu=False,
+                is_available=is_available,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    return recommendations
+
+
+def _get_openvino_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs
+) -> list[QuantizationRecommendation]:
+    """Get OpenVINO quantization recommendations (Intel CPU/iGPU).
+    
+    OpenVINO NNCF supports: INT4, INT8, FP16
+    NOT supported: INT2, INT3, INT5, INT6 (not available in NNCF)
+    """
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    has_openvino = False
+    try:
+        import openvino  # noqa
+        has_openvino = True
+    except ImportError:
+        pass
+
+    # OpenVINO quantization configurations: (type, factor, quality, speed, best_for)
+    configs = [
+        (QuantizationType.INT8, 0.5, 9, 8, "RECOMMENDED - Best quality/size balance"),
+        (QuantizationType.INT4, 0.25, 8, 9, "Maximum compression for Intel hardware"),
+        (QuantizationType.FP16, 0.5, 10, 8, "Baseline, no compression artifacts"),
+    ]
+
+    for quant_type, factor, quality, speed, best_for in configs:
+        # Add 10% overhead for OpenVINO IR format
+        estimated_size = (original_size_gb * factor) * 1.1
+        estimated_time = original_size_gb * 2.0
+
+        if has_openvino:
+            reason = f"OpenVINO {quant_type.display_name}: Optimized for Intel CPUs (AVX-512, VNNI, AMX). "
+            reason += f"Estimated size: {estimated_size:.1f}GB. "
+            reason += "Supports Intel iGPU (XMX) and Arc GPU acceleration."
+            if quant_type == QuantizationType.INT8:
+                reason += " ✓ RECOMMENDED for production."
+            is_available = True
+            unavailable_reason = ""
+        else:
+            reason = f"OpenVINO {quant_type.display_name}: NOT available. "
+            reason += "Requires: pip install openvino optimum[openvino]"
+            is_available = False
+            unavailable_reason = "Requires OpenVINO installation"
+
+        recommendations.append(
+            QuantizationRecommendation(
+                quant_type=quant_type,
+                module=QuantizationModule.OPENVINO,
+                reason=reason,
+                estimated_size_gb=estimated_size,
+                estimated_time_minutes=estimated_time,
+                quality_score=quality,
+                speed_score=speed,
+                best_for=best_for + " (Intel CPUs/iGPUs)",
+                requires_gpu=False,
                 is_available=is_available,
                 unavailable_reason=unavailable_reason,
             )

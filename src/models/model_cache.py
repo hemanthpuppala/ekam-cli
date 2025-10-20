@@ -486,6 +486,7 @@ class ModelMetadataCache:
                     "llava",
                     "blip",
                     "clip",
+                    "moondream",  # Moondream VLM
                     "qwen2vl",  # Qwen2-VL
                     "qwen3vl",  # Qwen3-VL
                     "qwenvl",   # Generic Qwen VL

@@ -272,6 +272,8 @@ class QuantizedProvider(BaseProvider):
         original_model = "unknown"
         params_billions = None
         ram_gb = None
+        model_type = ModelType.LLM  # Default
+        is_vlm = False
 
         # Use cached metadata if available
         if cached_metadata:
@@ -280,19 +282,60 @@ class QuantizedProvider(BaseProvider):
             ram_gb = cached_metadata.ram_gb
             if cached_metadata.architecture and cached_metadata.architecture != "unknown":
                 original_model = cached_metadata.architecture
+            # Check if VLM from metadata
+            if cached_metadata.model_type == "vlm":
+                model_type = ModelType.VLM
+                is_vlm = True
+        
+        # Also check config.json directly for VLM detection
+        config_path = model_dir / "config.json"
+        if not is_vlm and config_path.exists():
+            try:
+                import json
+                with open(config_path) as f:
+                    config = json.load(f)
+                
+                # Check architecture for VLM patterns
+                arch = config.get("architectures", [""])[0]
+                vlm_patterns = [
+                    "ForConditionalGeneration", "VisionTextDual", "VisionEncoder",
+                    "Llava", "Blip", "Qwen2VL", "Qwen3VL", "InstructBlip"
+                ]
+                is_vlm = any(pattern in arch for pattern in vlm_patterns)
+                
+                # Also check for vision config keys
+                if not is_vlm:
+                    is_vlm = any(key in config for key in ["vision_config", "visual_config", "image_encoder"])
+                
+                if is_vlm:
+                    model_type = ModelType.VLM
+                    logger.info(f"Detected VLM quantized model: {arch}")
+            except Exception as e:
+                logger.debug(f"Could not check config for VLM detection: {e}")
 
-        # Also read JSON metadata file for additional info
+        # Read JSON metadata file - this MUST override cached metadata for quantized models
+        # because cached metadata reads raw dtype (bf16) while JSON has actual quant type (int4)
+        is_mlx = False
         if metadata_file.exists():
             try:
                 with open(metadata_file) as f:
                     metadata = json.load(f)
-                    # Prefer JSON metadata for quantization type and original model
-                    if "quant_type" in metadata:
-                        quant_type = metadata.get("quant_type", "unknown")
-                    if "original_model" in metadata:
-                        original_model = metadata.get("original_model", "unknown")
+
+                    # ALWAYS prefer JSON metadata for quantized models
+                    # Cached metadata reads dtype from safetensors (bf16) which is wrong for MLX
+                    quant_type = metadata.get("quant_type", quant_type)  # Override even if empty
+                    original_model = metadata.get("original_model", original_model)
+
+                    # Check if this is an MLX model
+                    if metadata.get("module") == "mlx":
+                        is_mlx = True
+                        logger.info(f"Detected MLX quantized model: {model_dir.name}")
             except Exception as e:
                 logger.warning(f"Could not read metadata for {model_dir}: {e}")
+        else:
+            # Metadata file doesn't exist - this is a problem for MLX detection
+            logger.warning(f"No quantization_metadata.json found for {model_dir}")
+            logger.warning("MLX models require metadata file for proper detection")
 
         # Model ID: Use full path with format prefix
         # Format: "quantized:hf:/path/to/model_dir"
@@ -307,31 +350,90 @@ class QuantizedProvider(BaseProvider):
             elif quant_type == "int8":
                 name = f"{model_dir.name} [INT8 - 8-bit Integer]"
             elif quant_type == "int4":
-                name = f"{model_dir.name} [INT4 - 4-bit Integer]"
+                if is_mlx:
+                    name = f"{model_dir.name} [INT4 MLX] ⚠️ Use MLX tools"
+                else:
+                    name = f"{model_dir.name} [INT4 - 4-bit Integer]"
             else:
                 name = f"{model_dir.name} [{quant_type.upper()}]"
 
+        # Add MLX indicator if not already added
+        if is_mlx and "[MLX]" not in name and "MLX" not in name:
+            name = f"{name} [MLX Format]"
+
         # Assess compatibility
-        compatibility, compatibility_message = self._assess_compatibility_detailed(size_gb)
+        if is_mlx:
+            # MLX models CAN be loaded - we have native MLX inference support!
+            # Check if MLX is available on this system
+            mlx_available, mlx_message = self._check_mlx_availability()
+            if mlx_available:
+                # MLX is available - assess normally based on size
+                compatibility, compatibility_message = self._assess_compatibility_detailed(size_gb)
+                compatibility_message = f"MLX format (native Apple Silicon) - {compatibility_message}"
+            else:
+                # MLX not available - mark incompatible
+                compatibility = CompatibilityStatus.INCOMPATIBLE
+                compatibility_message = mlx_message
+        else:
+            compatibility, compatibility_message = self._assess_compatibility_detailed(size_gb)
 
         # Import required types
         from ..models.endpoints import EndpointType
+        
+        # Set capabilities based on model type
+        if is_vlm:
+            capabilities = [
+                EndpointType.QA,
+                EndpointType.CAPTION,
+                EndpointType.DETECT,
+                EndpointType.POINT,
+                EndpointType.TEXT,
+            ]
+        else:
+            capabilities = [EndpointType.TEXT]
 
         return ModelInfo(
             model_id=model_id,
             name=name,
             provider=ProviderType.QUANTIZED,
-            model_type=ModelType.LLM,
+            model_type=model_type,  # VLM or LLM based on detection
             size_gb=size_gb,
             params_billions=params_billions,  # From metadata cache
             ram_gb=ram_gb,  # From metadata cache
-            capabilities=[EndpointType.TEXT],  # Default to text-only
+            capabilities=capabilities,  # VLM gets vision capabilities
             compatibility=compatibility,
             compatibility_message=compatibility_message,
             is_installed=True,
             quantization=quant_type if quant_type != "unknown" else None,
             architecture=original_model if original_model != "unknown" else None,
         )
+
+    def _check_mlx_availability(self) -> tuple[bool, str]:
+        """Check if MLX framework is available for inference.
+
+        Returns:
+            Tuple of (available, message)
+        """
+        import platform
+
+        # Check if running on macOS
+        if platform.system() != "Darwin":
+            return False, "MLX only available on macOS (requires Apple Silicon)"
+
+        # Check if Apple Silicon
+        machine = platform.machine()
+        if machine != "arm64":
+            return False, f"MLX requires Apple Silicon, found: {machine}"
+
+        # Check if mlx packages are installed
+        try:
+            import mlx.core  # noqa: F401
+            import mlx_lm  # noqa: F401
+            import mlx_vlm  # noqa: F401
+            return True, "MLX framework available"
+        except ImportError as e:
+            missing = str(e).split("'")[1] if "'" in str(e) else "mlx"
+            return False, f"MLX not installed: {missing}. Run: pip install mlx mlx-lm mlx-vlm"
 
     def _assess_compatibility_detailed(self, model_size_gb: float) -> tuple[CompatibilityStatus, str]:
         """Assess model compatibility with system.
@@ -426,29 +528,295 @@ class QuantizedProvider(BaseProvider):
             raise ImportError("llama-cpp-python not installed. Run: pip install llama-cpp-python")
 
     def _load_hf_model(self, model_path: Path, device: str) -> Any:
-        """Load HuggingFace format quantized model.
+        """Load HuggingFace format quantized model (LLM or VLM).
+
+        Automatically detects MLX models and uses MLX inference instead of transformers.
 
         Args:
             model_path: Path to model directory
             device: Target device ("cuda", "mps", or "cpu")
 
         Returns:
-            Transformers model instance
+            Tuple of (model, processor/tokenizer, metadata) where metadata contains model type info
+        """
+        # Check if this is an MLX-quantized model
+        metadata_file = model_path / "quantization_metadata.json"
+        is_mlx = False
+        is_vlm = False
+
+        if metadata_file.exists():
+            try:
+                import json
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                    module = metadata.get("module", "")
+
+                    if module == "mlx":
+                        is_mlx = True
+                        original_model = metadata.get("original_model", "unknown")
+                        # Detect VLM from original model name or provider info
+                        is_vlm = "VL" in original_model or "vision" in original_model.lower()
+
+                        logger.info(f"Detected MLX {'VLM' if is_vlm else 'LLM'} model: {model_path.name}")
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"Could not parse quantization metadata: {e}")
+            except Exception as e:
+                logger.debug(f"Error checking quantization metadata: {e}")
+
+        # Route to appropriate loader
+        if is_mlx:
+            return self._load_mlx_model(model_path, is_vlm, device)
+        else:
+            return self._load_transformers_model(model_path, device)
+
+    def _load_mlx_model(self, model_path: Path, is_vlm: bool, device: str) -> Any:
+        """Load MLX quantized model using mlx-lm or mlx-vlm.
+
+        Args:
+            model_path: Path to MLX model directory
+            is_vlm: Whether this is a VLM or LLM
+            device: Target device (ignored for MLX - always uses Metal)
+
+        Returns:
+            Tuple of (model, processor/tokenizer, {"is_mlx": True, "is_vlm": bool})
         """
         try:
-            from transformers import AutoModelForCausalLM
+            if is_vlm:
+                # Use mlx-vlm for Vision-Language Models
+                from mlx_vlm import load
+
+                logger.info(f"Loading MLX VLM from: {model_path}")
+                model, processor = load(str(model_path))
+                logger.info("✓ MLX VLM loaded successfully on Metal GPU")
+
+                # Return with metadata marker (including model_path for inference)
+                return (model, processor, {"is_mlx": True, "is_vlm": True, "model_path": str(model_path)})
+            else:
+                # Use mlx-lm for pure LLMs
+                from mlx_lm import load
+
+                logger.info(f"Loading MLX LLM from: {model_path}")
+                model, tokenizer = load(str(model_path))
+                logger.info("✓ MLX LLM loaded successfully on Metal GPU")
+
+                # Return with metadata marker
+                return (model, tokenizer, {"is_mlx": True, "is_vlm": False})
+
+        except ImportError as e:
+            missing = "mlx-vlm" if is_vlm else "mlx-lm"
+            error_msg = (
+                f"❌ Cannot load MLX model: {missing} not installed\n\n"
+                f"Install with: pip install {missing}\n"
+                f"Or install both: pip install mlx mlx-lm mlx-vlm"
+            )
+            logger.error(error_msg)
+            raise ImportError(error_msg) from e
+
+        except Exception as e:
+            logger.error(f"Failed to load MLX model: {e}")
+            raise
+
+    def _load_transformers_model(self, model_path: Path, device: str) -> Any:
+        """Load model using HuggingFace transformers (non-MLX models).
+
+        Args:
+            model_path: Path to model directory
+            device: Target device
+
+        Returns:
+            Tuple of (model, processor/tokenizer, {"is_mlx": False, "is_vlm": bool})
+        """
+
+        try:
+            from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+
+            # Suppress library output during loading
+            from ..utils.output_suppressor import suppress_transformers_output
 
             logger.info(f"Loading HF quantized model: {model_path}")
 
-            # Use device_map="auto" for optimal placement
-            model = AutoModelForCausalLM.from_pretrained(
-                str(model_path),
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
+            # Check if this is a VLM by inspecting config.json
+            config_path = model_path / "config.json"
+            is_vlm = False
+            architecture_name = "unknown"
+            
+            if config_path.exists():
+                try:
+                    import json
+                    with open(config_path) as f:
+                        config = json.load(f)
+                    
+                    # Check architecture for VLM patterns
+                    architectures = config.get("architectures", [])
+                    arch = architectures[0] if architectures else ""
+                    architecture_name = arch
+                    
+                    # Comprehensive VLM pattern matching
+                    vlm_patterns = [
+                        "ForConditionalGeneration",  # Qwen2VL, LLaVA, etc.
+                        "VisionTextDual",            # CLIP-based
+                        "VisionEncoder",             # Vision encoders
+                        "Llava", "LLaVA",            # LLaVA variants
+                        "Blip", "BLIP",              # BLIP variants
+                        "Qwen2VL", "Qwen3VL",        # Qwen VLMs
+                        "QwenVL",                    # Original QwenVL
+                        "InstructBlip",              # InstructBLIP
+                        "Idefics",                   # Idefics
+                        "Kosmos",                    # Kosmos
+                        "Pix2Struct",                # Pix2Struct
+                        "Git",                       # GIT model
+                    ]
+                    
+                    # Case-insensitive pattern matching
+                    arch_lower = arch.lower()
+                    is_vlm = any(pattern.lower() in arch_lower for pattern in vlm_patterns)
+                    
+                    # Also check for vision config keys in config
+                    if not is_vlm:
+                        vision_keys = ["vision_config", "visual_config", "image_encoder", "vision_tower", "mm_vision_tower"]
+                        is_vlm = any(key in config for key in vision_keys)
+                        if is_vlm:
+                            logger.info(f"Detected VLM from vision config keys: {[k for k in vision_keys if k in config]}")
+                    
+                    # Check model_type field
+                    if not is_vlm:
+                        model_type_str = config.get("model_type", "").lower()
+                        is_vlm = any(vtype in model_type_str for vtype in ["vision", "vlm", "multimodal"])
+                        if is_vlm:
+                            logger.info(f"Detected VLM from model_type: {model_type_str}")
+                    
+                    logger.info(f"Model architecture: {arch}, VLM: {is_vlm}")
+                except Exception as e:
+                    logger.warning(f"Could not check model config for VLM detection: {e}")
 
-            logger.info(f"HF quantized model loaded successfully on {device}")
-            return model
+            # Load with appropriate strategy
+            with suppress_transformers_output():
+                if is_vlm:
+                    # Try to load as VLM with processor
+                    try:
+                        from transformers import AutoProcessor
+                        
+                        logger.info(f"Attempting to load VLM ({architecture_name}) with AutoProcessor...")
+                        
+                        processor = AutoProcessor.from_pretrained(
+                            str(model_path),
+                            trust_remote_code=True
+                        )
+                        
+                        # Verify processor has image_processor (confirming it's a VLM)
+                        if not hasattr(processor, 'image_processor'):
+                            logger.warning(f"Processor loaded but has no image_processor - not a VLM!")
+                            raise ValueError("Not a true VLM processor")
+                        
+                        # Check for Qwen3-VL + MPS incompatibility
+                        # Qwen3-VL has known MPS bugs (matrix dimension errors in mps_matmul)
+                        target_device = device
+                        if 'qwen3' in architecture_name.lower() and device == 'mps':
+                            logger.warning("⚠ Qwen3-VL has MPS compatibility issues")
+                            logger.warning("  MPS causes 'incompatible dimensions' errors during inference")
+                            logger.warning("  Forcing CPU mode for stability")
+                            target_device = 'cpu'
+                        
+                        # Load VLM with appropriate model class
+                        # Try multiple VLM model classes for maximum compatibility
+                        model = None
+                        model_classes = [
+                            'AutoModelForVision2Seq',  # Modern VLMs (Qwen2-VL, etc.)
+                            'AutoModelForCausalLM',    # Some VLMs use this (LLaVA)
+                            'AutoModel',                # Generic fallback
+                        ]
+                        
+                        for model_class_name in model_classes:
+                            try:
+                                logger.info(f"Trying to load VLM with {model_class_name}...")
+                                
+                                # Prepare loading kwargs
+                                load_kwargs = {
+                                    "low_cpu_mem_usage": True,
+                                    "trust_remote_code": True
+                                }
+                                
+                                # Use explicit device for Qwen3+MPS workaround, otherwise use device_map
+                                if target_device == 'cpu':
+                                    load_kwargs["device_map"] = {"": "cpu"}  # Force CPU
+                                    logger.debug("Loading with forced CPU device map")
+                                else:
+                                    load_kwargs["device_map"] = "auto"
+                                
+                                if model_class_name == 'AutoModelForVision2Seq':
+                                    from transformers import AutoModelForVision2Seq
+                                    model = AutoModelForVision2Seq.from_pretrained(
+                                        str(model_path),
+                                        **load_kwargs
+                                    )
+                                elif model_class_name == 'AutoModelForCausalLM':
+                                    from transformers import AutoModelForCausalLM
+                                    model = AutoModelForCausalLM.from_pretrained(
+                                        str(model_path),
+                                        **load_kwargs
+                                    )
+                                else:  # AutoModel
+                                    model = AutoModel.from_pretrained(
+                                        str(model_path),
+                                        **load_kwargs
+                                    )
+                                
+                                # Verify the model has generate method
+                                if not hasattr(model, 'generate'):
+                                    logger.warning(f"{model_class_name} loaded but has no .generate() method")
+                                    model = None
+                                    continue
+                                
+                                logger.info(f"✓ Successfully loaded VLM with {model_class_name}")
+                                break
+                                
+                            except Exception as e:
+                                logger.debug(f"{model_class_name} failed: {e}")
+                                continue
+                        
+                        if model is None:
+                            raise RuntimeError(
+                                f"Could not load VLM model from {model_path}.\n"
+                                f"Tried: {', '.join(model_classes)}\n"
+                                f"None of these model classes worked or had .generate() method."
+                            )
+                        
+                        logger.info(f"✓ Successfully loaded quantized VLM with processor on {target_device}")
+                        if target_device != device:
+                            logger.info(f"  Originally requested: {device}, using {target_device} for compatibility")
+                        logger.info(f"  Architecture: {architecture_name}")
+                        logger.info(f"  Processor type: {type(processor).__name__}")
+                        return (model, processor, {"is_mlx": False, "is_vlm": True})
+                    except Exception as e:
+                        logger.warning(f"Failed to load as VLM: {e}")
+                        logger.warning(f"Falling back to LLM loading...")
+                        is_vlm = False
+                
+                # Load as LLM (fallback or non-VLM)
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(model_path),
+                    trust_remote_code=True
+                )
+                
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(
+                        str(model_path),
+                        device_map="auto",
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True
+                    )
+                except Exception:
+                    # Fallback to AutoModel
+                    model = AutoModel.from_pretrained(
+                        str(model_path),
+                        device_map="auto",
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True
+                    )
+
+                logger.info(f"Loaded quantized LLM with tokenizer on {device}")
+                return (model, tokenizer, {"is_mlx": False, "is_vlm": False})
 
         except ImportError:
             raise ImportError("transformers not installed. Run: pip install transformers")
@@ -457,33 +825,688 @@ class QuantizedProvider(BaseProvider):
         """Unload model and free resources.
 
         Args:
-            model_handle: Model instance to unload
+            model_handle: Model instance (can be tuple of (model, processor) or single model)
         """
         # GGUF models (llama-cpp-python) handle cleanup automatically
         # HF models need manual cleanup
         try:
-            if hasattr(model_handle, "cpu"):
-                model_handle.cpu()
-            del model_handle
+            # Handle tuple (model, processor/tokenizer)
+            if isinstance(model_handle, tuple):
+                model, _ = model_handle
+                if hasattr(model, "cpu"):
+                    model.cpu()
+                del model_handle
+            else:
+                # Single model
+                if hasattr(model_handle, "cpu"):
+                    model_handle.cpu()
+                del model_handle
+            
+            # Clear GPU cache if available
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            
             logger.info("Quantized model unloaded")
         except Exception as e:
             logger.warning(f"Error during model unload: {e}")
 
-    def run_qa(self, model_handle: Any, image: Any, question: str) -> str:
-        """Not implemented for quantized provider."""
-        raise NotImplementedError("QA endpoint not yet implemented for quantized models")
+    def run_qa(
+        self,
+        model_handle: Any,
+        image: Any,
+        question: str,
+        conversation_history: Optional[list[tuple[str, str]]] = None
+    ) -> str:
+        """Run question answering on quantized VLM.
 
-    def run_caption(self, model_handle: Any, image: Any) -> str:
-        """Not implemented for quantized provider."""
-        raise NotImplementedError("Caption endpoint not yet implemented for quantized models")
+        Args:
+            model_handle: Loaded model (tuple of (model, processor, metadata) for HF/MLX VLMs)
+            image: PIL Image
+            question: Question text
+            conversation_history: Optional conversation history
+
+        Returns:
+            Answer text
+        """
+        # Check if this is a 3-tuple (new format with metadata)
+        if isinstance(model_handle, tuple) and len(model_handle) == 3:
+            model, processor_or_tokenizer, metadata = model_handle
+            is_mlx = metadata.get("is_mlx", False)
+            is_vlm = metadata.get("is_vlm", False)
+
+            if not is_vlm:
+                raise NotImplementedError(
+                    "This quantized model is a text-only LLM, not a VLM.\n"
+                    "QA endpoint requires a vision-language model.\n\n"
+                    "The model was quantized as an LLM without vision capabilities.\n"
+                    "To use vision tasks, quantize a VLM (e.g., LLaVA, Qwen2-VL, BLIP)."
+                )
+
+            # Route to appropriate inference method
+            if is_mlx:
+                return self._run_qa_mlx(model, processor_or_tokenizer, image, question, conversation_history, metadata)
+            else:
+                return self._run_qa_transformers(model, processor_or_tokenizer, image, question, conversation_history)
+
+        # Backward compatibility: 2-tuple format (legacy)
+        elif isinstance(model_handle, tuple) and len(model_handle) == 2:
+            model, processor_or_tokenizer = model_handle
+            
+            # Check if it's a processor (VLM) - processors have image_processor attribute
+            # Tokenizers do NOT have this, so this is the reliable way to detect VLMs
+            if hasattr(processor_or_tokenizer, 'image_processor'):
+                # This is a VLM with processor
+                import torch
+                from ..utils.history_formatter import format_qa_history
+                
+                # Get device
+                model_device = next(model.parameters()).device
+                
+                # Format question with history
+                full_question = format_qa_history(
+                    conversation_history=conversation_history,
+                    current_question=question,
+                    max_turns=5
+                )
+                
+                # Prepare inputs with automatic format detection for all VLMs
+                # Try messages format first (modern VLMs: Qwen2-VL, Qwen3-VL, Idefics, etc.)
+                # Fall back to standard format (LLaVA, BLIP, etc.)
+                inputs = None
+                
+                # Strategy 1: Try messages format with chat template (if available)
+                if hasattr(processor_or_tokenizer, 'apply_chat_template'):
+                    try:
+                        messages = [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": image},
+                                    {"type": "text", "text": full_question}
+                                ]
+                            }
+                        ]
+                        
+                        # Apply chat template to get properly formatted text with image tokens
+                        text_prompt = processor_or_tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                        
+                        # Process with the formatted text
+                        inputs = processor_or_tokenizer(
+                            text=[text_prompt],
+                            images=[image],
+                            padding=True,
+                            return_tensors="pt"
+                        )
+                        
+                        logger.debug("✓ Using messages format with chat template")
+                        
+                    except Exception as e:
+                        logger.debug(f"Messages format failed: {e}, trying standard format")
+                        inputs = None
+                
+                # Strategy 2: Standard text + images format (fallback)
+                if inputs is None:
+                    try:
+                        inputs = processor_or_tokenizer(
+                            text=full_question,
+                            images=image,
+                            return_tensors="pt"
+                        )
+                        logger.debug("✓ Using standard text + images format")
+                    except Exception as e:
+                        logger.error(f"Both input formats failed: {e}")
+                        raise RuntimeError(
+                            f"Failed to prepare inputs for VLM inference.\n"
+                            f"Processor: {type(processor_or_tokenizer).__name__}\n"
+                            f"Error: {e}"
+                        )
+                
+                # Move inputs to model device (handle each tensor individually for MPS compatibility)
+                inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+                
+                # Warn if on CPU (very slow)
+                if str(model_device) == 'cpu':
+                    logger.warning("⏳ Running inference on CPU - this will be SLOW (30s-2min)")
+                    logger.warning("   Consider using a smaller model or CUDA/MPS-compatible device")
+                
+                # Generate (reduced tokens for faster response on CPU)
+                logger.info("Generating response...")
+                max_tokens = 512 if str(model_device) == 'cpu' else 1024
+                
+                with torch.no_grad():
+                    output = model.generate(**inputs, max_new_tokens=max_tokens)
+                
+                logger.info("✓ Response generated")
+                
+                # Decode
+                response = processor_or_tokenizer.batch_decode(output, skip_special_tokens=True)[0]
+                
+                # Extract answer
+                if conversation_history and "A:" in response:
+                    parts = response.split("A:")
+                    if len(parts) > 1:
+                        response = parts[-1].strip()
+                
+                return response.strip()
+            else:
+                # This is a tokenizer (LLM), not a processor - cannot do vision tasks
+                raise NotImplementedError(
+                    "This quantized model is a text-only LLM, not a VLM.\n"
+                    "QA endpoint requires a vision-language model.\n\n"
+                    "The model was quantized as an LLM without vision capabilities.\n"
+                    "To use vision tasks, quantize a VLM (e.g., LLaVA, Qwen2-VL, BLIP)."
+                )
+        
+        # GGUF models don't support VLM yet
+        raise NotImplementedError(
+            "QA endpoint requires HuggingFace format quantized VLM.\n"
+            "GGUF quantized models don't support vision inference yet."
+        )
+
+    def _run_qa_mlx(
+        self,
+        model: Any,
+        processor: Any,
+        image: Any,
+        question: str,
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        metadata: Optional[dict] = None
+    ) -> str:
+        """Run QA inference using MLX framework.
+
+        Args:
+            model: MLX model
+            processor: MLX processor
+            image: PIL Image
+            question: Question text
+            conversation_history: Optional conversation history
+            metadata: Optional metadata dict with model_path
+
+        Returns:
+            Answer text
+        """
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        from mlx_vlm.utils import load_config
+
+        logger.info("Running MLX VLM inference...")
+        
+        # Get model path from metadata (needed for config loading)
+        model_path = metadata.get("model_path") if metadata else None
+
+        try:
+            # MLX VLM expects image path or list of image paths
+            # If it's a PIL Image, we need to save it temporarily
+            import tempfile
+            from pathlib import Path
+
+            # Save PIL image to temp file if needed
+            if hasattr(image, 'save'):
+                # It's a PIL Image
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    image.save(tmp.name, format='JPEG')
+                    image_path = tmp.name
+                    logger.debug(f"Saved image to temp file: {image_path}")
+            else:
+                # Assume it's already a path
+                image_path = str(image)
+
+            logger.debug(f"Image path: {image_path}")
+            
+            # PRODUCTION FIX: Use MLX's apply_chat_template to format prompt correctly
+            # This adds required image tokens and applies model-specific template
+            try:
+                # Load model config to get chat template (requires model_path)
+                if not model_path:
+                    raise ValueError("model_path not available in metadata")
+                    
+                config = load_config(model_path)
+                
+                # Format question with history using MLX's template system
+                # For VLMs, we need to include image placeholder in the content
+                if conversation_history:
+                    # Build message list with history
+                    messages = []
+                    for user_msg, bot_msg in conversation_history[-3:]:  # Last 3 turns
+                        messages.append({"role": "user", "content": user_msg})
+                        messages.append({"role": "assistant", "content": bot_msg})
+                    # For current question, include image reference
+                    messages.append({"role": "user", "content": question})
+                else:
+                    # Single question with image
+                    messages = [{"role": "user", "content": question}]
+                
+                # Apply chat template
+                prompt = apply_chat_template(processor, config, messages, num_images=1)
+                logger.debug(f"Applied chat template. Prompt: {prompt[:200]}...")
+                
+                # CRITICAL: Check if image tokens were added
+                # Some models need explicit image tokens like <image>, <|vision_start|>, etc.
+                has_image_token = any(token in prompt for token in ['<image>', '<|image|>', '<|vision_start|>', '<|im_start|>user<image>'])
+                
+                if not has_image_token:
+                    logger.warning("Chat template didn't add image tokens, adding manually")
+                    # Prepend image token to the prompt
+                    # Different models use different tokens - try common ones
+                    if '<|im_start|>' in prompt:
+                        # Qwen format - add after user start
+                        prompt = prompt.replace('<|im_start|>user\n', '<|im_start|>user\n<image>\n', 1)
+                    else:
+                        # Generic - prepend to start
+                        prompt = '<image>\n' + prompt
+                    logger.debug(f"Modified prompt with image token: {prompt[:200]}...")
+                
+            except Exception as template_error:
+                # Fallback: Use raw question if template fails
+                logger.warning(f"Chat template failed: {template_error}, using raw prompt")
+                if conversation_history:
+                    # Build simple conversation format
+                    conv_text = ""
+                    for user_msg, bot_msg in conversation_history[-3:]:
+                        conv_text += f"Q: {user_msg}\nA: {bot_msg}\n\n"
+                    conv_text += f"Q: {question}\nA:"
+                    prompt = conv_text
+                else:
+                    prompt = question
+
+            # Generate response using MLX VLM
+            # CORRECT Signature: generate(model, processor, prompt, image, **kwargs)
+            # Note: 'image' can be a single path or list of paths
+            # MEMORY FIX: Reduced max_tokens from 1024 to 256 to prevent OOM crashes on 8GB systems
+            response = generate(
+                model,
+                processor,
+                prompt,  # Prompt comes BEFORE image in MLX VLM
+                image_path,  # Image path comes AFTER prompt
+                max_tokens=256,  # Reduced from 1024 to fit in 8GB RAM
+                temp=0.7,
+                verbose=False
+            )
+
+            # Clean up temp file if we created one
+            if hasattr(image, 'save'):
+                try:
+                    Path(image_path).unlink()
+                except:
+                    pass
+
+            logger.info("✓ MLX response generated")
+
+            # PRODUCTION FIX: Extract text from MLX GenerationResult
+            # MLX VLM returns a GenerationResult object with .text attribute
+            if hasattr(response, 'text'):
+                # It's a GenerationResult object - extract the text
+                response_text = response.text
+                logger.debug(f"Extracted text from GenerationResult (tokens: {getattr(response, 'generation_tokens', 'N/A')})")
+            elif isinstance(response, str):
+                # Already a string
+                response_text = response
+            else:
+                # Fallback: Convert to string
+                response_text = str(response)
+                logger.warning(f"Unexpected response type: {type(response)}, converting to string")
+            
+            # Clean response
+            response_text = response_text.strip()
+
+            # Clean up any prompt echo if present
+            if prompt in response_text:
+                response_text = response_text.replace(prompt, "").strip()
+
+            return response_text if response_text else "I don't have a response."
+
+        except Exception as e:
+            logger.error(f"MLX VLM inference failed: {e}", exc_info=True)
+            raise
+
+    def _run_qa_transformers(
+        self,
+        model: Any,
+        processor: Any,
+        image: Any,
+        question: str,
+        conversation_history: Optional[list[tuple[str, str]]] = None
+    ) -> str:
+        """Run QA inference using HuggingFace transformers.
+
+        Args:
+            model: Transformers model
+            processor: Transformers processor
+            image: PIL Image
+            question: Question text
+            conversation_history: Optional conversation history
+
+        Returns:
+            Answer text
+        """
+        import torch
+        from ..utils.history_formatter import format_qa_history
+
+        # Get device
+        model_device = next(model.parameters()).device
+
+        # Format question with history
+        full_question = format_qa_history(
+            conversation_history=conversation_history,
+            current_question=question,
+            max_turns=5
+        )
+
+        # Prepare inputs with automatic format detection for all VLMs
+        inputs = None
+
+        # Strategy 1: Try messages format with chat template (if available)
+        if hasattr(processor, 'apply_chat_template'):
+            try:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": image},
+                            {"type": "text", "text": full_question}
+                        ]
+                    }
+                ]
+
+                text_prompt = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+
+                inputs = processor(
+                    text=[text_prompt],
+                    images=[image],
+                    padding=True,
+                    return_tensors="pt"
+                )
+
+                logger.debug("✓ Using messages format with chat template")
+
+            except Exception as e:
+                logger.debug(f"Messages format failed: {e}, trying standard format")
+                inputs = None
+
+        # Strategy 2: Standard text + images format (fallback)
+        if inputs is None:
+            try:
+                inputs = processor(
+                    text=full_question,
+                    images=image,
+                    return_tensors="pt"
+                )
+                logger.debug("✓ Using standard text + images format")
+            except Exception as e:
+                logger.error(f"Both input formats failed: {e}")
+                raise RuntimeError(
+                    f"Failed to prepare inputs for VLM inference.\n"
+                    f"Processor: {type(processor).__name__}\n"
+                    f"Error: {e}"
+                )
+
+        # Move inputs to model device
+        inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+
+        # Warn if on CPU
+        if str(model_device) == 'cpu':
+            logger.warning("⏳ Running inference on CPU - this will be SLOW (30s-2min)")
+
+        # Generate
+        logger.info("Generating response...")
+        max_tokens = 512 if str(model_device) == 'cpu' else 1024
+
+        with torch.no_grad():
+            output = model.generate(**inputs, max_new_tokens=max_tokens)
+
+        logger.info("✓ Response generated")
+
+        # Decode
+        response = processor.batch_decode(output, skip_special_tokens=True)[0]
+
+        # Extract answer
+        if conversation_history and "A:" in response:
+            parts = response.split("A:")
+            if len(parts) > 1:
+                response = parts[-1].strip()
+
+        return response.strip()
+
+    def _run_text_mlx(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        conversation_history: Optional[list[tuple[str, str]]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float
+    ) -> str:
+        """Run text generation using MLX framework.
+
+        Args:
+            model: MLX model
+            tokenizer: MLX tokenizer
+            prompt: Input text
+            conversation_history: Optional conversation history
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            repetition_penalty: Repetition penalty
+
+        Returns:
+            Generated text
+        """
+        from mlx_lm import generate
+        from ..utils.history_formatter import format_conversation_history
+
+        # Format prompt with history
+        if conversation_history:
+            formatted_prompt = format_conversation_history(
+                conversation_history,
+                prompt,
+                max_turns=5
+            )
+        else:
+            formatted_prompt = prompt
+
+        logger.info("Running MLX LLM inference...")
+
+        # MLX generate function
+        response = generate(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=formatted_prompt,
+            max_tokens=max_tokens,
+            temp=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            verbose=False
+        )
+
+        logger.info("✓ MLX text response generated")
+
+        # Clean response
+        from ..utils.response_cleaner import clean_model_response
+        if response:
+            response = clean_model_response(response, aggressive=True)
+
+        return response if response else "I don't have a response."
+
+    def _run_text_transformers(
+        self,
+        model: Any,
+        tokenizer: Any,
+        prompt: str,
+        conversation_history: Optional[list[tuple[str, str]]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        repetition_penalty: float
+    ) -> str:
+        """Run text generation using HuggingFace transformers.
+
+        Args:
+            model: Transformers model
+            tokenizer: Transformers tokenizer
+            prompt: Input text
+            conversation_history: Optional conversation history
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            repetition_penalty: Repetition penalty
+
+        Returns:
+            Generated text
+        """
+        import torch
+        from ..utils.history_formatter import format_conversation_history
+
+        # Get device
+        model_device = next(model.parameters()).device
+
+        # Build messages
+        messages = []
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-5:]:
+                messages.append({"role": "user", "content": user_msg})
+                messages.append({"role": "assistant", "content": bot_msg})
+        messages.append({"role": "user", "content": prompt})
+
+        # Format with tokenizer's chat template if available
+        try:
+            formatted_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+        except:
+            # Fallback to simple format
+            formatted_prompt = format_conversation_history(
+                conversation_history,
+                prompt,
+                max_turns=5
+            )
+
+        # Tokenize and generate
+        inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model_device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=temperature > 0,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+
+        # Decode only new tokens
+        input_length = inputs["input_ids"].shape[1]
+        generated_tokens = outputs[0][input_length:]
+        response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+        # Clean response
+        from ..utils.response_cleaner import clean_model_response
+        if response:
+            response = clean_model_response(response, aggressive=True)
+
+        return response if response else "I don't have a response."
+
+    def run_caption(
+        self,
+        model_handle: Any,
+        image: Any,
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        detail_level: str = "detailed"
+    ) -> str:
+        """Generate image caption with quantized VLM.
+        
+        Args:
+            model_handle: Loaded model
+            image: PIL Image
+            conversation_history: Optional conversation history
+            detail_level: "detailed" or "short"
+            
+        Returns:
+            Caption text
+            
+        Raises:
+            NotImplementedError: If model is not a VLM
+        """
+        prompt = (
+            "Describe this image in detail."
+            if detail_level == "detailed"
+            else "Describe this image briefly."
+        )
+        return self.run_qa(model_handle, image, prompt, conversation_history)
 
     def run_detect(self, model_handle: Any, image: Any, object_name: str) -> list[dict]:
-        """Not implemented for quantized provider."""
-        raise NotImplementedError("Detect endpoint not yet implemented for quantized models")
+        """Detect objects with quantized VLM.
+        
+        Args:
+            model_handle: Loaded model
+            image: PIL Image
+            object_name: Object to detect
+            
+        Returns:
+            List of detections
+            
+        Raises:
+            NotImplementedError: If model is not a VLM
+        """
+        from ..utils.vlm_response_parser import parse_detection_response
+        
+        prompt = (
+            f"Detect all instances of '{object_name}' in this image. "
+            f"Provide bounding box coordinates in JSON format as: "
+            f'[{{"bbox": [x1, y1, x2, y2], "label": "{object_name}"}}]'
+        )
+        response = self.run_qa(model_handle, image, prompt)
+        
+        # Parse response
+        detections = parse_detection_response(response, object_name)
+        for detection in detections:
+            detection["raw"] = response
+        
+        return detections
 
     def run_point(self, model_handle: Any, image: Any, object_name: str) -> dict:
-        """Not implemented for quantized provider."""
-        raise NotImplementedError("Point endpoint not yet implemented for quantized models")
+        """Point to object location with quantized VLM.
+        
+        Args:
+            model_handle: Loaded model
+            image: PIL Image
+            object_name: Object to locate
+            
+        Returns:
+            Coordinates dict
+            
+        Raises:
+            NotImplementedError: If model is not a VLM
+        """
+        from ..utils.vlm_response_parser import parse_point_response
+        
+        prompt = (
+            f"Where is the '{object_name}' in this image? "
+            f"Provide the center coordinates in JSON format as: "
+            f'{{"x": <number>, "y": <number>}}'
+        )
+        response = self.run_qa(model_handle, image, prompt)
+        
+        # Parse response
+        coordinates = parse_point_response(response, object_name)
+        coordinates["raw"] = response
+        
+        return coordinates
 
     def run_text(
         self,
@@ -520,9 +1543,85 @@ class QuantizedProvider(BaseProvider):
             frequency_penalty = custom_parameters.get("frequency_penalty", frequency_penalty)
             presence_penalty = custom_parameters.get("presence_penalty", presence_penalty)
 
-        # Detect model type and use appropriate method
-        if hasattr(model_handle, "__call__"):
-            # llama-cpp-python Llama model
+        # Check if this is a 3-tuple (new format with metadata)
+        if isinstance(model_handle, tuple) and len(model_handle) == 3:
+            model, tokenizer, metadata = model_handle
+            is_mlx = metadata.get("is_mlx", False)
+
+            # Route to appropriate inference method
+            if is_mlx:
+                return self._run_text_mlx(
+                    model, tokenizer, prompt, conversation_history,
+                    max_tokens, temperature, top_p, repetition_penalty
+                )
+            else:
+                return self._run_text_transformers(
+                    model, tokenizer, prompt, conversation_history,
+                    max_tokens, temperature, top_p, repetition_penalty
+                )
+
+        # Backward compatibility: 2-tuple format (legacy)
+        elif isinstance(model_handle, tuple) and len(model_handle) == 2:
+            model, tokenizer = model_handle
+
+            # Use HuggingFace transformers for text generation
+            import torch
+            from ..utils.history_formatter import format_conversation_history
+            
+            # Get device
+            model_device = next(model.parameters()).device
+            
+            # Build messages
+            messages = []
+            if conversation_history:
+                for user_msg, bot_msg in conversation_history[-5:]:
+                    messages.append({"role": "user", "content": user_msg})
+                    messages.append({"role": "assistant", "content": bot_msg})
+            messages.append({"role": "user", "content": prompt})
+            
+            # Format with tokenizer's chat template if available
+            try:
+                formatted_prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+            except:
+                # Fallback to simple format
+                formatted_prompt = format_conversation_history(
+                    conversation_history,
+                    prompt,
+                    max_turns=5
+                )
+            
+            # Tokenize and generate
+            inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model_device)
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=temperature > 0,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+            
+            # Decode only new tokens
+            input_length = inputs["input_ids"].shape[1]
+            generated_tokens = outputs[0][input_length:]
+            response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            
+            # Clean response
+            from ..utils.response_cleaner import clean_model_response
+            if response:
+                response = clean_model_response(response, aggressive=True)
+            
+            return response if response else "I don't have a response."
+        
+        elif hasattr(model_handle, "__call__"):
+            # llama-cpp-python Llama model (GGUF)
             # Format conversation history if provided
             if conversation_history:
                 # Use SIMPLE template with explicit system prompt for conversation context

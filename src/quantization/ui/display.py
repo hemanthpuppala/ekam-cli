@@ -444,12 +444,30 @@ def ask_quantization_method(model_info: ModelInfo) -> str:
         platform_desc = "macOS"
         if machine in ["arm64", "aarch64"]:
             platform_desc += " (Apple Silicon)"
+            is_apple_silicon = True
         else:
             platform_desc += " (Intel)"
+            is_apple_silicon = False
     elif "arm" in machine.lower() or "aarch" in machine.lower():
         platform_desc = "ARM CPU"
+        is_apple_silicon = False
     else:
         platform_desc = "CPU"
+        is_apple_silicon = False
+
+    # Check for MLX and OpenVINO
+    has_mlx = False
+    has_openvino = False
+    try:
+        import mlx.core  # noqa
+        has_mlx = True
+    except ImportError:
+        pass
+    try:
+        import openvino  # noqa
+        has_openvino = True
+    except ImportError:
+        pass
 
     # Build header with system info
     if has_cuda:
@@ -492,11 +510,31 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   {"• Takes longer (includes conversion step)" if not is_vlm else "[dim]• Takes longer (includes conversion step)[/dim]"}
   {"• Stable for LLMs" if not is_vlm else "[dim]• [red]NOT SUPPORTED for VLMs[/red] (llama.cpp limitation)[/dim]"}
 
+{"[bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [green]✓ Available[/green]" if is_apple_silicon and has_mlx else "[dim][bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Native Metal GPU acceleration" if is_apple_silicon and has_mlx else "[dim]• Native Metal GPU acceleration[/dim]"}
+  {"• 85x faster inference on Mac" if is_apple_silicon and has_mlx else "[dim]• 85x faster inference on Mac[/dim]"}
+  {"• VLM: Quantizes entire model (both vision + language)" if is_vlm and is_apple_silicon and has_mlx else "[dim]• VLM: Quantizes entire model (both vision + language)[/dim]"}
+  {"• Output: MLX format" if is_apple_silicon and has_mlx else "[dim]• Output: MLX format[/dim]"}
+  {"• " if not (is_apple_silicon and has_mlx) else ""}{"[red]Requires: macOS + Apple Silicon + pip install mlx mlx-lm mlx-vlm[/red]" if not (is_apple_silicon and has_mlx) else ""}
+
+{"[bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [green]✓ Available[/green]" if has_openvino else "[dim][bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Optimized for Intel CPUs (AVX-512, VNNI, AMX)" if has_openvino else "[dim]• Optimized for Intel CPUs (AVX-512, VNNI, AMX)[/dim]"}
+  {"• Supports Intel iGPU acceleration" if has_openvino else "[dim]• Supports Intel iGPU acceleration[/dim]"}
+  {"• VLM: Vision encoder + language decoder supported" if has_openvino else "[dim]• VLM: Vision encoder + language decoder supported[/dim]"}
+  {"• Output: OpenVINO IR format" if has_openvino else "[dim]• Output: OpenVINO IR format[/dim]"}
+  {"• " if has_openvino else ""}{"[red]Requires: pip install openvino optimum[openvino][/red]" if not has_openvino else ""}
+
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
-[dim]Recommendation: {"Use Generic (1) or Advanced (2) - GGUF not supported for VLMs" if is_vlm else "Use Advanced (2) for best quality, or GGUF (3) for llama.cpp"}[/dim]"""
-        valid_choices = ["1", "2"] if is_vlm else ["1", "2", "3"]
+[dim]Recommendation: {"Use Generic (1), Advanced (2), or MLX (4)" if is_vlm else "Use Advanced (2), MLX (4), or GGUF (3)"}[/dim]"""
+        # Determine valid choices
+        base_choices = ["1", "2"] if is_vlm else ["1", "2", "3"]
+        if is_apple_silicon and has_mlx:
+            base_choices.append("4")
+        if has_openvino:
+            base_choices.append("5")
+        valid_choices = base_choices
     else:
         # No CUDA - show all 3 options but gray out Advanced
         menu_text = f"""[bold cyan]Choose Quantization Method[/bold cyan]
@@ -533,25 +571,43 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   {"• Slower process (includes conversion step)" if not is_vlm else "[dim]• Slower process (includes conversion step)[/dim]"}
   {"• Works for pure LLMs" if not is_vlm else "[dim]• [red]NOT SUPPORTED for VLMs[/red] (llama.cpp doesn't support VLM architectures)[/dim]"}
 
+{"[bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [green]✓ Available[/green]" if is_apple_silicon and has_mlx else "[dim][bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Native Metal GPU acceleration" if is_apple_silicon and has_mlx else "[dim]• Native Metal GPU acceleration[/dim]"}
+  {"• 85x faster inference on Mac" if is_apple_silicon and has_mlx else "[dim]• 85x faster inference on Mac[/dim]"}
+  {"• VLM: Quantizes entire model (both vision + language)" if is_vlm and is_apple_silicon and has_mlx else "[dim]• VLM: Quantizes entire model (both vision + language)[/dim]"}
+  {"• Output: MLX format" if is_apple_silicon and has_mlx else "[dim]• Output: MLX format[/dim]"}
+  {"• " if not (is_apple_silicon and has_mlx) else ""}{"[red]Requires: macOS + Apple Silicon + pip install mlx mlx-lm mlx-vlm[/red]" if not (is_apple_silicon and has_mlx) else ""}
+
+{"[bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [green]✓ Available[/green]" if has_openvino else "[dim][bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Optimized for Intel CPUs (AVX-512, VNNI, AMX)" if has_openvino else "[dim]• Optimized for Intel CPUs (AVX-512, VNNI, AMX)[/dim]"}
+  {"• Supports Intel iGPU acceleration" if has_openvino else "[dim]• Supports Intel iGPU acceleration[/dim]"}
+  {"• VLM: Vision encoder + language decoder supported" if has_openvino else "[dim]• VLM: Vision encoder + language decoder supported[/dim]"}
+  {"• Output: OpenVINO IR format" if has_openvino else "[dim]• Output: OpenVINO IR format[/dim]"}
+  {"• " if has_openvino else ""}{"[red]Requires: pip install openvino optimum[openvino][/red]" if not has_openvino else ""}
+
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
 {'─'*60}
 [dim]💡 [bold]Recommendation for your {platform_desc} system:[/bold]
-{"• Use Generic FP16 (option 1) - GGUF not supported for VLMs" if is_vlm else "• Use Generic FP16 (1) for simplicity, or GGUF (3) for llama.cpp"}
+{"• MLX (4) recommended for Mac, or Generic FP16 (1)" if is_vlm and is_apple_silicon and has_mlx else "• Use Generic FP16 (option 1)"}
 • Advanced methods require NVIDIA CUDA GPU (use on Windows/Linux with NVIDIA GPU)[/dim]"""
 
-        # Valid choices depend on model type
-        if is_vlm:
-            valid_choices = ["1"]  # Only Generic for VLMs on Mac
-        else:
-            valid_choices = ["1", "3"]  # Generic and GGUF for LLMs on Mac
+        # Determine valid choices based on system
+        base_choices = ["1"]  # Generic always available
+        if not is_vlm:
+            base_choices.append("3")  # GGUF for LLMs
+        if is_apple_silicon and has_mlx:
+            base_choices.append("4")  # MLX
+        if has_openvino:
+            base_choices.append("5")  # OpenVINO
+        valid_choices = base_choices
 
     tui.show_panel(menu_text, title="Quantization Method Selection", border_style="cyan")
 
     while True:
         # Dynamic prompt based on available options
-        choice = tui.prompt("Choose [1/2/3/b/m/h]:", style="cyan").strip().lower()
+        choice = tui.prompt("Choose [1/2/3/4/5/b/m/h]:", style="cyan").strip().lower()
 
         # Check for navigation hotkeys
         from .navigation import check_navigation_input, NavigationException, NavigationAction
@@ -598,15 +654,22 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
         elif choice == "3":
             logger.info(f"User selected GGUF conversion for {model_info.name}")
             return "gguf_conversion"
+        elif choice == "4":
+            logger.info(f"User selected MLX quantization for {model_info.name}")
+            return "mlx"
+        elif choice == "5":
+            logger.info(f"User selected OpenVINO quantization for {model_info.name}")
+            return "openvino"
 
 
-def ask_vlm_quantization_scope(model_info: ModelInfo) -> str:
+def ask_vlm_quantization_scope(model_info: ModelInfo, quant_method: str = None) -> str:
     """Ask user if they want standard or component-level quantization for VLMs.
 
     Only shown for Vision-Language Models (VLMs).
 
     Args:
         model_info: VLM model to quantize
+        quant_method: Selected quantization method (for MLX warning)
 
     Returns:
         "standard" or "component_level"
@@ -620,30 +683,37 @@ def ask_vlm_quantization_scope(model_info: ModelInfo) -> str:
     if model_info.model_type != ModelType.VLM:
         return "standard"
 
+    # Build warning message for MLX
+    mlx_warning = ""
+    if quant_method == "mlx":
+        mlx_warning = "\n[bold yellow]⚠ MLX Note:[/bold yellow] MLX requires full model quantization (option 1 only).\n"
+
     tui.clear_screen()
     tui.show_panel(
         f"""[bold cyan]VLM Quantization Scope[/bold cyan]
 
 [bold]Model:[/bold] {model_info.name}
 [bold]Type:[/bold] Vision-Language Model (VLM)
-
+{mlx_warning}
 [bold]Choose quantization scope:[/bold]
 
 [bold]1. Standard Quantization[/bold] [dim](Recommended)[/dim]
   • Quantize entire model (vision + language)
   • Simpler, faster setup
   • Most common use case
+  {"• [green]✓ Works with MLX[/green]" if quant_method == "mlx" else ""}
 
 [bold]2. Component-Level Control[/bold] [dim](Advanced)[/dim]
   • Choose specific components to quantize
   • Vision encoder only, language decoder only, or both
   • Maximum flexibility for optimization
+  {"• [red]✗ NOT supported by MLX[/red]" if quant_method == "mlx" else ""}
 
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
 [dim]Tip: Most users should choose Standard (option 1).
-Component-level is for advanced optimization scenarios.[/dim]""",
+{"For MLX, only Standard is supported." if quant_method == "mlx" else "Component-level is for advanced optimization scenarios."}[/dim]""",
         title="VLM Quantization Scope",
         border_style="cyan",
     )
@@ -670,6 +740,18 @@ Component-level is for advanced optimization scenarios.[/dim]""",
             logger.info("User selected standard VLM quantization (entire model)")
             return "standard"
         elif choice == "2":
+            # Check if MLX - block component-level for MLX
+            if quant_method == "mlx":
+                tui.show_error(
+                    "[red]✗ Component-level quantization is NOT supported by MLX[/red]\n\n"
+                    "MLX can only quantize the entire VLM model (both vision + language).\n\n"
+                    "Options:\n"
+                    "  • Select option 1 (Standard) to continue with MLX\n"
+                    "  • Press 'b' to go back and choose a different quantization method\n"
+                    "    (Generic or OpenVINO support component-level quantization)"
+                )
+                continue
+
             logger.info("User selected component-level VLM quantization")
             return "component_level"
         else:
@@ -677,13 +759,14 @@ Component-level is for advanced optimization scenarios.[/dim]""",
             continue
 
 
-def ask_vlm_components(model_info: ModelInfo) -> str:
+def ask_vlm_components(model_info: ModelInfo, quant_method: str) -> str:
     """Ask user which VLM components to quantize.
 
     Only shown when component-level control is selected.
 
     Args:
         model_info: VLM model to quantize
+        quant_method: Selected quantization method ("mlx", "openvino", etc.)
 
     Returns:
         "vision", "language", or "both"
@@ -692,37 +775,94 @@ def ask_vlm_components(model_info: ModelInfo) -> str:
         UserExitException: If user wants to exit
     """
     tui.clear_screen()
+
+    # MLX: Force full model quantization (both components)
+    if quant_method == "mlx":
+        tui.show_panel(
+            f"""[bold yellow]MLX Quantization - Component Selection[/bold yellow]
+
+[bold]Model:[/bold] {model_info.name}
+
+[bold red]⚠ MLX VLM Limitation[/bold red]
+
+MLX quantization for VLMs requires quantizing the ENTIRE model:
+  • [yellow]⚠ Vision Encoder + Language Decoder[/yellow] (both required)
+  • [red]✗ Component-level extraction NOT supported[/red]
+
+[bold yellow]Auto-Selected: Both Components (Full Model)[/bold yellow]
+  • Vision encoder will be quantized to 4-bit
+  • Language decoder will be quantized to 4-bit
+  • MLX converts the entire VLM model to 4-bit format
+
+[bold]Architecture:[/bold]
+  Vision Encoder (4-bit) → Projection → Language Decoder (4-bit)
+
+[bold]Note:[/bold] For language-only quantization, use Generic FP16 method instead.
+
+[bold]Navigation:[/bold]
+  [Enter] Continue | [b] Go back | [m] Main menu | [h] Home
+
+[dim]Press Enter to proceed with full model quantization...[/dim]""",
+            title="MLX Component Selection (Auto)",
+            border_style="yellow",
+        )
+
+        choice = tui.prompt("[Enter/b/m/h]:", style="cyan").strip().lower()
+
+        from .navigation import check_navigation_input, NavigationException, NavigationAction
+        nav_action = check_navigation_input(choice)
+        if nav_action:
+            if nav_action == NavigationAction.BACK:
+                raise UserExitException("User cancelled")
+            elif nav_action == NavigationAction.MAIN_MENU:
+                raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+            elif nav_action == NavigationAction.HOME:
+                raise NavigationException(NavigationAction.HOME, "User requested home menu")
+
+        if choice in ["quit", "exit", "b"]:
+            raise UserExitException("User cancelled")
+
+        logger.info("MLX: Auto-selected full model quantization (both components - forced)")
+        return "both"
+
+    # OpenVINO and others: Show all options (gray out MLX-incompatible choices)
+    # Note: This shouldn't normally be reached for MLX since we block at scope selection,
+    # but if it is, we gray out options 1 and 2
+    is_mlx_blocked = quant_method == "mlx"
+
     tui.show_panel(
         f"""[bold cyan]Select VLM Components to Quantize[/bold cyan]
 
 [bold]Model:[/bold] {model_info.name}
+{f"[bold yellow]⚠ Method:[/bold yellow] {quant_method.upper()} - Component extraction not supported" if is_mlx_blocked else ""}
 
 [bold]VLM Architecture:[/bold]
   Vision Encoder → Projection → Language Decoder
 
 [bold]Choose components to quantize:[/bold]
 
-[bold]1. Vision Encoder Only[/bold]
-  • Quantize image/video processing component
+{"[dim]" if is_mlx_blocked else ""}[bold]1. Vision Encoder Only[/bold]{"[/dim]" if is_mlx_blocked else ""} {"[red]✗ NOT supported by MLX[/red]" if is_mlx_blocked else ""}
+  {"[dim]" if is_mlx_blocked else ""}• Quantize image/video processing component
   • Language decoder stays in original precision
-  • Use case: Reduce vision model size, keep language quality
+  • Use case: Reduce vision model size, keep language quality{"[/dim]" if is_mlx_blocked else ""}
 
-[bold]2. Language Decoder Only[/bold]
-  • Quantize text generation component
-  • Vision encoder stays in original precision
-  • Use case: Reduce language model size, keep vision quality
-  • [green]✓ GGUF conversion available[/green]
+{"[dim]" if is_mlx_blocked else ""}[bold]2. Language Decoder Only[/bold]{"[/dim]" if is_mlx_blocked else ""} {"[red]✗ NOT supported by MLX[/red]" if is_mlx_blocked else "[dim][green]⭐ RECOMMENDED for VLMs![/green][/dim]"}
+  {"[dim]" if is_mlx_blocked else ""}• Quantize text generation component (largest part)
+  • Vision encoder stays in FULL PRECISION (FP32/FP16)
+  • {"[red]MLX doesn't support component extraction[/red]" if is_mlx_blocked else "[green]✓ Smaller model size (~70% reduction)[/green]"}
+  • {"[/dim]" if is_mlx_blocked else ""}{"[green]✓ Preserved vision quality (no vision quantization)[/green]" if not is_mlx_blocked else ""}
+  {"[green]✓ Best quality/size trade-off for VLMs![/green]" if not is_mlx_blocked else ""}{"[/dim]" if is_mlx_blocked else ""}
 
-[bold]3. Both Components[/bold] [dim](Recommended)[/dim]
+[bold]3. Both Components[/bold] {"[green]✓ Works with MLX[/green]" if is_mlx_blocked else ""}
   • Quantize entire VLM (vision + language)
   • Maximum size reduction
   • Most common use case
+  {"• [green]ONLY option for MLX quantization[/green]" if is_mlx_blocked else ""}
 
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
-[dim]Tip: Most users should choose Both (option 3).
-Component-specific quantization is for advanced scenarios.[/dim]""",
+[dim]Tip: {"For MLX, only 'Both Components' (option 3) is supported." if is_mlx_blocked else "Most users should choose Both (option 3). Component-specific quantization is for advanced scenarios."}[/dim]""",
         title="VLM Component Selection",
         border_style="cyan",
     )
@@ -746,9 +886,32 @@ Component-specific quantization is for advanced scenarios.[/dim]""",
             raise UserExitException("User cancelled")
 
         if choice == "1":
+            # Check if blocked by MLX
+            if is_mlx_blocked:
+                tui.show_error(
+                    "[red]✗ Vision encoder only is NOT supported by MLX[/red]\n\n"
+                    "MLX can only quantize the entire VLM model (both vision + language).\n\n"
+                    "Options:\n"
+                    "  • Select option 3 (Both Components) to continue with MLX\n"
+                    "  • Press 'b' to go back and choose a different quantization method"
+                )
+                continue
+
             logger.info("User selected vision encoder only")
             return "vision"
         elif choice == "2":
+            # Check if blocked by MLX
+            if is_mlx_blocked:
+                tui.show_error(
+                    "[red]✗ Language decoder only is NOT supported by MLX[/red]\n\n"
+                    "MLX can only quantize the entire VLM model (both vision + language).\n\n"
+                    "Options:\n"
+                    "  • Select option 3 (Both Components) to continue with MLX\n"
+                    "  • Press 'b' to go back and choose a different quantization method\n"
+                    "    (Generic FP16 or OpenVINO support component-level quantization)"
+                )
+                continue
+
             logger.info("User selected language decoder only")
             return "language"
         elif choice == "3":

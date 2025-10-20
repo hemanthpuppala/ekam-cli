@@ -8,6 +8,7 @@ providers:
     enabled: true
     cache_dir: "~/.cache/huggingface/hub/"
     device_preference: ["cuda", "mps", "cpu"]
+    # 2025 OPTIMIZATION: Flash Attention automatically enabled if available
 
   lm_studio:
     enabled: false
@@ -17,11 +18,28 @@ providers:
     enabled: true
     models_dir: "~/models/gguf/"
     device_preference: ["cuda", "mps", "cpu"]
+    # 2025 FEATURE: VLM support with mmproj files (place mmproj in same directory as model)
 
   quantized:
     enabled: true
     models_dir: "results/quantizations/"
     device_preference: ["cuda", "mps", "cpu"]
+
+  # 2025 NEW: MLX provider for Apple Silicon (M1/M2/M3/M4)
+  # Up to 85x faster VLM inference on Mac with native Metal acceleration
+  mlx:
+    enabled: true  # Auto-disabled if not on macOS or MLX not installed
+    models_dir: "~/.cache/mlx/models"
+    # Supports both VLMs (mlx-vlm) and LLMs (mlx-lm)
+    # Install: pip install mlx mlx-lm mlx-vlm
+
+  # 2025 NEW: OpenVINO provider for Intel CPU/iGPU optimization
+  # Optimized for Intel CPUs (AVX-512, VNNI, AMX) and iGPUs
+  openvino:
+    enabled: true  # Auto-disabled if OpenVINO not installed
+    models_dir: "~/.cache/openvino/models"
+    # Supports VLMs: Qwen2-VL, Phi-3.5-Vision, InternVL2
+    # Install: pip install openvino openvino-dev optimum[openvino]
 
 system:
   max_image_dimension: 1920

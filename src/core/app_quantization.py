@@ -5,6 +5,7 @@ from pathlib import Path
 from loguru import logger
 
 from ..cli.tui_manager import tui
+from ..cli.diagnostics import SystemDiagnostics
 from ..quantization.manager import QuantizationManager
 from ..quantization.ui import run_quantization_workflow, show_background_jobs_monitor
 from ..services.session import SessionManager
@@ -14,7 +15,7 @@ def show_quantization_or_inference_menu() -> str:
     """Show menu to choose between Quantization or Inference.
 
     Returns:
-        "quantization", "inference", or "quit"
+        "quantization", "inference", "diagnostics", or "quit"
     """
     tui.clear_screen()
 
@@ -31,17 +32,21 @@ def show_quantization_or_inference_menu() -> str:
     Reduce model size through quantization
     Create optimized models for faster inference
 
+[3] [blue]System Diagnostics[/blue]
+    View hardware capabilities and quantization support
+    Check installed dependencies and recommendations
+
 [bold]Navigation:[/bold]
   [q] Quit application
 
-[dim]Quantization Phase 1: GGUF models only
-Future: HuggingFace and Ollama model conversion[/dim]""",
+[dim]Production-ready for Windows, Linux, and macOS
+Full transparency and hardware capability detection[/dim]""",
         title="Operation Mode",
         border_style="cyan",
     )
 
     while True:
-        choice = tui.prompt("Choose [1/2/q]:", style="cyan").strip().lower()
+        choice = tui.prompt("Choose [1/2/3/q]:", style="cyan").strip().lower()
 
         if choice in ["q", "quit", "exit"]:
             return "quit"
@@ -49,8 +54,10 @@ Future: HuggingFace and Ollama model conversion[/dim]""",
             return "inference"
         elif choice == "2":
             return "quantization"
+        elif choice == "3":
+            return "diagnostics"
         else:
-            tui.show_error("Invalid choice. Enter 1, 2, or 'q'")
+            tui.show_error("Invalid choice. Enter 1, 2, 3, or 'q'")
 
 
 def initialize_quantization_manager(session_manager: SessionManager) -> QuantizationManager:

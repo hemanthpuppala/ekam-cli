@@ -10,12 +10,28 @@ from ..models.model import ModelInfo
 
 
 class QuantizationType(Enum):
-    """Available quantization types."""
+    """Available quantization types.
+    
+    Quantization reduces model size and memory usage by using lower-precision
+    numeric representations. Supported across multiple frameworks:
+    
+    - **Generic (INT2-INT8, FP16)**: Universal format, works with MLX, PyTorch, HF
+    - **GGUF**: llama.cpp format for CPU inference
+    - **GPTQ/AWQ**: GPU-optimized quantization
+    - **BitsAndBytes**: HuggingFace native quantization
+    
+    Quality vs Size tradeoff (larger = better quality, bigger size):
+    FP16 > INT8 > INT6 > INT4 > INT3 > INT2
+    """
 
-    # Generic/Standard quantizations (HuggingFace/PyTorch)
-    FP16 = "fp16"  # Half precision (float16)
-    INT8 = "int8"  # 8-bit integer quantization
-    INT4 = "int4"  # 4-bit integer quantization
+    # Generic/Standard quantizations (HuggingFace/PyTorch/MLX)
+    # These work across multiple frameworks and are framework-agnostic
+    FP16 = "fp16"  # Half precision (float16) - 50% size, minimal quality loss
+    INT8 = "int8"  # 8-bit integer - 50% size, very good quality
+    INT6 = "int6"  # 6-bit integer - 37.5% size, good quality (MLX)
+    INT4 = "int4"  # 4-bit integer - 25% size, acceptable quality
+    INT3 = "int3"  # 3-bit integer - 18.75% size, noticeable quality loss (MLX)
+    INT2 = "int2"  # 2-bit integer - 12.5% size, significant quality loss (MLX)
 
     # GGUF quantizations (llama.cpp)
     GGUF_Q4_K_M = "q4_k_m"
@@ -45,7 +61,10 @@ class QuantizationType(Enum):
             # Generic
             self.FP16: "FP16 - Half Precision",
             self.INT8: "INT8 - 8-bit Integer",
+            self.INT6: "INT6 - 6-bit Integer",
             self.INT4: "INT4 - 4-bit Integer",
+            self.INT3: "INT3 - 3-bit Integer",
+            self.INT2: "INT2 - 2-bit Integer",
             # GGUF
             self.GGUF_Q4_K_M: "Q4_K_M - 4-bit Medium",
             self.GGUF_Q4_K_S: "Q4_K_S - 4-bit Small",
@@ -71,7 +90,7 @@ class QuantizationType(Enum):
         """File extension for this quantization type."""
         if self.value.startswith("q"):  # GGUF
             return ".gguf"
-        elif self.value in ["fp16", "int8", "int4"]:  # Generic PyTorch/HF
+        elif self.value in ["fp16", "int8", "int6", "int4", "int3", "int2"]:  # Generic PyTorch/HF
             return ".safetensors"
         elif "gptq" in self.value:
             return ".safetensors"
@@ -82,15 +101,24 @@ class QuantizationType(Enum):
 
     @property
     def method_family(self) -> str:
-        """Quantization method family (Generic, GGUF, GPTQ, AWQ, BNB)."""
-        if self.value in ["fp16", "int8", "int4"]:
+        """Quantization method family (Generic, GGUF, GPTQ, AWQ, BNB).
+        
+        Returns:
+            Method family string for categorization and UI display
+        """
+        # Generic integer quantization (2/3/4/6/8-bit) - works across multiple frameworks
+        if self.value in ["fp16", "int8", "int6", "int4", "int3", "int2"]:
             return "Generic"
+        # GGUF quantization (llama.cpp format)
         elif self.value.startswith("q"):
             return "GGUF"
+        # GPTQ quantization (GPU-optimized)
         elif "gptq" in self.value:
             return "GPTQ"
+        # AWQ quantization (Activation-aware Weight Quantization)
         elif "awq" in self.value:
             return "AWQ"
+        # BitsAndBytes quantization (HuggingFace native)
         else:
             return "BitsAndBytes"
 
@@ -103,6 +131,8 @@ class QuantizationModule(Enum):
     AUTO_GPTQ = "auto_gptq"
     AUTO_AWQ = "auto_awq"
     OPTIMUM = "optimum"
+    MLX = "mlx"  # Apple Silicon MLX framework
+    OPENVINO = "openvino"  # Intel OpenVINO optimization
 
     @property
     def display_name(self) -> str:
@@ -113,6 +143,8 @@ class QuantizationModule(Enum):
             self.AUTO_GPTQ: "AutoGPTQ",
             self.AUTO_AWQ: "AutoAWQ",
             self.OPTIMUM: "Optimum (HuggingFace)",
+            self.MLX: "MLX (Apple Silicon)",
+            self.OPENVINO: "OpenVINO (Intel)",
         }
         return names.get(self, self.value)
 
@@ -125,6 +157,8 @@ class QuantizationModule(Enum):
             self.AUTO_GPTQ: "auto-gptq",
             self.AUTO_AWQ: "autoawq",
             self.OPTIMUM: "optimum",
+            self.MLX: "mlx",
+            self.OPENVINO: "openvino",
         }
         return packages.get(self, self.value)
 

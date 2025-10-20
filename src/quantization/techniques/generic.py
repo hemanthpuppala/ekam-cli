@@ -402,44 +402,63 @@ class GenericQuantizer(BaseQuantizer):
                     f"{'='*60}\n"
                 )
 
-        # Strategy 1: Try AutoModelForCausalLM (most common for LLMs)
+        # Try multiple model classes for maximum compatibility (LLMs and VLMs)
         model = None
-        try:
-            logger.info(f"Loading with AutoModelForCausalLM...")
-            model = AutoModelForCausalLM.from_pretrained(model_path_str, **load_kwargs)
-
-            # Move to explicit device if needed
-            if explicit_device is not None:
-                logger.info(f"Moving model to {explicit_device}")
-                model = model.to(explicit_device)
-
-            logger.info("Successfully loaded model")
-
-        except Exception as e:
-            logger.warning(f"AutoModelForCausalLM failed: {str(e)[:200]}")
-
-            # Strategy 2: Try AutoModel (fallback)
+        model_strategies = [
+            ('AutoModelForCausalLM', 'Most LLMs and some VLMs'),
+            ('AutoModelForVision2Seq', 'Modern VLMs (Qwen2-VL, Idefics, etc.)'),
+            ('AutoModel', 'Generic fallback'),
+        ]
+        
+        last_error = None
+        for model_class_name, description in model_strategies:
             try:
-                logger.info(f"Trying AutoModel as fallback...")
-                model = AutoModel.from_pretrained(model_path_str, **load_kwargs)
+                logger.info(f"Loading with {model_class_name} ({description})...")
+                
+                if model_class_name == 'AutoModelForVision2Seq':
+                    try:
+                        from transformers import AutoModelForVision2Seq
+                        model = AutoModelForVision2Seq.from_pretrained(model_path_str, **load_kwargs)
+                    except ImportError:
+                        logger.debug("AutoModelForVision2Seq not available in this transformers version")
+                        continue
+                elif model_class_name == 'AutoModelForCausalLM':
+                    model = AutoModelForCausalLM.from_pretrained(model_path_str, **load_kwargs)
+                else:  # AutoModel
+                    model = AutoModel.from_pretrained(model_path_str, **load_kwargs)
 
+                # Move to explicit device if needed
                 if explicit_device is not None:
+                    logger.info(f"Moving model to {explicit_device}")
                     model = model.to(explicit_device)
 
-                logger.info("Successfully loaded with AutoModel")
+                # Verify model has generate method (important for VLMs)
+                if not hasattr(model, 'generate'):
+                    logger.warning(f"{model_class_name} loaded but has no .generate() method")
+                    logger.info("This model class may not support generation, trying next...")
+                    model = None
+                    continue
 
-            except Exception as e2:
-                logger.error(f"AutoModel also failed: {str(e2)[:200]}")
-                raise RuntimeError(
-                    f"Failed to load model.\n\n"
-                    f"Platform: {caps.platform.value}\n"
-                    f"Device: {caps.device_type.value}\n\n"
-                    f"Error: {str(e)}\n\n"
-                    f"Try:\n"
-                    f"  1. Check model files are complete\n"
-                    f"  2. Ensure enough RAM ({caps.available_ram_gb:.1f}GB available)\n"
-                    f"  3. Try FP16 instead of INT8/INT4 if memory limited\n"
-                )
+                logger.info(f"✓ Successfully loaded model with {model_class_name}")
+                break
+
+            except Exception as e:
+                logger.debug(f"{model_class_name} failed: {str(e)[:200]}")
+                last_error = e
+                continue
+        
+        if model is None:
+            raise RuntimeError(
+                f"Failed to load model with any strategy.\n\n"
+                f"Platform: {caps.platform.value}\n"
+                f"Device: {caps.device_type.value}\n"
+                f"Tried: {', '.join([s[0] for s in model_strategies])}\n\n"
+                f"Last error: {str(last_error)[:200]}\n\n"
+                f"Try:\n"
+                f"  1. Check model files are complete\n"
+                f"  2. Ensure enough RAM ({caps.available_ram_gb:.1f}GB available)\n"
+                f"  3. Try FP16 instead of INT8/INT4 if memory limited\n"
+            )
 
         return model
 
@@ -536,13 +555,50 @@ class GenericQuantizer(BaseQuantizer):
 
             logger.info(f"Loading model from {model_identifier}")
 
-            # Load model with fallback strategies
+            # CRITICAL: Validate quantization type is supported on this platform
+            if task.quant_type in [QuantizationType.INT8, QuantizationType.INT4]:
+                has_cuda = torch.cuda.is_available()
+                if not has_cuda:
+                    error_msg = (
+                        f"\n{'='*60}\n"
+                        f"{task.quant_type.display_name} QUANTIZATION REQUIRES CUDA + BITSANDBYTES\n"
+                        f"{'='*60}\n\n"
+                        f"Your System:\n"
+                        f"  Platform: {device_caps.platform.value}\n"
+                        f"  Device: {device_caps.device_type.value}\n"
+                        f"  RAM: {device_caps.available_ram_gb:.1f}GB available\n"
+                        f"  CUDA: Not available\n"
+                        f"  bitsandbytes: {'installed' if device_caps.backends.get('bitsandbytes') else 'not installed'}\n\n"
+                        f"{task.quant_type.display_name} quantization requires:\n"
+                        f"  • CUDA GPU (NVIDIA) - Metal/CPU not supported\n"
+                        f"  • bitsandbytes library\n\n"
+                        f"Why CPU/Metal {task.quant_type.display_name} doesn't work:\n"
+                        f"  • PyTorch does not support persistent {task.quant_type.display_name} quantization on CPU\n"
+                        f"  • bitsandbytes {task.quant_type.display_name} requires CUDA (not available on Mac)\n\n"
+                        f"✓ Available options on Mac/CPU:\n"
+                        f"  • FP16 quantization (50% size reduction, works everywhere)\n"
+                        f"  • GGUF quantization (Q4_K_M, Q4_K_S, Q5_K_M, etc.)\n"
+                        f"  • MLX quantization (4-bit, Apple Silicon only, pip install mlx mlx-lm mlx-vlm)\n\n"
+                        f"For {task.quant_type.display_name}:\n"
+                        f"  • Use GGUF quantization (supports Q4_K_M, Q8_0, etc.)\n"
+                        f"  • Use MLX quantization (4-bit for Mac)\n"
+                        f"  • Or get a CUDA GPU + install bitsandbytes\n"
+                        f"{'='*60}\n"
+                    )
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+            # Import output suppressor for clean TUI
+            from ...utils.output_suppressor import suppress_transformers_output
+
+            # Load model with fallback strategies (suppress library output)
             logger.info(f"Loading model in {task.quant_type.display_name} format")
-            model = self._load_model_with_fallbacks(
-                model_identifier,
-                task.quant_type,
-                torch
-            )
+            with suppress_transformers_output():
+                model = self._load_model_with_fallbacks(
+                    model_identifier,
+                    task.quant_type,
+                    torch
+                )
 
             # VLM Component-Level Quantization Support
             if task.vlm_components:
@@ -551,21 +607,44 @@ class GenericQuantizer(BaseQuantizer):
                 # Detect VLM components
                 vision, language, has_projection = self._detect_vlm_components(model)
 
-                if task.vlm_components == "vision" and vision is not None:
-                    logger.info("Component-level: Quantizing vision encoder only")
-                    logger.warning("NOTE: Vision-only quantization is currently experimental")
-                    # TODO: Implement vision-only quantization
-                    # For now, quantize entire model
-
-                elif task.vlm_components == "language" and language is not None:
-                    logger.info("Component-level: Quantizing language decoder only")
-                    logger.warning("NOTE: Language-only quantization is currently experimental")
-                    # TODO: Implement language-only quantization
-                    # For now, quantize entire model
+                if task.vlm_components == "language" and language is not None:
+                    logger.info("✓ Component-level: Quantizing LANGUAGE DECODER only")
+                    logger.info("Vision encoder will remain in FULL PRECISION (FP16/FP32)")
+                    logger.info("This is OPTIMAL for VLMs: smaller size, preserved vision quality!")
+                    
+                    # Quantize only the language component
+                    if task.quant_type == QuantizationType.FP16:
+                        logger.info("Converting language decoder to FP16...")
+                        language.to(torch.float16)
+                        # Vision encoder stays in its original dtype
+                        logger.info("✓ Language decoder: FP16")
+                        logger.info("✓ Vision encoder: Full precision (unchanged)")
+                    
+                    elif task.quant_type in [QuantizationType.INT8, QuantizationType.INT4]:
+                        # For INT8/INT4, we need to selectively quantize
+                        logger.info(f"Quantizing language decoder to {task.quant_type.display_name}...")
+                        logger.warning("INT8/INT4 component-level quantization requires BitsAndBytes on CUDA")
+                        logger.warning("For now, quantizing entire model. Use FP16 for true component-level.")
+                        # Fall through to normal quantization below
+                
+                elif task.vlm_components == "vision" and vision is not None:
+                    logger.info("✓ Component-level: Quantizing VISION ENCODER only")
+                    logger.info("Language decoder will remain in FULL PRECISION")
+                    logger.info("NOTE: This is less common - usually language is quantized instead")
+                    
+                    # Quantize only the vision component
+                    if task.quant_type == QuantizationType.FP16:
+                        logger.info("Converting vision encoder to FP16...")
+                        vision.to(torch.float16)
+                        logger.info("✓ Vision encoder: FP16")
+                        logger.info("✓ Language decoder: Full precision (unchanged)")
+                    else:
+                        logger.warning("INT8/INT4 vision-only quantization not recommended")
+                        logger.info("Falling back to standard quantization")
 
                 elif task.vlm_components == "both" or (vision and language):
-                    logger.info("Component-level: Quantizing both components (standard VLM quantization)")
-                    # Quantize entire model (current behavior)
+                    logger.info("Component-level: Quantizing BOTH components (standard VLM quantization)")
+                    # Quantize entire model (current behavior - falls through)
 
                 else:
                     logger.warning(f"Could not detect VLM components for {task.vlm_components} quantization")
@@ -583,37 +662,85 @@ class GenericQuantizer(BaseQuantizer):
                 progress_callback(60.0, None)
             task.progress = 60.0
 
-            # Load tokenizer
-            task.substage = "Loading tokenizer"
-            logger.info("Loading tokenizer")
-            tokenizer = None
+            # Load tokenizer/processor (suppress library output)
+            # For VLMs, we need processor (tokenizer + image_processor)
+            # For LLMs, we just need tokenizer
+            task.substage = "Loading tokenizer/processor"
+            logger.info("Detecting model type and loading appropriate tokenizer/processor...")
+            
+            # Check if model is a VLM by inspecting architecture
+            is_vlm = False
+            processor_or_tokenizer = None
             last_error = None
-
-            # Try loading with trust_remote_code first
+            
+            # Try to detect VLM from model's config
             try:
-                logger.debug(f"Trying to load tokenizer with trust_remote_code from: {model_identifier}")
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_identifier,
-                    trust_remote_code=True
-                )
-                logger.info("Tokenizer loaded successfully with trust_remote_code")
+                config = model.config
+                arch = config.architectures[0] if hasattr(config, 'architectures') and config.architectures else ""
+                
+                # VLM patterns
+                vlm_patterns = [
+                    "ForConditionalGeneration", "VisionTextDual", "Llava", "Blip",
+                    "Qwen2VL", "Qwen3VL", "QwenVL", "InstructBlip", "Idefics"
+                ]
+                is_vlm = any(pattern in arch for pattern in vlm_patterns)
+                
+                # Also check for vision config
+                if not is_vlm:
+                    config_dict = config.to_dict()
+                    is_vlm = any(key in config_dict for key in ["vision_config", "visual_config", "image_encoder"])
+                
+                logger.info(f"Model architecture: {arch}, VLM: {is_vlm}")
             except Exception as e:
-                last_error = e
-                logger.warning(f"Could not load tokenizer with trust_remote_code: {e}")
-
-                # Fallback: try without trust_remote_code
+                logger.debug(f"Could not detect VLM from config: {e}")
+            
+            # Load processor for VLMs, tokenizer for LLMs
+            if is_vlm:
+                # Try loading processor for VLM
                 try:
-                    logger.debug("Attempting to load tokenizer without trust_remote_code...")
-                    tokenizer = AutoTokenizer.from_pretrained(model_identifier)
-                    logger.info("Tokenizer loaded successfully without trust_remote_code")
-                except Exception as e2:
-                    last_error = e2
-                    logger.error(f"Tokenizer loading failed (second attempt): {e2}")
+                    logger.info("Loading processor for VLM...")
+                    from transformers import AutoProcessor
+                    
+                    with suppress_transformers_output():
+                        processor_or_tokenizer = AutoProcessor.from_pretrained(
+                            model_identifier,
+                            trust_remote_code=True
+                        )
+                    logger.info("✓ Processor loaded successfully (VLM)")
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Failed to load processor for VLM, trying tokenizer: {e}")
+                    is_vlm = False  # Fall back to tokenizer
+            
+            if not is_vlm:
+                # Load tokenizer for LLM (or VLM fallback)
+                logger.info("Loading tokenizer...")
+                try:
+                    logger.debug(f"Trying to load tokenizer with trust_remote_code from: {model_identifier}")
+                    with suppress_transformers_output():
+                        processor_or_tokenizer = AutoTokenizer.from_pretrained(
+                            model_identifier,
+                            trust_remote_code=True
+                        )
+                    logger.info("Tokenizer loaded successfully with trust_remote_code")
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Could not load tokenizer with trust_remote_code: {e}")
 
-            if tokenizer is None:
-                # Both attempts failed - provide detailed error
+                    # Fallback: try without trust_remote_code
+                    try:
+                        logger.debug("Attempting to load tokenizer without trust_remote_code...")
+                        with suppress_transformers_output():
+                            processor_or_tokenizer = AutoTokenizer.from_pretrained(model_identifier)
+                        logger.info("Tokenizer loaded successfully without trust_remote_code")
+                    except Exception as e2:
+                        last_error = e2
+                        logger.error(f"Tokenizer loading failed (second attempt): {e2}")
+
+            if processor_or_tokenizer is None:
+                # All attempts failed - provide detailed error
                 error_msg = (
-                    f"Could not load tokenizer from {model_identifier}\n\n"
+                    f"Could not load tokenizer/processor from {model_identifier}\n\n"
                     f"Last error: {str(last_error)}\n\n"
                     f"Try checking the model identifier is correct."
                 )
@@ -635,11 +762,18 @@ class GenericQuantizer(BaseQuantizer):
             model.save_pretrained(task.output_path)
 
             # Update progress during save
-            task.substage = "Writing tokenizer"
+            task.substage = f"Writing {'processor' if is_vlm else 'tokenizer'}"
             if progress_callback:
                 progress_callback(90.0, None)
             task.progress = 90.0
-            tokenizer.save_pretrained(task.output_path)
+            
+            # Save processor (for VLMs) or tokenizer (for LLMs)
+            processor_or_tokenizer.save_pretrained(task.output_path)
+            
+            if is_vlm:
+                logger.info("✓ Saved VLM processor (includes image_processor + tokenizer)")
+            else:
+                logger.info("✓ Saved tokenizer")
 
             # Calculate estimated size for display
             if task.output_path.exists():

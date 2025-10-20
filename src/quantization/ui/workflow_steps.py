@@ -218,7 +218,8 @@ def _create_workflow_steps(
         from ...cli.prompts import UserExitException
         from .navigation import NavigationException
         try:
-            s.vlm_scope = ask_vlm_quantization_scope(s.selected_model)
+            # Pass quant_method for MLX warning logic
+            s.vlm_scope = ask_vlm_quantization_scope(s.selected_model, s.quant_method)
             return s.vlm_scope
         except NavigationException:
             # Let navigation exceptions bubble up
@@ -232,7 +233,8 @@ def _create_workflow_steps(
         from .navigation import NavigationException
         try:
             if s.vlm_scope == "component_level":
-                s.vlm_components = ask_vlm_components(s.selected_model)
+                # Pass quant_method for MLX forcing logic
+                s.vlm_components = ask_vlm_components(s.selected_model, s.quant_method)
             else:
                 s.vlm_components = "both"
             return s.vlm_components

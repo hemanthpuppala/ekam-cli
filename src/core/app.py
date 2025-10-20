@@ -19,6 +19,7 @@ from ..cli.menus import (
     SystemSpecsScreen,
     WelcomeScreen,
 )
+from ..cli.diagnostics import SystemDiagnostics
 from ..cli.prompts import (
     UserExitException,
     confirm_deletion,
@@ -806,6 +807,15 @@ def main() -> None:
                     style="cyan"
                 )
                 return
+            elif operation_mode == "diagnostics":
+                # Run diagnostics
+                logger.info("Running system diagnostics")
+                from ..cli.diagnostics import SystemDiagnostics
+                diag = SystemDiagnostics()
+                diag.run_full_diagnostics(output_format="rich")
+                tui.prompt("\nPress Enter to return to main menu...", style="dim")
+                operation_mode = None  # Return to main menu
+                continue
 
         # Initialize config and session manager if needed
         if session_manager is None:
@@ -933,6 +943,32 @@ def register_all_providers(session_manager: SessionManager, config: dict, system
             # LM Studio not yet implemented
             elif provider_type == ProviderType.LM_STUDIO:
                 logger.info("LM Studio provider not yet implemented")
+
+            # 2025 NEW: MLX provider for Apple Silicon
+            elif provider_type == ProviderType.MLX:
+                try:
+                    from ..providers.mlx import MLXProvider
+                    provider = MLXProvider(provider_config)
+                    session_manager.register_provider(provider_type, provider_config, provider)
+                    logger.info(f"Registered MLX provider at {provider_config.models_dir}")
+                    registered_providers.append(provider_type)
+                except ImportError:
+                    logger.warning("MLX provider not available (requires macOS with Apple Silicon)")
+                except Exception as e:
+                    logger.error(f"Failed to initialize MLX provider: {e}")
+
+            # 2025 NEW: OpenVINO provider for Intel optimization
+            elif provider_type == ProviderType.OPENVINO:
+                try:
+                    from ..providers.openvino import OpenVINOProvider
+                    provider = OpenVINOProvider(provider_config)
+                    session_manager.register_provider(provider_type, provider_config, provider)
+                    logger.info(f"Registered OpenVINO provider at {provider_config.models_dir}")
+                    registered_providers.append(provider_type)
+                except ImportError:
+                    logger.warning("OpenVINO provider not available (install: pip install openvino optimum[openvino])")
+                except Exception as e:
+                    logger.error(f"Failed to initialize OpenVINO provider: {e}")
 
             else:
                 logger.warning(f"Unknown provider type: {provider_type.value}")

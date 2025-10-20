@@ -267,7 +267,7 @@ class HuggingFaceProvider(BaseProvider):
         vlm_keywords = [
             "llava", "blip", "instructblip", "clip", "vision", "vit",
             "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl",
-            "cogvlm", "internvl", "minicpm-v", "phi-3-vision"
+            "cogvlm", "internvl", "minicpm-v", "phi-3-vision", "moondream"
         ]
 
         if any(keyword in model_lower for keyword in vlm_keywords):
@@ -300,6 +300,9 @@ class HuggingFaceProvider(BaseProvider):
             Tuple of (model, processor/tokenizer)
         """
         logger.info(f"Loading HuggingFace model: {model_id}")
+        
+        # Suppress transformers output during loading (keeps TUI clean)
+        from ..utils.output_suppressor import suppress_transformers_output
 
         try:
             # Import base classes (always available)
@@ -321,7 +324,7 @@ class HuggingFaceProvider(BaseProvider):
                 vlm_keywords = [
                     "llava", "blip", "instructblip", "clip", "vision", "vl",
                     "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl", "qwen3-vl",
-                    "cogvlm", "internvl", "minicpm-v", "phi-3-vision"
+                    "cogvlm", "internvl", "minicpm-v", "phi-3-vision", "moondream"
                 ]
                 is_vlm = any(keyword in model_lower for keyword in vlm_keywords)
 
@@ -331,22 +334,93 @@ class HuggingFaceProvider(BaseProvider):
                     # Import VLM-specific classes (may not be available in all versions)
                     from transformers import AutoProcessor
 
-                    processor = AutoProcessor.from_pretrained(
-                        model_id,
-                        cache_dir=str(self.cache_dir),
-                        trust_remote_code=True
-                    )
+                    # Suppress output during loading
+                    with suppress_transformers_output():
+                        processor = AutoProcessor.from_pretrained(
+                            model_id,
+                            cache_dir=str(self.cache_dir),
+                            trust_remote_code=True
+                        )
 
-                    # Prepare loading kwargs with proper dtype parameter
-                    vlm_load_kwargs = {
-                        "cache_dir": str(self.cache_dir),
-                        "trust_remote_code": True,
-                        "dtype": torch.float16 if self.device == "cuda" else torch.float32
-                    }
+                        # Prepare loading kwargs with proper dtype parameter
+                        vlm_load_kwargs = {
+                            "cache_dir": str(self.cache_dir),
+                            "trust_remote_code": True,
+                            "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
+                            "low_cpu_mem_usage": True,  # Stream weights during loading
+                        }
 
-                    # FUTURE-PROOF: Use AutoModel (auto-detects correct class)
-                    # Works for: Qwen3-VL, LLaVA, BLIP, InstructBLIP, any future VLM
-                    model = AutoModel.from_pretrained(model_id, **vlm_load_kwargs)
+                        # 2025 OPTIMIZATION: Flash Attention 2/3 support for faster inference
+                        # Reduces memory usage and improves speed (requires flash-attn package)
+                        try:
+                            import flash_attn  # noqa: F401
+                            vlm_load_kwargs["attn_implementation"] = "flash_attention_2"
+                            logger.info("✓ Flash Attention 2 enabled for faster VLM inference")
+                        except ImportError:
+                            logger.debug("Flash Attention not available (install flash-attn for 2-4x speedup)")
+                            # Fallback to SDPA (Scaled Dot-Product Attention) - PyTorch 2.0+ native
+                            if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+                                vlm_load_kwargs["attn_implementation"] = "sdpa"
+                                logger.info("✓ Using PyTorch SDPA for optimized attention")
+
+                        # Load VLM with appropriate model class
+                        # Try multiple classes in order of compatibility for custom/standard architectures
+                        model = None
+                        last_error = None
+                        
+                        # PRODUCTION FIX: Try AutoModelForCausalLM FIRST
+                        # This works with most VLMs including custom architectures (moondream2, etc.)
+                        # when trust_remote_code=True is enabled
+                        model_classes_to_try = [
+                            ('AutoModelForCausalLM', 'VLMs with custom configs (moondream, LLaVA, etc.)'),
+                            ('AutoModelForVision2Seq', 'Modern VLMs (Qwen2-VL, Idefics, etc.)'),
+                        ]
+                        
+                        for model_class_name, desc in model_classes_to_try:
+                            try:
+                                logger.debug(f"Trying {model_class_name} for VLM: {desc}")
+                                
+                                if model_class_name == 'AutoModelForCausalLM':
+                                    from transformers import AutoModelForCausalLM
+                                    
+                                    # Try with full kwargs first
+                                    try:
+                                        model = AutoModelForCausalLM.from_pretrained(model_id, **vlm_load_kwargs)
+                                    except (TypeError, ValueError) as param_error:
+                                        # Some models don't support all parameters (e.g., attn_implementation)
+                                        # Retry with minimal kwargs
+                                        logger.debug(f"Full kwargs failed, retrying with minimal kwargs: {param_error}")
+                                        minimal_kwargs = {
+                                            "cache_dir": str(self.cache_dir),
+                                            "trust_remote_code": True,
+                                            "torch_dtype": vlm_load_kwargs.get("torch_dtype", torch.float32),
+                                        }
+                                        model = AutoModelForCausalLM.from_pretrained(model_id, **minimal_kwargs)
+                                        
+                                elif model_class_name == 'AutoModelForVision2Seq':
+                                    from transformers import AutoModelForVision2Seq
+                                    model = AutoModelForVision2Seq.from_pretrained(model_id, **vlm_load_kwargs)
+                                
+                                # Verify model has .generate() method
+                                if not hasattr(model, 'generate'):
+                                    logger.debug(f"{model_class_name} loaded but has no .generate() method, trying next...")
+                                    model = None
+                                    continue
+                                
+                                logger.info(f"✓ Loaded VLM with {model_class_name}")
+                                break
+                                
+                            except Exception as e:
+                                last_error = e
+                                logger.debug(f"{model_class_name} failed: {str(e)[:200]}")
+                                continue
+                        
+                        if model is None:
+                            error_msg = f"Could not load VLM {model_id} with any compatible model class.\n"
+                            error_msg += f"Tried: {', '.join([c[0] for c in model_classes_to_try])}\n"
+                            if last_error:
+                                error_msg += f"Last error: {str(last_error)[:300]}"
+                            raise RuntimeError(error_msg)
 
                     # Determine target device - some models have MPS compatibility issues
                     target_device = self.device
@@ -363,43 +437,53 @@ class HuggingFaceProvider(BaseProvider):
                 except Exception as e:
                     logger.warning(f"Failed to load as VLM: {e}, trying as LLM...")
 
-            # Load as LLM
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_id,
-                cache_dir=str(self.cache_dir),
-                trust_remote_code=True
-            )
+            # Load as LLM (suppress output)
+            with suppress_transformers_output():
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_id,
+                    cache_dir=str(self.cache_dir),
+                    trust_remote_code=True
+                )
 
-            # Prepare loading kwargs with proper dtype parameter
-            load_kwargs = {
-                "cache_dir": str(self.cache_dir),
-                "trust_remote_code": True,
-            }
+                # Prepare loading kwargs with proper dtype parameter
+                load_kwargs = {
+                    "cache_dir": str(self.cache_dir),
+                    "trust_remote_code": True,
+                    "low_cpu_mem_usage": True,  # Stream weights during loading
+                }
 
-            # Use 'dtype' instead of deprecated 'torch_dtype'
-            if self.device == "cuda":
-                load_kwargs["dtype"] = torch.float16
-            else:
-                load_kwargs["dtype"] = torch.float32
+                # Use 'dtype' instead of deprecated 'torch_dtype'
+                if self.device == "cuda":
+                    load_kwargs["torch_dtype"] = torch.float16
+                else:
+                    load_kwargs["torch_dtype"] = torch.float32
 
-            try:
-                # FUTURE-PROOF: Use AutoModel (auto-detects correct class)
-                # This automatically picks the right model class from config.json
-                # Works for: LLMs, VLMs, future architectures, any transformers model
-                model = AutoModel.from_pretrained(model_id, **load_kwargs)
-            except Exception as e:
-                # Fallback: try without trust_remote_code for standard models
-                logger.warning(f"Failed with trust_remote_code=True, trying standard loading: {e}")
-                load_kwargs["trust_remote_code"] = False
+                # 2025 OPTIMIZATION: Flash Attention for LLMs
                 try:
-                    model = AutoModel.from_pretrained(model_id, **load_kwargs)
-                except Exception as e2:
-                    # Final fallback: minimal loading
-                    logger.warning(f"Failed with dtype, trying default loading: {e2}")
-                    model = AutoModel.from_pretrained(
-                        model_id,
-                        cache_dir=str(self.cache_dir)
-                    )
+                    import flash_attn  # noqa: F401
+                    load_kwargs["attn_implementation"] = "flash_attention_2"
+                    logger.info("✓ Flash Attention 2 enabled for faster inference")
+                except ImportError:
+                    if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+                        load_kwargs["attn_implementation"] = "sdpa"
+                        logger.info("✓ Using PyTorch SDPA for optimized attention")
+
+                # PRODUCTION FIX: Use AutoModelForCausalLM for LLMs
+                # This works with both standard and custom architectures when trust_remote_code=True
+                # AutoModel doesn't support custom config classes, so we avoid it completely
+                from transformers import AutoModelForCausalLM
+                
+                try:
+                    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+                except (TypeError, ValueError) as param_error:
+                    # Some models don't support all parameters
+                    logger.debug(f"Full kwargs failed, retrying with minimal kwargs: {param_error}")
+                    minimal_kwargs = {
+                        "cache_dir": str(self.cache_dir),
+                        "trust_remote_code": True,
+                        "torch_dtype": load_kwargs.get("torch_dtype", torch.float32),
+                    }
+                    model = AutoModelForCausalLM.from_pretrained(model_id, **minimal_kwargs)
 
             # Determine target device - some models have MPS compatibility issues
             target_device = self.device
@@ -483,16 +567,108 @@ class HuggingFaceProvider(BaseProvider):
                 max_turns=5
             )
 
-            # Prepare inputs and move to SAME device as model
-            inputs = processor(
-                text=full_question,
-                images=image,
-                return_tensors="pt"
-            ).to(model_device)
+            # SPECIAL HANDLING: Moondream2 has a custom inference API
+            # It uses model.encode_image() + model.answer_question() instead of standard processor
+            if hasattr(model, 'encode_image') and hasattr(model, 'answer_question'):
+                logger.debug("Detected moondream2 custom API - using encode_image + answer_question")
+                try:
+                    # Encode the image using moondream's custom encoder
+                    image_embeds = model.encode_image(image)
+                    
+                    # Generate answer using moondream's custom method
+                    answer = model.answer_question(
+                        image_embeds=image_embeds,
+                        question=full_question,
+                        tokenizer=processor  # moondream uses tokenizer, not processor
+                    )
+                    
+                    logger.info("✓ Response generated with moondream2 API")
+                    return answer.strip()
+                    
+                except Exception as e:
+                    logger.error(f"Moondream2 custom API failed: {e}")
+                    # Fall through to try standard approach
+                    pass
 
-            # Generate response
+            # Prepare inputs with automatic format detection for all VLMs
+            # Try messages format first (modern VLMs: Qwen2-VL, Qwen3-VL, Idefics, etc.)
+            # Fall back to standard format (LLaVA, BLIP, etc.)
+            inputs = None
+            
+            # Strategy 1: Try messages format with chat template (if available)
+            if hasattr(processor, 'apply_chat_template'):
+                try:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": image},
+                                {"type": "text", "text": full_question}
+                            ]
+                        }
+                    ]
+                    
+                    # Apply chat template to get properly formatted text with image tokens
+                    text_prompt = processor.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                    
+                    # Process with the formatted text
+                    inputs = processor(
+                        text=[text_prompt],
+                        images=[image],
+                        padding=True,
+                        return_tensors="pt"
+                    )
+                    
+                    logger.debug("✓ Using messages format with chat template")
+                    
+                except Exception as e:
+                    logger.debug(f"Messages format failed: {e}, trying standard format")
+                    inputs = None
+            
+            # Strategy 2: Standard text + images format (fallback)
+            if inputs is None:
+                try:
+                    inputs = processor(
+                        text=full_question,
+                        images=image,
+                        return_tensors="pt"
+                    )
+                    logger.debug("✓ Using standard text + images format")
+                except Exception as e:
+                    logger.error(f"Both input formats failed: {e}")
+                    raise RuntimeError(
+                        f"Failed to prepare inputs for VLM inference.\n"
+                        f"Processor: {type(processor).__name__}\n"
+                        f"Error: {e}"
+                    )
+            
+            # Move inputs to model device (handle each tensor individually for MPS compatibility)
+            inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+
+            # Warn if on CPU (very slow)
+            if str(model_device) == 'cpu':
+                logger.warning("⏳ Running inference on CPU - this will be SLOW (30s-2min)")
+                logger.warning("   Consider using a smaller model or CUDA/MPS-compatible device")
+            
+            # Generate response (reduced tokens for faster response on CPU)
+            logger.info("Generating response...")
+            max_tokens = 512 if str(model_device) == 'cpu' else 1024
+
+            # 2025 OPTIMIZATION: KV cache configuration for faster generation
+            generation_config = {
+                "max_new_tokens": max_tokens,
+                "use_cache": True,  # Enable KV cache (default but explicit)
+                "do_sample": False,  # Greedy decoding for consistency
+            }
+
             with torch.no_grad():
-                output = model.generate(**inputs, max_new_tokens=1024)  # Increased for more detailed responses
+                output = model.generate(**inputs, **generation_config)
+            
+            logger.info("✓ Response generated")
 
             # Decode response
             response = processor.batch_decode(output, skip_special_tokens=True)[0]
@@ -679,6 +855,7 @@ class HuggingFaceProvider(BaseProvider):
                 "top_p": 0.9,
                 "top_k": 50,
                 "do_sample": True,
+                "use_cache": True,  # 2025 OPTIMIZATION: Enable KV cache for faster generation
                 "pad_token_id": tokenizer.pad_token_id,
                 "eos_token_id": tokenizer.eos_token_id,
             }
@@ -789,11 +966,14 @@ class HuggingFaceProvider(BaseProvider):
         }
 
     def install_model(self, model_name: str, progress_callback=None) -> bool:
-        """Download model from HuggingFace Hub.
+        """Download model from HuggingFace Hub with visible progress bars.
 
         Handles both regular transformers models and GGUF models:
         - GGUF repos: Downloads .gguf files directly (no transformers validation)
         - Regular models: Downloads via transformers (requires valid config.json)
+        
+        Progress bars are shown during download for transparency.
+        No output suppression is used during installation.
 
         Args:
             model_name: Model identifier (e.g., "llava-hf/llava-1.5-7b-hf" or "TheBloke/Llama-2-7B-GGUF")
@@ -803,6 +983,9 @@ class HuggingFaceProvider(BaseProvider):
             True if successful
         """
         logger.info(f"Downloading HuggingFace model: {model_name}")
+        
+        # NOTE: Do NOT use suppress_transformers_output() here!
+        # We want users to see download progress bars during installation.
 
         try:
             from huggingface_hub import list_repo_files, hf_hub_download
@@ -881,12 +1064,13 @@ class HuggingFaceProvider(BaseProvider):
                                      for f in sorted_files[1:]]
                         logger.info(f"Other versions: {', '.join(other_files)}")
 
-                    # Download with progress (hf_hub_download shows progress by default)
+                    # Download with visible progress bar
+                    # hf_hub_download shows tqdm progress by default (not suppressed)
                     downloaded_path = hf_hub_download(
                         repo_id=model_name,
                         filename=best_file,
                         local_dir=str(download_dir),
-                        local_dir_use_symlinks=False
+                        local_dir_use_symlinks=False  # Direct copy for GGUF compatibility
                     )
                     logger.info(f"Downloaded {best_file} successfully")
                     logger.info(f"Location: {downloaded_path}")
@@ -912,14 +1096,15 @@ class HuggingFaceProvider(BaseProvider):
             # Check if VLM (vision-language model)
             vlm_keywords = [
                 "llava", "blip", "instructblip", "vision", "vl", "clip",
-                "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl", "qwen3-vl"
+                "paligemma", "idefics", "fuyu", "kosmos", "qwen-vl", "qwen3-vl", "moondream"
             ]
             is_vlm = any(keyword in model_lower for keyword in vlm_keywords)
 
             if is_vlm:
-                # Download processor for VLM (only import if needed)
+                # Download processor for VLM (with visible progress)
                 try:
                     from transformers import AutoProcessor
+                    # Progress bars shown during download
                     AutoProcessor.from_pretrained(
                         model_name,
                         cache_dir=str(self.cache_dir),
@@ -929,8 +1114,9 @@ class HuggingFaceProvider(BaseProvider):
                 except Exception as e:
                     logger.debug(f"Could not download processor: {e}")
 
-            # Download tokenizer (for all models)
+            # Download tokenizer (with visible progress)
             try:
+                # Progress bars shown during download
                 AutoTokenizer.from_pretrained(
                     model_name,
                     cache_dir=str(self.cache_dir),
@@ -940,17 +1126,20 @@ class HuggingFaceProvider(BaseProvider):
             except Exception as e:
                 logger.debug(f"Could not download tokenizer: {e}")
 
-            # FUTURE-PROOF: Use AutoModel (generic) instead of AutoModelForCausalLM
-            # AutoModel automatically detects the correct model class from config.json
-            # This works for:
-            # - New architectures (Qwen3-VL, future models)
-            # - VLMs (LLaVA, BLIP, InstructBLIP, etc.)
-            # - LLMs (GPT, Llama, Qwen, DeepSeek, etc.)
-            # - Any model type transformers supports
-            AutoModel.from_pretrained(
-                model_name,
+            # Download model weights (with visible progress)
+            # Use snapshot_download for robust handling of all model types:
+            # - Models with custom configurations (e.g., moondream2)
+            # - Standard transformers models
+            # - VLMs and LLMs
+            # This avoids configuration class validation errors while still downloading all files
+            from huggingface_hub import snapshot_download
+            
+            # Progress bars shown during download
+            snapshot_download(
+                repo_id=model_name,
                 cache_dir=str(self.cache_dir),
-                trust_remote_code=True  # Allow custom model code
+                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.py"],
+                ignore_patterns=["*.gguf", "*.md", "*.git*"]
             )
 
             logger.info(f"Successfully downloaded {model_name}")
