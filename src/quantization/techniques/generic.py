@@ -834,7 +834,15 @@ class GenericQuantizer(BaseQuantizer):
             return False
 
         except Exception as e:
-            error_msg = f"Quantization failed: {str(e)}"
+            # For GGUF-related errors, preserve the full helpful message
+            error_str = str(e)
+            if "GENERIC QUANTIZATION FROM OLLAMA NOT YET SUPPORTED" in error_str:
+                # Don't wrap GGUF error messages - they're already formatted
+                error_msg = error_str
+            else:
+                # Wrap other errors
+                error_msg = f"Quantization failed: {error_str}"
+
             logger.error(error_msg, exc_info=True)
             task.status = TaskStatus.FAILED
             task.error = error_msg
