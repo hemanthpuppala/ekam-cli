@@ -361,12 +361,25 @@ class GGUFQuantizer(BaseQuantizer):
 
         cmd = [
             str(self.quantize_binary),
+            "--allow-requantize",  # Allow requantizing already quantized models
             str(source_path),
             str(task.output_path),
             quant_type_arg,
         ]
 
         logger.info(f"Running quantization command: {' '.join(cmd)}")
+
+        # Check if source is already quantized (requantization)
+        if source_path.suffix == ".gguf":
+            try:
+                # Quick check - if file exists and is GGUF, it might be quantized
+                logger.warning(
+                    f"Requantizing from already quantized GGUF model. "
+                    f"This may reduce quality compared to quantizing from FP16/FP32. "
+                    f"Source: {source_path.name}"
+                )
+            except Exception:
+                pass
 
         # Update task status
         task.status = TaskStatus.RUNNING
