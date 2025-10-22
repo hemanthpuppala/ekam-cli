@@ -117,8 +117,10 @@ class GGUFDequantizer(BaseConverter):
 
         try:
             # Use F16 type for dequantization
+            # Need --allow-requantize because source is already quantized
             cmd = [
                 str(self.quantize_binary),
+                "--allow-requantize",  # Required for requantizing from quantized models
                 str(source_path),
                 str(output_path),
                 "F16",  # FP16 quantization (effectively dequantization)
