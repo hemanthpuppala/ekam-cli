@@ -9,7 +9,7 @@ import httpx
 from loguru import logger
 from PIL import Image
 
-from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
+from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType, ProviderType
 from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
@@ -115,7 +115,7 @@ class OllamaProvider(BaseProvider):
             return ModelInfo(
                 model_id=name,
                 name=name,
-                provider="ollama",
+                provider=ProviderType.OLLAMA,
                 size_gb=metadata.file_size_gb,
                 architecture=metadata.architecture,
                 quantization=metadata.quantization,
@@ -142,7 +142,7 @@ class OllamaProvider(BaseProvider):
             return ModelInfo(
                 model_id=name,
                 name=name,
-                provider="ollama",
+                provider=ProviderType.OLLAMA,
                 size_gb=size_gb,
                 model_type=model_type,
                 capabilities=capabilities,
