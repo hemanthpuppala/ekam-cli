@@ -16,6 +16,7 @@ from ..techniques.bnb import BitsAndBytesQuantizer
 from ..techniques.mlx import MLXQuantizer
 from ..techniques.openvino import OpenVINOQuantizer
 from ..models import QuantizationTask, TaskStatus, QuantizationModule
+from ..orchestrator import QuantizationOrchestrator
 
 
 class BackgroundJobManager:
@@ -40,6 +41,9 @@ class BackgroundJobManager:
         self.bnb_quantizer = BitsAndBytesQuantizer()
         self.mlx_quantizer = MLXQuantizer()
         self.openvino_quantizer = OpenVINOQuantizer()
+
+        # Initialize orchestrator for multi-step conversions
+        self.orchestrator = QuantizationOrchestrator()
 
         # Load saved state
         self._load_state()
@@ -84,7 +88,35 @@ class BackgroundJobManager:
                     if progress_callback:
                         progress_callback(task.task_id, progress, eta)
 
-                # Execute quantization based on module (takes priority) or method family
+                # STEP 1: Check if conversion is needed (Ollama/GGUF → other formats)
+                conversion_path = self.orchestrator.determine_conversion_path(
+                    task.model_info, task.quant_type
+                )
+                logger.debug(f"Conversion path: {conversion_path.value}")
+
+                converted_path = None
+                if self.orchestrator.needs_conversion(conversion_path):
+                    logger.info(f"Multi-step conversion required: {conversion_path.value}")
+
+                    # Execute conversion pipeline (GGUF → FP16, etc.)
+                    converted_path = self.orchestrator.execute_conversion_pipeline(
+                        task, conversion_path, progress_wrapper
+                    )
+
+                    if not converted_path:
+                        task.status = TaskStatus.FAILED
+                        task.error = "Format conversion failed"
+                        success = False
+                        return
+
+                    logger.info(f"Conversion completed: {converted_path}")
+
+                    # Update task to use converted model
+                    # Store original source_path for cleanup
+                    original_source_path = task.model_info.source_path
+                    task.model_info.source_path = converted_path
+
+                # STEP 2: Execute quantization based on module (takes priority) or method family
                 # Check module first for platform-specific quantizers
                 if task.module == QuantizationModule.MLX:
                     success = self.mlx_quantizer.quantize(task, progress_wrapper)
@@ -108,6 +140,11 @@ class BackgroundJobManager:
                         task.status = TaskStatus.FAILED
                         task.error = f"Quantization method {method_family} not yet implemented"
                         success = False
+
+                # STEP 3: Clean up intermediate files if conversion was used
+                if converted_path and success:
+                    logger.info("Cleaning up intermediate conversion files")
+                    self.orchestrator.cleanup_intermediate_files(task)
 
                 # Update completion time
                 if success:

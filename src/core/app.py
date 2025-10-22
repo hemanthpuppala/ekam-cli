@@ -541,15 +541,42 @@ def run_install_workflow(
     tui.clear_screen()
 
     # Get provider instance
-    # Special handling for GGUF: Use HuggingFace provider for installation
-    # (GGUF models are downloaded from HuggingFace Hub as .gguf files)
+    # Special handling: GGUF, MLX, OpenVINO, and Quantized providers don't support direct installation
+    # They rely on HuggingFace to download models first
     install_provider_type = provider_type
-    if provider_type == ProviderType.GGUF:
-        # GGUF models are installed via HuggingFace Hub
-        install_provider_type = ProviderType.HUGGINGFACE
-        logger.info("Using HuggingFace provider to install GGUF model from Hub")
+    needs_hf_installation = provider_type in [
+        ProviderType.GGUF,
+        ProviderType.MLX,
+        ProviderType.OPENVINO,
+        ProviderType.QUANTIZED
+    ]
 
+    if needs_hf_installation:
+        # Explain to user what will happen
+        provider_name = provider_type.value.upper()
+        tui.console.print()
+        tui.console.print(f"[yellow]ℹ Note:[/yellow] {provider_name} models must be installed via HuggingFace Hub first.")
+        tui.console.print(f"[dim]After installation, the model will appear in the HuggingFace provider list.[/dim]")
+        tui.console.print()
+
+        # Ask for confirmation
+        from ..cli.prompts import prompt_yes_no
+        if not prompt_yes_no(
+            "Install this model using HuggingFace Hub?",
+            default=True
+        ):
+            logger.info(f"User cancelled HuggingFace installation for {provider_name}")
+            tui.show_message("Installation cancelled.", title="Cancelled", style="yellow")
+            tui.prompt("Press Enter to continue...", style="dim")
+            return False
+
+        # Use HuggingFace provider for installation
+        install_provider_type = ProviderType.HUGGINGFACE
+        logger.info(f"Using HuggingFace provider to install model for {provider_name}")
+
+    logger.info(f"Getting provider for installation: {install_provider_type.value}")
     provider = session_manager.model_discovery.get_provider(install_provider_type)
+    logger.info(f"Got provider: {type(provider).__name__}")
     if provider is None:
         tui.show_error(f"Provider {install_provider_type.value} not registered")
         return False
@@ -628,6 +655,29 @@ def run_install_workflow(
                 style="green"
             )
             logger.info(f"Successfully installed {model_name}")
+
+            # If installed via HuggingFace for another provider, inform user
+            if needs_hf_installation:
+                tui.console.print()
+                tui.console.print(f"[yellow]ℹ Important:[/yellow] This model is now available in the [bold cyan]HuggingFace[/bold cyan] provider.")
+                tui.console.print(f"[dim]To use it with {provider_name}, you can:[/dim]")
+
+                if provider_type == ProviderType.GGUF:
+                    tui.console.print(f"[dim]  • Convert it to GGUF format using the quantization feature[/dim]")
+                elif provider_type == ProviderType.MLX:
+                    tui.console.print(f"[dim]  • Quantize it to MLX format using the quantization feature[/dim]")
+                elif provider_type == ProviderType.OPENVINO:
+                    tui.console.print(f"[dim]  • Quantize it to OpenVINO format using the quantization feature[/dim]")
+                elif provider_type == ProviderType.QUANTIZED:
+                    tui.console.print(f"[dim]  • Quantize it using the quantization feature[/dim]")
+
+                tui.console.print()
+
+                # Ask for confirmation that user understands
+                prompt_yes_no(
+                    "Do you understand where to find this model?",
+                    default=True
+                )
         else:
             tui.show_error(f"Failed to install {model_name}")
             logger.error(f"Installation failed for {model_name}")
@@ -642,12 +692,79 @@ def run_install_workflow(
     return install_success
 
 
+def parse_selection_input(input_str: str, max_value: int) -> list[int]:
+    """Parse user selection input supporting multiple formats.
+
+    Supports:
+    - Single: "5" → [5]
+    - Multiple: "1 2 3" or "1,2,3" → [1, 2, 3]
+    - Range: "1-5" → [1, 2, 3, 4, 5]
+    - Mixed: "1 3-5 7" → [1, 3, 4, 5, 7]
+
+    Args:
+        input_str: User input string
+        max_value: Maximum valid value
+
+    Returns:
+        List of selected indices (1-based)
+
+    Raises:
+        ValueError: If input is invalid
+    """
+    if not input_str or input_str.strip().lower() == 'c':
+        return []
+
+    indices = set()
+
+    # Replace commas with spaces for uniform parsing
+    input_str = input_str.replace(',', ' ')
+
+    # Split by whitespace
+    parts = input_str.split()
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Check for range (e.g., "1-5")
+        if '-' in part:
+            try:
+                start, end = part.split('-', 1)
+                start_idx = int(start.strip())
+                end_idx = int(end.strip())
+
+                if start_idx < 1 or end_idx > max_value or start_idx > end_idx:
+                    raise ValueError(f"Invalid range: {part}")
+
+                indices.update(range(start_idx, end_idx + 1))
+            except (ValueError, AttributeError) as e:
+                raise ValueError(f"Invalid range format: {part}") from e
+        else:
+            # Single number
+            try:
+                idx = int(part)
+                if idx < 1 or idx > max_value:
+                    raise ValueError(f"Index {idx} out of range [1-{max_value}]")
+                indices.add(idx)
+            except ValueError as e:
+                raise ValueError(f"Invalid number: {part}") from e
+
+    return sorted(list(indices))
+
+
 def run_delete_workflow(
     session_manager: SessionManager,
     provider_type: ProviderType,
     models: list
 ) -> bool:
-    """Run model deletion workflow.
+    """Run model deletion workflow with multi-selection support.
+
+    Supports multiple selection formats:
+    - Single: "5"
+    - Multiple: "1 2 3" or "1,2,3"
+    - Range: "1-5"
+    - Mixed: "1 3-5 7"
 
     Args:
         session_manager: Session manager instance
@@ -655,7 +772,7 @@ def run_delete_workflow(
         models: List of available models
 
     Returns:
-        True if model was successfully deleted
+        True if at least one model was successfully deleted
     """
     from ..models.model import ModelInfo
 
@@ -678,8 +795,9 @@ def run_delete_workflow(
 
     # Show model list for selection
     tui.show_panel(
-        "[bold cyan]Select Model to Delete[/bold cyan]\n\n"
-        "Choose a model from the list to delete it permanently.",
+        "[bold cyan]Select Model(s) to Delete[/bold cyan]\n\n"
+        "Choose one or more models to delete permanently.\n"
+        "[dim]Examples: '5' (single), '1 2 3' (multiple), '1-5' (range), '1 3-5 7' (mixed)[/dim]",
         title="Model Deletion",
         border_style="cyan"
     )
@@ -690,74 +808,120 @@ def run_delete_workflow(
         tui.console.print(f"  [{idx}] {model.name} - {model.size_gb:.1f} GB")
     tui.console.print()
 
-    # Get model selection
+    # Get model selection(s)
     try:
         choice = tui.prompt(
-            f"Select model [1-{len(models)}] or 'c' to cancel:",
+            f"Select model(s) [1-{len(models)}] or 'c' to cancel:",
             style="cyan"
-        ).strip().lower()
+        ).strip()
 
-        if choice == 'c':
+        if choice.lower() == 'c':
             logger.info("User cancelled model deletion")
             return False
 
-        idx = int(choice)
-        if not (1 <= idx <= len(models)):
-            tui.show_error("Invalid selection")
-            tui.prompt("Press Enter to continue...", style="dim")
+        # Parse selection input
+        selected_indices = parse_selection_input(choice, len(models))
+
+        if not selected_indices:
+            logger.info("User cancelled model deletion (empty selection)")
             return False
 
-        selected_model = models[idx - 1]
+        # Get selected models
+        selected_models = [models[idx - 1] for idx in selected_indices]
 
-    except ValueError:
-        tui.show_error("Invalid input")
+    except ValueError as e:
+        tui.show_error(f"Invalid input: {e}")
         tui.prompt("Press Enter to continue...", style="dim")
         return False
 
+    # Calculate total size
+    total_size = sum(model.size_gb for model in selected_models)
+
     # Confirm deletion
-    if not confirm_deletion(selected_model.name, selected_model.size_gb):
-        logger.info(f"User cancelled deletion of {selected_model.name}")
+    model_names = "\n".join([f"  • {model.name} ({model.size_gb:.1f} GB)" for model in selected_models])
+    confirm_msg = (
+        f"[bold red]Delete {len(selected_models)} model(s)?[/bold red]\n\n"
+        f"{model_names}\n\n"
+        f"[bold]Total space to free: {total_size:.1f} GB[/bold]\n\n"
+        f"[yellow]This action cannot be undone![/yellow]"
+    )
+
+    tui.show_panel(confirm_msg, title="Confirm Deletion", border_style="red")
+    confirm = tui.prompt("Type 'yes' to confirm deletion:", style="yellow").strip().lower()
+
+    if confirm != 'yes':
+        logger.info(f"User cancelled deletion of {len(selected_models)} models")
         tui.show_message("Deletion cancelled.", title="Cancelled", style="yellow")
         tui.prompt("Press Enter to continue...", style="dim")
         return False
 
-    # Check if model is currently loaded - unload it first
-    if (session_manager.state.loaded_model and
-        session_manager.state.loaded_model.model_info.model_id == selected_model.model_id):
-        logger.info(f"Unloading currently loaded model before deletion: {selected_model.model_id}")
+    # Check if any selected model is currently loaded - unload it first
+    if session_manager.state.loaded_model:
+        loaded_model_id = session_manager.state.loaded_model.model_info.model_id
+        if any(model.model_id == loaded_model_id for model in selected_models):
+            logger.info("Unloading currently loaded model before deletion")
+            tui.show_message(
+                "One of the selected models is currently loaded.\nUnloading before deletion...",
+                title="Unloading Model",
+                style="yellow"
+            )
+            session_manager.unload_current_model()
+
+    # Delete the models
+    tui.clear_screen()
+    tui.console.print(f"\n[bold yellow]Deleting {len(selected_models)} model(s)...[/bold yellow]\n")
+
+    successful_deletions = []
+    failed_deletions = []
+
+    for i, model in enumerate(selected_models, 1):
+        tui.console.print(f"[{i}/{len(selected_models)}] Deleting {model.name}...", style="cyan")
+
+        try:
+            delete_success = provider.delete_model(model.model_id)
+
+            if delete_success:
+                successful_deletions.append(model)
+                tui.console.print(f"  ✓ Deleted {model.name} ({model.size_gb:.1f} GB)", style="green")
+                logger.info(f"Successfully deleted {model.name}")
+            else:
+                failed_deletions.append(model)
+                tui.console.print(f"  ✗ Failed to delete {model.name}", style="red")
+                logger.error(f"Deletion failed for {model.name}")
+
+        except Exception as e:
+            failed_deletions.append(model)
+            logger.error(f"Deletion error for {model.name}: {e}")
+            tui.console.print(f"  ✗ Error deleting {model.name}: {e}", style="red")
+
+    # Show summary
+    tui.console.print()
+    freed_space = sum(model.size_gb for model in successful_deletions)
+
+    if successful_deletions and not failed_deletions:
         tui.show_message(
-            f"Model {selected_model.name} is currently loaded.\nUnloading before deletion...",
-            title="Unloading Model",
+            f"✓ Successfully deleted {len(successful_deletions)} model(s)!\n\n"
+            f"Freed {freed_space:.1f} GB of disk space.",
+            title="Deletion Complete",
+            style="green"
+        )
+    elif successful_deletions and failed_deletions:
+        tui.show_message(
+            f"⚠ Partial success:\n\n"
+            f"✓ Deleted: {len(successful_deletions)} model(s) ({freed_space:.1f} GB freed)\n"
+            f"✗ Failed: {len(failed_deletions)} model(s)\n\n"
+            f"Check logs for details.",
+            title="Deletion Partially Complete",
             style="yellow"
         )
-        session_manager.unload_current_model()
-
-    # Delete the model
-    tui.clear_screen()
-    tui.console.print(f"\n[bold yellow]Deleting {selected_model.name}...[/bold yellow]\n")
-
-    try:
-        delete_success = provider.delete_model(selected_model.model_id)
-
-        if delete_success:
-            tui.show_message(
-                f"✓ Successfully deleted {selected_model.name}!\n\n"
-                f"Freed {selected_model.size_gb:.1f} GB of disk space.",
-                title="Deletion Complete",
-                style="green"
-            )
-            logger.info(f"Successfully deleted {selected_model.name}")
-        else:
-            tui.show_error(f"Failed to delete {selected_model.name}")
-            logger.error(f"Deletion failed for {selected_model.name}")
-
-    except Exception as e:
-        logger.error(f"Deletion error for {selected_model.name}: {e}")
-        tui.show_error(f"Deletion failed: {e}")
-        delete_success = False
+    else:
+        tui.show_error(
+            f"Failed to delete all {len(selected_models)} model(s).\n\n"
+            "Check logs for details."
+        )
 
     tui.prompt("Press Enter to continue...", style="dim")
-    return delete_success
+    return len(successful_deletions) > 0
 
 
 def main() -> None:
@@ -1071,7 +1235,7 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
 
             if selected_model == "INSTALL":
                 # User wants to install a new model
-                logger.info("User initiated model installation")
+                logger.info(f"User initiated model installation for provider: {provider_type.value}")
                 install_success = run_install_workflow(session_manager, provider_type, system_specs)
 
                 if install_success:
@@ -1123,14 +1287,16 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
             # Handle TOO_LARGE models with user override
             if selected_model.compatibility == "too_large":
                 tui.show_message(
-                    f"⚠️  WARNING: Model May Not Fit in Memory\n\n"
+                    f"⚠️  WARNING: Model Size Exceeds Recommended Limit\n\n"
                     f"Model: {selected_model.name}\n"
                     f"Size: {selected_model.size_gb:.1f} GB\n"
-                    f"Recommended: {system_specs.recommended_model_size_gb:.1f} GB\n"
+                    f"Recommended max: {system_specs.recommended_model_size_gb:.1f} GB\n"
                     f"Available RAM: {system_specs.available_ram_gb:.1f} GB\n\n"
-                    f"Loading this model may cause:\n"
-                    f"  • System slowdown or crashes\n"
-                    f"  • Out of memory errors\n"
+                    f"{selected_model.compatibility_message}\n\n"
+                    f"This may cause:\n"
+                    f"  • Out-of-memory (OOM) errors\n"
+                    f"  • System slowdown or freezing\n"
+                    f"  • Application crashes\n"
                     f"  • Excessive swap usage",
                     title="Memory Warning",
                     style="yellow"

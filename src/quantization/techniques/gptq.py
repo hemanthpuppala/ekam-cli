@@ -138,13 +138,18 @@ class GPTQQuantizer(BaseQuantizer):
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting GPTQ {task.quant_type.display_name} quantization")
 
-            # Check if auto-gptq is available
-            available, message = self.check_availability()
+            # Check if auto-gptq is available and auto-install if needed
+            available, message = self.check_and_install_dependencies(
+                auto_install=True,
+                show_progress=True
+            )
             if not available:
                 task.status = TaskStatus.FAILED
                 task.error = message
                 logger.error(f"Auto-GPTQ not available: {message}")
                 return False
+            
+            logger.info(f"✓ Auto-GPTQ available: {message}")
 
             # Update progress: Validating
             if progress_callback:

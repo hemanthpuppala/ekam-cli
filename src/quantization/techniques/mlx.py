@@ -124,8 +124,16 @@ class MLXQuantizer(BaseQuantizer):
             model_info: Model to quantize
 
         Returns:
-            Path to model directory (MLX works with HuggingFace model IDs)
+            Path to model directory or GGUF file
         """
+        from ...models.provider import ProviderType
+
+        # For Ollama/GGUF models, return source_path (will be FP16 GGUF after orchestrator)
+        if model_info.provider in [ProviderType.OLLAMA, ProviderType.GGUF]:
+            if model_info.source_path:
+                return model_info.source_path
+            return None
+
         # MLX works with HuggingFace model IDs directly
         # Return None to indicate we use model_id string instead of local path
         return None
@@ -240,6 +248,19 @@ class MLXQuantizer(BaseQuantizer):
         """
         logger.info(f"Starting MLX quantization: {task.model_info.model_id}")
         logger.info(f"Target type: {task.quant_type.display_name}")
+        
+        # VALIDATION 0: Check availability and auto-install dependencies if needed
+        available, availability_msg = self.check_and_install_dependencies(
+            auto_install=True,
+            show_progress=True
+        )
+        if not available:
+            logger.error(f"MLX not available: {availability_msg}")
+            task.status = TaskStatus.FAILED
+            task.error = availability_msg
+            return False
+        
+        logger.info(f"✓ MLX available: {availability_msg}")
         
         # VALIDATION 1: Check quantization type is supported
         is_valid, error_msg = self._validate_quantization_type(task.quant_type)
@@ -358,50 +379,82 @@ class MLXQuantizer(BaseQuantizer):
             from ...models.model import ModelType
             is_vlm = task.model_info.model_type == ModelType.VLM
 
-            # PRODUCTION CHECK: Verify MLX compatibility for VLMs
-            # MLX-VLM has limited architecture support - check before attempting conversion
-            if is_vlm:
-                logger.info("Checking VLM compatibility with MLX...")
-                try:
-                    # Try to get the model's architecture type
-                    from transformers import AutoConfig
-                    config = AutoConfig.from_pretrained(
-                        task.model_info.model_id,
-                        trust_remote_code=True
+            # PRODUCTION CHECK: Verify MLX architecture compatibility BEFORE attempting conversion
+            # This prevents wasted time and provides clear feedback for unsupported models
+            logger.info(f"Checking {'VLM' if is_vlm else 'LLM'} architecture compatibility with MLX...")
+            
+            try:
+                # Get model's architecture type
+                from transformers import AutoConfig
+                config = AutoConfig.from_pretrained(
+                    task.model_info.model_id,
+                    trust_remote_code=True
+                )
+                arch_type = getattr(config, 'model_type', 'unknown')
+                logger.debug(f"Model architecture: {arch_type}")
+                
+                # Check if architecture is supported by querying MLX's supported models
+                is_supported, support_msg = self._check_mlx_architecture_support(arch_type, is_vlm)
+                
+                if not is_supported:
+                    logger.error(f"Architecture '{arch_type}' not supported by {'mlx-vlm' if is_vlm else 'mlx-lm'}")
+                    task.status = TaskStatus.FAILED
+                    
+                    # Get installed version
+                    installed_version = "unknown"
+                    try:
+                        if is_vlm:
+                            import mlx_vlm
+                            installed_version = getattr(mlx_vlm, "__version__", "unknown")
+                        else:
+                            import mlx_lm
+                            installed_version = getattr(mlx_lm, "__version__", "unknown")
+                    except Exception:
+                        pass
+                    
+                    task.error = (
+                        f"❌ Model architecture '{arch_type}' not supported by {'mlx-vlm' if is_vlm else 'mlx-lm'}\n\n"
+                        f"Model: {task.model_info.model_id}\n"
+                        f"Architecture: {arch_type}\n"
+                        f"Installed {'mlx-vlm' if is_vlm else 'mlx-lm'} version: {installed_version}\n\n"
+                        f"{support_msg}\n\n"
+                        f"🔧 Solutions:\n\n"
+                        f"1. **UPDATE MLX** (Recommended - newer versions support more models):\n"
+                        f"   pip install --upgrade mlx-vlm mlx-lm\n\n"
+                        f"2. **Use alternative quantization methods**:\n"
+                        f"   • Generic FP16 - Works with ALL models (LLMs & VLMs)\n"
+                        f"   • OpenVINO - Intel CPU optimized (INT4/INT8)\n"
+                        f"   • GGUF - For pure LLMs (llama.cpp format)\n\n"
+                        f"3. **Check model compatibility**:\n"
+                        f"   Visit: https://github.com/{'Blaizzy/mlx-vlm' if is_vlm else 'ml-explore/mlx-lm'}/releases\n\n"
+                        f"💡 This model will NOT work with MLX quantization. Please choose an alternative method."
                     )
-                    arch_type = getattr(config, 'model_type', 'unknown')
-                    
-                    # List of known-unsupported architectures in MLX-VLM
-                    # This will be updated as MLX-VLM adds support
-                    known_unsupported = []  # Currently empty - let MLX handle the check
-                    
-                    if arch_type in known_unsupported:
-                        logger.warning(f"Architecture '{arch_type}' has known issues with MLX-VLM")
-                        task.status = TaskStatus.FAILED
-                        task.error = (
-                            f"❌ Model architecture '{arch_type}' not yet supported by MLX-VLM\n\n"
-                            f"Model: {task.model_info.model_id}\n"
-                            f"Architecture: {arch_type}\n\n"
-                            f"🔧 Alternative quantization methods:\n"
-                            f"1. Generic FP16 - Works with ALL models (LLMs & VLMs)\n"
-                            f"2. OpenVINO - Intel CPU optimized (INT4/INT8)\n\n"
-                            f"💡 Check MLX-VLM releases for architecture support updates:\n"
-                            f"   https://github.com/Blaizzy/mlx-vlm/releases"
-                        )
-                        return False
-                    
-                    logger.debug(f"Model architecture: {arch_type}")
-                    
-                except Exception as e:
-                    logger.debug(f"Could not check architecture compatibility: {e}")
-                    # Continue anyway - MLX will report if unsupported
+                    return False
+                
+                logger.info(f"✓ Architecture '{arch_type}' supported by {'mlx-vlm' if is_vlm else 'mlx-lm'}")
+                
+            except Exception as e:
+                logger.warning(f"Could not pre-check architecture compatibility: {e}")
+                logger.info("Continuing with conversion - MLX will report if unsupported")
+                # Continue anyway - MLX will catch unsupported architectures during conversion
+
+            # Determine input source (GGUF file or HF model ID)
+            model_source = self.get_source_model_path(task.model_info)
+            if model_source and model_source.exists():
+                # Using GGUF file (from Ollama conversion)
+                input_arg = str(model_source)
+                logger.info(f"Converting from GGUF file: {model_source}")
+            else:
+                # Using HuggingFace model ID
+                input_arg = task.model_info.model_id
+                logger.info(f"Converting from HF model: {input_arg}")
 
             # Build convert command - use mlx-vlm for VLMs, mlx-lm for LLMs
             if is_vlm:
                 # Use mlx_vlm.convert for Vision-Language Models
                 cmd = [
                     "python", "-m", "mlx_vlm.convert",
-                    "--hf-path", task.model_info.model_id,
+                    "--hf-path", input_arg,
                     "--mlx-path", str(task.output_path),
                 ]
                 logger.info("Using mlx-vlm for VLM conversion")
@@ -409,7 +462,7 @@ class MLXQuantizer(BaseQuantizer):
                 # Use mlx_lm.convert for pure LLMs
                 cmd = [
                     "python", "-m", "mlx_lm.convert",
-                    "--hf-path", task.model_info.model_id,
+                    "--hf-path", input_arg,
                     "--mlx-path", str(task.output_path),
                 ]
                 logger.info("Using mlx-lm for LLM conversion")
@@ -602,6 +655,91 @@ class MLXQuantizer(BaseQuantizer):
             f"3. Check model compatibility at GitHub\n"
             f"4. Try a different quantization method"
         )
+
+    def _check_mlx_architecture_support(self, arch_type: str, is_vlm: bool) -> tuple[bool, str]:
+        """Check if architecture is supported by MLX dynamically.
+        
+        This method queries MLX's actual supported models list at runtime,
+        making it future-proof without hardcoding architecture names.
+        
+        Args:
+            arch_type: Model architecture type (e.g., 'llama', 'hf_olmo', 'qwen2_vl')
+            is_vlm: Whether this is a VLM (uses mlx-vlm) or LLM (uses mlx-lm)
+            
+        Returns:
+            (is_supported, message) tuple
+        """
+        try:
+            if is_vlm:
+                # Check mlx-vlm supported models
+                try:
+                    import mlx_vlm.utils
+                    # Try to get supported models from mlx-vlm
+                    # mlx-vlm uses a model registry that we can query
+                    if hasattr(mlx_vlm.utils, '_get_classes'):
+                        # Try to get the model classes for this architecture
+                        try:
+                            mlx_vlm.utils._get_classes(arch_type)
+                            # If no exception, architecture is supported
+                            return True, f"Architecture '{arch_type}' is supported by mlx-vlm"
+                        except (ModuleNotFoundError, ValueError) as e:
+                            # Architecture not supported
+                            error_msg = str(e)
+                            if "not supported" in error_msg.lower():
+                                return False, (
+                                    f"This VLM architecture is not yet supported by your mlx-vlm version.\n"
+                                    f"Supported VLM architectures may include: llava, paligemma, phi3_v, qwen2_vl, etc.\n"
+                                    f"Check the latest releases for updates."
+                                )
+                except ImportError:
+                    pass
+                
+                # Fallback: Known common VLM architectures
+                # This is a soft check - we still let MLX try if unknown
+                common_vlm_archs = {'llava', 'paligemma', 'phi3_v', 'qwen2_vl', 'idefics', 'idefics2'}
+                if arch_type in common_vlm_archs:
+                    return True, f"Architecture '{arch_type}' is a known VLM architecture"
+                
+                # Unknown but let MLX try - it might be newly supported
+                logger.debug(f"Architecture '{arch_type}' not in known list, will attempt conversion")
+                return True, "Architecture support unknown, will attempt conversion"
+                
+            else:
+                # Check mlx-lm supported models
+                try:
+                    import mlx_lm.utils
+                    # Try to get supported models from mlx-lm
+                    if hasattr(mlx_lm.utils, '_get_classes'):
+                        try:
+                            mlx_lm.utils._get_classes(arch_type)
+                            return True, f"Architecture '{arch_type}' is supported by mlx-lm"
+                        except (ModuleNotFoundError, ValueError) as e:
+                            error_msg = str(e)
+                            if "not supported" in error_msg.lower():
+                                return False, (
+                                    f"This LLM architecture is not yet supported by your mlx-lm version.\n"
+                                    f"Supported LLM architectures may include: llama, mistral, phi, qwen2, gemma, etc.\n"
+                                    f"Check the latest releases for updates."
+                                )
+                except ImportError:
+                    pass
+                
+                # Fallback: Known common LLM architectures
+                common_llm_archs = {
+                    'llama', 'mistral', 'mixtral', 'phi', 'phi3', 'qwen2', 'gemma', 'gemma2',
+                    'stablelm', 'cohere', 'gpt2', 'gpt_neox', 'openelm', 'starcoder2'
+                }
+                if arch_type in common_llm_archs:
+                    return True, f"Architecture '{arch_type}' is a known LLM architecture"
+                
+                # Unknown architecture - let MLX try
+                logger.debug(f"Architecture '{arch_type}' not in known list, will attempt conversion")
+                return True, "Architecture support unknown, will attempt conversion"
+                
+        except Exception as e:
+            logger.debug(f"Error checking architecture support: {e}")
+            # On error, allow the attempt - MLX will report if unsupported
+            return True, "Could not verify architecture support, will attempt conversion"
 
     def get_recommendations(self, model_info: ModelInfo) -> Optional[str]:
         """Get quantization recommendations for this model.

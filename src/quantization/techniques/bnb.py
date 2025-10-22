@@ -138,13 +138,18 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting BitsAndBytes {task.quant_type.display_name} quantization")
 
-            # Check if bitsandbytes is available
-            available, message = self.check_availability()
+            # Check if bitsandbytes is available and auto-install if needed
+            available, message = self.check_and_install_dependencies(
+                auto_install=True,
+                show_progress=True
+            )
             if not available:
                 task.status = TaskStatus.FAILED
                 task.error = message
                 logger.error(f"BitsAndBytes not available: {message}")
                 return False
+            
+            logger.info(f"✓ BitsAndBytes available: {message}")
 
             # Update progress: Validating
             if progress_callback:

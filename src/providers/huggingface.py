@@ -12,6 +12,7 @@ from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
+from ..utils.architecture_registry import get_architecture_registry
 from ..utils.history_formatter import format_conversation_history, format_qa_history
 from .base import BaseProvider
 
@@ -36,9 +37,183 @@ class HuggingFaceProvider(BaseProvider):
         self.metadata_cache = ModelMetadataCache()
         logger.debug("Initialized model metadata cache")
 
+        # Initialize architecture registry for automatic dependency management
+        self.arch_registry = get_architecture_registry()
+        logger.debug(f"Initialized architecture registry with {len(self.arch_registry.architectures)} architectures")
+
+        # Initialize HuggingFace authentication
+        self.hf_token = self._setup_authentication()
+
         # Determine best available device
         self.device = self._get_best_device()
         logger.info(f"HuggingFace provider initialized on device: {self.device}")
+
+    def _prompt_and_save_token(self) -> bool:
+        """Interactively prompt user for HF token and save to config.yaml.
+
+        Returns:
+            True if token was successfully saved, False otherwise
+        """
+        try:
+            from ..cli.tui_manager import tui
+
+            # Show token prompt panel
+            tui.show_panel(
+                "[bold cyan]HuggingFace Authentication Required[/bold cyan]\n\n"
+                "This model requires HuggingFace authentication.\n\n"
+                "[bold]To get your token:[/bold]\n"
+                "  1. Visit: https://huggingface.co/settings/tokens\n"
+                "  2. Create a new token (read access is enough)\n"
+                "  3. Copy the token\n\n"
+                "[dim]Your token will be saved securely to config.yaml[/dim]",
+                title="Get HuggingFace Token",
+                border_style="cyan"
+            )
+
+            # Prompt for token
+            token = tui.prompt(
+                "Paste your HuggingFace token here (or press Enter to skip):",
+                style="cyan"
+            ).strip()
+
+            if not token:
+                logger.info("User skipped token input")
+                return False
+
+            # Validate token format (basic check)
+            if not token.startswith("hf_"):
+                tui.show_panel(
+                    "[yellow]⚠️  Invalid token format[/yellow]\n\n"
+                    "HF tokens should start with 'hf_'\n"
+                    "Please check and try again.",
+                    title="Invalid Token",
+                    border_style="yellow"
+                )
+                logger.warning("Invalid token format provided by user")
+                return False
+
+            # Save token to config.yaml
+            if self._save_token_to_config(token):
+                # Update current instance token
+                self.hf_token = token
+
+                tui.show_panel(
+                    "[bold green]✓ Token Saved Successfully![/bold green]\n\n"
+                    "Your token has been saved to config.yaml\n"
+                    "Restart the application to use the new token.",
+                    title="Success",
+                    border_style="green"
+                )
+                logger.info("HF token successfully saved to config.yaml")
+                return True
+            else:
+                tui.show_panel(
+                    "[red]✗ Failed to save token[/red]\n\n"
+                    "Could not write to config.yaml\n"
+                    "Please check file permissions.",
+                    title="Error",
+                    border_style="red"
+                )
+                return False
+
+        except ImportError:
+            # Fallback to simple input if TUI not available
+            print("\nHuggingFace token required.")
+            print("Get it from: https://huggingface.co/settings/tokens")
+            token = input("Paste your token (starts with 'hf_'): ").strip()
+
+            if token and token.startswith("hf_"):
+                if self._save_token_to_config(token):
+                    self.hf_token = token
+                    print("✓ Token saved to config.yaml")
+                    return True
+                else:
+                    print("✗ Failed to save token to config.yaml")
+                    return False
+            return False
+
+    def _save_token_to_config(self, token: str) -> bool:
+        """Save token to config.yaml file.
+
+        Args:
+            token: HuggingFace token to save
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            import yaml
+
+            # Read current config
+            config_path = Path("config.yaml")
+            if config_path.exists():
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+            else:
+                config = {"providers": {}}
+
+            # Ensure structure exists
+            if "providers" not in config:
+                config["providers"] = {}
+            if "huggingface" not in config["providers"]:
+                config["providers"]["huggingface"] = {}
+
+            # Save token
+            config["providers"]["huggingface"]["hf_token"] = token
+
+            # Write back to config
+            with open(config_path, 'w') as f:
+                yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+
+            logger.info(f"Token saved to {config_path}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to save token to config: {e}")
+            return False
+
+    def _setup_authentication(self) -> Optional[str]:
+        """Setup HuggingFace authentication from config or environment.
+
+        Checks in order:
+        1. Config file (hf_token field)
+        2. Environment variable (HF_TOKEN or HUGGING_FACE_HUB_TOKEN)
+        3. Local ~/.huggingface/token file
+        4. None if not found
+
+        Returns:
+            HuggingFace token string or None
+        """
+        # Try to get token from config
+        hf_token = None
+        try:
+            if hasattr(self.config, 'hf_token') and self.config.hf_token:
+                hf_token = self.config.hf_token
+                logger.debug("Using HF token from config")
+                return hf_token
+        except (AttributeError, KeyError):
+            pass
+
+        # Try environment variables
+        hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if hf_token:
+            logger.debug("Using HF token from environment variable")
+            return hf_token
+
+        # Try local token file
+        token_file = Path.home() / ".huggingface" / "token"
+        if token_file.exists():
+            try:
+                with open(token_file, 'r') as f:
+                    hf_token = f.read().strip()
+                    if hf_token:
+                        logger.debug("Using HF token from ~/.huggingface/token")
+                        return hf_token
+            except Exception as e:
+                logger.debug(f"Could not read token file: {e}")
+
+        logger.debug("No HuggingFace token found (will use public access)")
+        return None
 
     def _get_best_device(self) -> str:
         """Determine best available device from preferences.
@@ -290,7 +465,7 @@ class HuggingFaceProvider(BaseProvider):
         return (ModelType.LLM, [EndpointType.TEXT])
 
     def load_model(self, model_id: str, device: str) -> Any:
-        """Load HuggingFace model with transformers.
+        """Load HuggingFace model with transformers and automatic dependency management.
 
         Args:
             model_id: Model identifier (e.g., "llava-hf/llava-1.5-7b-hf")
@@ -298,15 +473,205 @@ class HuggingFaceProvider(BaseProvider):
 
         Returns:
             Tuple of (model, processor/tokenizer)
+
+        Raises:
+            RuntimeError: If model cannot be loaded after all attempts
         """
         logger.info(f"Loading HuggingFace model: {model_id}")
-        
+
+        # Retry loop for iterative dependency installation
+        max_retries = 5  # Prevent infinite loops
+        all_installed_deps = []
+        all_failed_deps = {}
+        all_errors = []
+
+        for attempt in range(max_retries):
+            try:
+                return self._load_model_internal(model_id)
+            except Exception as e:
+                error_msg = str(e)
+                all_errors.append(f"Attempt {attempt + 1}: {error_msg}")
+
+                if attempt == 0:
+                    logger.error(f"Failed to load HuggingFace model {model_id}: {error_msg}")
+                else:
+                    logger.error(f"Retry attempt {attempt} failed: {error_msg}")
+
+                # Log full error traceback for debugging
+                import traceback
+                full_traceback = traceback.format_exc()
+                logger.debug(f"Full error traceback:\n{full_traceback}")
+
+                # Try to handle missing dependencies automatically
+                should_retry, installed_deps, failure_info = self.arch_registry.handle_model_load_error(
+                    model_id=model_id,
+                    error_message=error_msg,
+                    auto_install=True
+                )
+
+                # Track all failed/skipped dependencies
+                all_failed_deps.update(failure_info)
+
+                if should_retry:
+                    if installed_deps:
+                        all_installed_deps.extend(installed_deps)
+                        logger.info(
+                            f"Installed dependencies: {installed_deps}. "
+                            f"Retrying model load (attempt {attempt + 2}/{max_retries})..."
+                        )
+                    # Continue to next iteration to retry
+                    continue
+                else:
+                    # No new dependencies to install - this is a real failure
+                    self._show_model_incompatibility_error(
+                        model_id=model_id,
+                        all_errors=all_errors,
+                        all_installed_deps=all_installed_deps,
+                        all_failed_deps=all_failed_deps
+                    )
+                    raise RuntimeError(f"Failed to load model {model_id}: {e}")
+
+        # Max retries exceeded
+        logger.error(f"Max retries ({max_retries}) exceeded for model {model_id}")
+        self._show_model_incompatibility_error(
+            model_id=model_id,
+            all_errors=all_errors,
+            all_installed_deps=all_installed_deps,
+            all_failed_deps=all_failed_deps
+        )
+        raise RuntimeError(
+            f"Failed to load model {model_id} after {max_retries} attempts. "
+            f"See logs for details."
+        )
+
+    def _show_model_incompatibility_error(
+        self,
+        model_id: str,
+        all_errors: list[str],
+        all_installed_deps: list[str],
+        all_failed_deps: dict[str, str]
+    ) -> None:
+        """Show detailed error message when model cannot be loaded.
+
+        Args:
+            model_id: Model identifier
+            all_errors: List of all error messages from attempts
+            all_installed_deps: List of successfully installed dependencies
+            all_failed_deps: Dict of failed/skipped dependencies with reasons
+        """
+        # Log comprehensive error information
+        logger.error("=" * 80)
+        logger.error(f"MODEL INCOMPATIBILITY REPORT: {model_id}")
+        logger.error("=" * 80)
+
+        # Check if this is an authentication issue
+        has_auth_error = any(
+            "gated" in error.lower() or "unauthorized" in error.lower() or
+            "authentication" in error.lower() or "token" in error.lower() or
+            "access denied" in error.lower() or "permission denied" in error.lower()
+            for error in all_errors
+        )
+
+        # Check if it's a connection/download issue (might also need token)
+        has_connection_error = any(
+            "connection" in error.lower() or "cannot find" in error.lower() or
+            "locate the file" in error.lower() or "network" in error.lower() or
+            "timeout" in error.lower() or "unable to download" in error.lower()
+            for error in all_errors
+        )
+
+        if has_auth_error or (has_connection_error and not self.hf_token):
+            # Could be auth issue or connection that needs token
+            logger.error("\n⚠️  POSSIBLE AUTHENTICATION ISSUE")
+            logger.error("The model may require HuggingFace authentication.")
+            logger.error(f"Current HF token: {'Set (from config/env)' if self.hf_token else 'NOT SET'}")
+
+            # Try to get token from user interactively
+            self._prompt_and_save_token()
+
+        if all_installed_deps:
+            logger.error(f"\nSuccessfully installed dependencies ({len(all_installed_deps)}):")
+            for dep in all_installed_deps:
+                logger.error(f"  ✓ {dep}")
+
+        if all_failed_deps:
+            logger.error(f"\nFailed/skipped dependencies ({len(all_failed_deps)}):")
+            for dep, reason in all_failed_deps.items():
+                logger.error(f"  ✗ {dep}: {reason}")
+
+        logger.error(f"\nAll error messages ({len(all_errors)} attempts):")
+        for i, error in enumerate(all_errors, 1):
+            logger.error(f"  {i}. {error}")
+
+        logger.error("=" * 80)
+
+        # Show user-friendly TUI message
+        try:
+            from ..cli.tui_manager import tui
+
+            error_panel = "[bold red]Model Loading Failed[/bold red]\n\n"
+            error_panel += f"[bold]Model:[/bold] {model_id}\n\n"
+
+            # Check if it's an authentication issue or connection issue
+            if has_auth_error or (has_connection_error and not self.hf_token):
+                # Auth/connection error already handled by _prompt_and_save_token()
+                error_panel += "[bold yellow]Authentication or Connection Issue[/bold yellow]\n\n"
+                error_panel += "A HuggingFace token may be needed.\n"
+                error_panel += "Check the panel above to add your token.\n\n"
+            else:
+                error_panel += "[bold]This model is not compatible with your current system.[/bold]\n\n"
+                error_panel += "Possible reasons:\n"
+                if all_failed_deps:
+                    error_panel += "[yellow]Failed dependencies:[/yellow]\n"
+                    for dep, reason in all_failed_deps.items():
+                        error_panel += f"  • [cyan]{dep}[/cyan]: {reason}\n"
+                    error_panel += "\n"
+                else:
+                    error_panel += "  • Model requires CUDA (NVIDIA GPU) but you're on CPU/MPS\n"
+                    error_panel += "  • Platform-specific dependencies unavailable\n"
+                    error_panel += "  • Architecture not supported on this OS\n\n"
+
+            if all_installed_deps:
+                error_panel += f"[green]Successfully installed:[/green] {', '.join(all_installed_deps)}\n"
+
+            error_panel += f"\n[dim]Full error details logged to: logs/vlm_cli_*.log[/dim]"
+
+            tui.show_panel(error_panel, title="Model Loading Failed", border_style="red")
+            tui.prompt("\nPress Enter to return to model selection...", style="dim")
+
+        except ImportError:
+            # Fallback if TUI not available
+            print("\n" + "=" * 80)
+            print(f"ERROR: Model {model_id} is not compatible with this system")
+            print("=" * 80)
+            if all_failed_deps:
+                print("\nFailed dependencies:")
+                for dep, reason in all_failed_deps.items():
+                    print(f"  • {dep}: {reason}")
+            print("\nCheck logs for full error details.")
+            print("=" * 80 + "\n")
+
+    def _load_model_internal(self, model_id: str) -> Any:
+        """Internal method to load model (called by load_model and retry logic).
+
+        Args:
+            model_id: Model identifier
+
+        Returns:
+            Tuple of (model, processor/tokenizer)
+        """
         # Suppress transformers output during loading (keeps TUI clean)
         from ..utils.output_suppressor import suppress_transformers_output
 
         try:
             # Import base classes (always available)
             from transformers import AutoModel, AutoTokenizer
+
+            # Setup token for private model access
+            token_kwarg = {}
+            if self.hf_token:
+                token_kwarg = {"token": self.hf_token}
+                logger.debug("Using HF token for model access")
 
             # Determine if this is a VLM using metadata cache
             # This checks the actual model config, not just keywords
@@ -339,7 +704,8 @@ class HuggingFaceProvider(BaseProvider):
                         processor = AutoProcessor.from_pretrained(
                             model_id,
                             cache_dir=str(self.cache_dir),
-                            trust_remote_code=True
+                            trust_remote_code=True,
+                            **token_kwarg
                         )
 
                         # Prepare loading kwargs with proper dtype parameter
@@ -348,6 +714,7 @@ class HuggingFaceProvider(BaseProvider):
                             "trust_remote_code": True,
                             "torch_dtype": torch.float16 if self.device == "cuda" else torch.float32,
                             "low_cpu_mem_usage": True,  # Stream weights during loading
+                            **token_kwarg,  # Add token for private model access
                         }
 
                         # 2025 OPTIMIZATION: Flash Attention 2/3 support for faster inference
@@ -439,17 +806,76 @@ class HuggingFaceProvider(BaseProvider):
 
             # Load as LLM (suppress output)
             with suppress_transformers_output():
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_id,
-                    cache_dir=str(self.cache_dir),
-                    trust_remote_code=True
-                )
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        model_id,
+                        cache_dir=str(self.cache_dir),
+                        trust_remote_code=True,
+                        **token_kwarg
+                    )
+                except (ValueError, OSError) as e:
+                    # Some models (audio, speech, etc.) may not have a tokenizer
+                    # Try to find the base language model's tokenizer from config
+                    error_str = str(e)
+                    if "Unrecognized configuration class" in error_str or "does not appear to have" in error_str:
+                        logger.warning(f"Model doesn't have a standard tokenizer: {e}")
+                        logger.info("Attempting to find base language model tokenizer from config...")
+
+                        # Try to read config and find the language model component
+                        try:
+                            from transformers import AutoConfig
+                            import json
+
+                            config = AutoConfig.from_pretrained(
+                                model_id,
+                                cache_dir=str(self.cache_dir),
+                                trust_remote_code=True,
+                                **token_kwarg
+                            )
+
+                            # Look for language_model or llm attribute in config
+                            base_model = None
+                            if hasattr(config, 'language_model'):
+                                base_model = config.language_model
+                            elif hasattr(config, 'text_config'):
+                                if hasattr(config.text_config, 'model_type'):
+                                    base_model = config.text_config.model_type
+                            elif hasattr(config, 'llm_config'):
+                                if hasattr(config.llm_config, 'model_type'):
+                                    base_model = config.llm_config.model_type
+
+                            if base_model:
+                                logger.info(f"Found base model type: {base_model}")
+                                # Try loading tokenizer for base model type
+                                tokenizer = AutoTokenizer.from_pretrained(
+                                    base_model if '/' in str(base_model) else f"google/{base_model}",
+                                    cache_dir=str(self.cache_dir),
+                                    trust_remote_code=True
+                                )
+                                logger.info(f"✓ Loaded tokenizer from base model: {base_model}")
+                            else:
+                                # No base model found - this model is not compatible
+                                raise ValueError(
+                                    f"Model {model_id} doesn't have a compatible tokenizer and "
+                                    f"no base language model could be found in config. "
+                                    f"This may be an audio-only or vision-only model."
+                                )
+                        except Exception as fallback_error:
+                            logger.error(f"Fallback tokenizer loading failed: {fallback_error}")
+                            raise ValueError(
+                                f"Could not load tokenizer for {model_id}. "
+                                f"Original error: {e}\n"
+                                f"Fallback error: {fallback_error}"
+                            )
+                    else:
+                        raise
 
                 # Prepare loading kwargs with proper dtype parameter
                 load_kwargs = {
                     "cache_dir": str(self.cache_dir),
                     "trust_remote_code": True,
                     "low_cpu_mem_usage": True,  # Stream weights during loading
+                    **token_kwarg,  # Add token for private model access
                 }
 
                 # Use 'dtype' instead of deprecated 'torch_dtype'
@@ -502,8 +928,8 @@ class HuggingFaceProvider(BaseProvider):
             return (model, tokenizer)
 
         except Exception as e:
-            logger.error(f"Failed to load HuggingFace model {model_id}: {e}")
-            raise RuntimeError(f"Failed to load model {model_id}: {e}")
+            # Let the parent load_model method handle errors and retries
+            raise
 
     def unload_model(self, handle: Any) -> None:
         """Unload model and free GPU memory universally across all platforms.
@@ -632,22 +1058,55 @@ class HuggingFaceProvider(BaseProvider):
             # Strategy 2: Standard text + images format (fallback)
             if inputs is None:
                 try:
+                    # Try with images as list first (some processors require this)
                     inputs = processor(
                         text=full_question,
-                        images=image,
+                        images=[image] if not isinstance(image, list) else image,
                         return_tensors="pt"
                     )
                     logger.debug("✓ Using standard text + images format")
                 except Exception as e:
-                    logger.error(f"Both input formats failed: {e}")
-                    raise RuntimeError(
-                        f"Failed to prepare inputs for VLM inference.\n"
-                        f"Processor: {type(processor).__name__}\n"
-                        f"Error: {e}"
-                    )
+                    logger.error(f"Standard format with list failed: {e}, trying without list")
+                    try:
+                        # Try without wrapping in list
+                        inputs = processor(
+                            text=full_question,
+                            images=image,
+                            return_tensors="pt"
+                        )
+                        logger.debug("✓ Using standard text + images format (no list)")
+                    except Exception as e2:
+                        logger.error(f"Both input formats failed: Strategy1={e}, Strategy2={e2}")
+                        raise RuntimeError(
+                            f"Failed to prepare inputs for VLM inference.\n"
+                            f"Processor: {type(processor).__name__}\n"
+                            f"Error: {e2}"
+                        )
             
             # Move inputs to model device (handle each tensor individually for MPS compatibility)
             inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+
+            # Debug: Log what inputs were prepared
+            logger.debug(f"Prepared inputs keys: {list(inputs.keys())}")
+            for key, value in inputs.items():
+                if hasattr(value, 'shape'):
+                    logger.debug(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+                else:
+                    logger.debug(f"  {key}: {type(value)}")
+
+            # Validate that images are included (pixel_values, image_embeds, etc.)
+            has_image_data = any(
+                key in inputs for key in ['pixel_values', 'image_embeds', 'pixel_values_videos', 'images']
+            )
+            if not has_image_data:
+                logger.error("Processor did not include image data in inputs!")
+                logger.error(f"Processor type: {type(processor).__name__}")
+                logger.error(f"Image type: {type(image)}, Image value: {image if isinstance(image, (str, type(None))) else f'<{type(image).__name__}>'}")
+                raise RuntimeError(
+                    "Processor failed to include image data in inputs. "
+                    f"Got keys: {list(inputs.keys())}, expected pixel_values or similar. "
+                    "This model may require a specific processor version or image format."
+                )
 
             # Warn if on CPU (very slow)
             if str(model_device) == 'cpu':
@@ -665,10 +1124,24 @@ class HuggingFaceProvider(BaseProvider):
                 "do_sample": False,  # Greedy decoding for consistency
             }
 
-            with torch.no_grad():
-                output = model.generate(**inputs, **generation_config)
-            
-            logger.info("✓ Response generated")
+            try:
+                with torch.no_grad():
+                    output = model.generate(**inputs, **generation_config)
+
+                logger.info("✓ Response generated")
+            except AssertionError as ae:
+                # InternVL and similar VLMs may require images even for QA
+                # Try to provide helpful error message
+                error_msg = str(ae)
+                if "img_context_token_id" in error_msg or not error_msg:
+                    logger.error("Model requires image context tokens but none were provided")
+                    raise RuntimeError(
+                        "This VLM model requires images to be properly formatted. "
+                        "This may indicate the model needs special image preprocessing that isn't being applied. "
+                        "Try using a different VLM or ensure images are being passed correctly."
+                    )
+                else:
+                    raise
 
             # Decode response
             response = processor.batch_decode(output, skip_special_tokens=True)[0]
@@ -683,7 +1156,7 @@ class HuggingFaceProvider(BaseProvider):
             return response.strip()
 
         except Exception as e:
-            logger.error(f"QA inference failed: {e}")
+            logger.error(f"QA inference failed: {e}", exc_info=True)
             raise NotImplementedError(f"QA not supported for this model: {e}")
 
     def run_caption(
@@ -847,15 +1320,87 @@ class HuggingFaceProvider(BaseProvider):
             # Tokenize input and move to the SAME device as the model
             # This works universally: CUDA (NVIDIA), MPS (Apple), CPU (all), ROCm (AMD), etc.
             inputs = tokenizer(formatted_prompt, return_tensors="pt", padding=True).to(model_device)
+            
+            # Debug: Log what tokenizer produced
+            logger.debug(f"Tokenizer outputs: {list(inputs.keys())}")
+            logger.debug(f"input_ids shape: {inputs.get('input_ids').shape if inputs.get('input_ids') is not None else 'None'}")
+            logger.debug(f"attention_mask shape: {inputs.get('attention_mask').shape if inputs.get('attention_mask') is not None else 'None'}")
+
+            # GENERIC FIX: Filter inputs to only include parameters the model's forward() accepts
+            # The generate() method passes **inputs to forward() as model_kwargs
+            # Some models (e.g., OLMo) don't accept token_type_ids
+            import inspect
+            try:
+                # CRITICAL: Check model.forward() signature, not generate()
+                # generate() passes inputs to forward(), so we need forward's signature
+                if hasattr(model, 'forward'):
+                    sig = inspect.signature(model.forward)
+                    
+                    # Get accepted parameter names
+                    accepted_params = set(sig.parameters.keys())
+                    
+                    # Check if forward accepts **kwargs (VAR_KEYWORD)
+                    has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD 
+                                   for p in sig.parameters.values())
+                    
+                    # ALWAYS keep input_ids and attention_mask (essential for generation)
+                    # Filter out parameters not present in the forward signature
+                    logger.debug(f"Model forward() signature: {accepted_params}")
+                    filtered_inputs = {}
+
+                    essential_params = {'input_ids', 'attention_mask'}
+                    allowed_params = set(accepted_params) | essential_params
+
+                    for key, value in inputs.items():
+                        if key in allowed_params:
+                            filtered_inputs[key] = value
+                        else:
+                            logger.debug(f"Filtering out unsupported parameter: {key}")
+
+                    if not filtered_inputs:
+                        # Safety: never leave inputs empty
+                        filtered_inputs = {'input_ids': inputs['input_ids']}
+
+                    inputs = filtered_inputs
+                    logger.debug(f"Filtered inputs to: {list(inputs.keys())}")
+                else:
+                    # Fallback: model has no forward method (unlikely)
+                    logger.warning("Model has no forward method, using minimal inputs")
+                    inputs = {'input_ids': inputs['input_ids']}
+                    
+            except Exception as e:
+                logger.debug(f"Could not filter inputs, using fallback: {e}")
+                # Fallback: try with only essential parameters
+                try:
+                    essential_params = {'input_ids', 'attention_mask'}
+                    filtered_inputs = {k: v for k, v in inputs.items() if k in essential_params}
+                    if filtered_inputs:
+                        inputs = filtered_inputs
+                        logger.debug("Fallback: using only input_ids and attention_mask")
+                except:
+                    # Last resort: keep all inputs (backward compatible)
+                    logger.debug("Fallback failed, passing all inputs")
+                    pass
 
             # Build generation parameters with defaults
+            # CRITICAL: Check if model supports use_cache properly
+            # Some models (e.g., OLMo) don't handle None past_key_values correctly
+            model_name_or_path = getattr(model.config, "_name_or_path", "").lower()
+            model_class_name = model.__class__.__name__.lower()
+            
+            # Disable use_cache for models that don't handle it properly
+            supports_use_cache = True
+            if "olmo" in model_name_or_path or "olmo" in model_class_name:
+                supports_use_cache = False
+                logger.debug("Disabled use_cache for OLMo model (doesn't handle None past_key_values)")
+            
             gen_params = {
                 "max_new_tokens": 1024,  # Increased for more detailed responses
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "top_k": 50,
                 "do_sample": True,
-                "use_cache": True,  # 2025 OPTIMIZATION: Enable KV cache for faster generation
+                "use_cache": supports_use_cache,  # Disabled for models that don't support it
                 "pad_token_id": tokenizer.pad_token_id,
                 "eos_token_id": tokenizer.eos_token_id,
             }
@@ -885,9 +1430,23 @@ class HuggingFaceProvider(BaseProvider):
 
                 logger.debug(f"Using custom parameters: {custom_parameters}")
 
+            # Debug: Log final inputs going to generate
+            logger.debug(f"Final inputs to model.generate(): {list(inputs.keys())}")
+            for key in inputs.keys():
+                tensor = inputs[key]
+                logger.debug(f"  {key}: shape={tensor.shape if tensor is not None else 'None'}, "
+                           f"dtype={tensor.dtype if tensor is not None else 'None'}")
+
             # Generate with parameters
             with torch.no_grad():
-                output = model.generate(**inputs, **gen_params)
+                try:
+                    output = model.generate(**inputs, **gen_params)
+                except Exception as gen_error:
+                    logger.error(f"model.generate() failed with inputs: {list(inputs.keys())}")
+                    logger.error(f"Generation params: {list(gen_params.keys())}")
+                    import traceback
+                    logger.error(f"Full traceback:\n{traceback.format_exc()}")
+                    raise
 
             # Decode only the new tokens (exclude input prompt)
             input_length = inputs["input_ids"].shape[1]
@@ -990,10 +1549,16 @@ class HuggingFaceProvider(BaseProvider):
         try:
             from huggingface_hub import list_repo_files, hf_hub_download
 
+            # Setup token kwargs for authenticated access
+            token_kwarg = {}
+            if self.hf_token:
+                token_kwarg = {"token": self.hf_token}
+                logger.debug("Using HF token for model download")
+
             # STEP 1: Check if this is a GGUF repository
             # GGUF repos contain .gguf files and should be downloaded directly
             try:
-                repo_files = list_repo_files(model_name)
+                repo_files = list_repo_files(model_name, **token_kwarg)
                 gguf_files = [f for f in repo_files if f.endswith('.gguf')]
 
                 if gguf_files:
@@ -1070,7 +1635,8 @@ class HuggingFaceProvider(BaseProvider):
                         repo_id=model_name,
                         filename=best_file,
                         local_dir=str(download_dir),
-                        local_dir_use_symlinks=False  # Direct copy for GGUF compatibility
+                        local_dir_use_symlinks=False,  # Direct copy for GGUF compatibility
+                        **token_kwarg
                     )
                     logger.info(f"Downloaded {best_file} successfully")
                     logger.info(f"Location: {downloaded_path}")
@@ -1108,7 +1674,8 @@ class HuggingFaceProvider(BaseProvider):
                     AutoProcessor.from_pretrained(
                         model_name,
                         cache_dir=str(self.cache_dir),
-                        trust_remote_code=True
+                        trust_remote_code=True,
+                        **token_kwarg
                     )
                     logger.info("Downloaded VLM processor")
                 except Exception as e:
@@ -1120,7 +1687,8 @@ class HuggingFaceProvider(BaseProvider):
                 AutoTokenizer.from_pretrained(
                     model_name,
                     cache_dir=str(self.cache_dir),
-                    trust_remote_code=True
+                    trust_remote_code=True,
+                    **token_kwarg
                 )
                 logger.info("Downloaded tokenizer")
             except Exception as e:
@@ -1139,7 +1707,8 @@ class HuggingFaceProvider(BaseProvider):
                 repo_id=model_name,
                 cache_dir=str(self.cache_dir),
                 allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.py"],
-                ignore_patterns=["*.gguf", "*.md", "*.git*"]
+                ignore_patterns=["*.gguf", "*.md", "*.git*"],
+                **token_kwarg
             )
 
             logger.info(f"Successfully downloaded {model_name}")
@@ -1153,14 +1722,83 @@ class HuggingFaceProvider(BaseProvider):
             return True
 
         except Exception as e:
-            logger.error(f"Failed to download {model_name}: {e}")
+            error_str = str(e)
+            logger.error(f"Failed to download {model_name}: {error_str}")
+            
+            # Check if this is an authentication/access error
+            is_auth_error = any([
+                "gated" in error_str.lower(),
+                "unauthorized" in error_str.lower(),
+                "authentication" in error_str.lower(),
+                "token" in error_str.lower(),
+                "access denied" in error_str.lower(),
+                "permission denied" in error_str.lower(),
+                "403" in error_str,
+                "401" in error_str
+            ])
+            
+            # Check if it's a connection error that might need auth
+            is_connection_error = any([
+                "connection" in error_str.lower(),
+                "cannot find" in error_str.lower(),
+                "locate the file" in error_str.lower(),
+                "network" in error_str.lower(),
+                "timeout" in error_str.lower(),
+                "unable to download" in error_str.lower()
+            ])
+            
+            # If auth error OR connection error without token, prompt for token
+            if is_auth_error or (is_connection_error and not self.hf_token):
+                logger.error("\n⚠️  AUTHENTICATION REQUIRED")
+                logger.error(f"Model {model_name} may require HuggingFace authentication.")
+                logger.error(f"Current HF token: {'Set' if self.hf_token else 'NOT SET'}")
+                
+                # Try to get token from user interactively
+                token_saved = self._prompt_and_save_token()
+                
+                # Show error panel with guidance
+                try:
+                    from ..cli.tui_manager import tui
+                    
+                    error_panel = "[bold red]Model Download Failed[/bold red]\n\n"
+                    error_panel += f"[bold]Model:[/bold] {model_name}\n\n"
+                    
+                    if token_saved:
+                        error_panel += "[bold green]✓ Token Saved![/bold green]\n\n"
+                        error_panel += "[yellow]Please restart the application to use the new token.[/yellow]\n\n"
+                        error_panel += "Steps:\n"
+                        error_panel += "  1. Exit this application (Ctrl+C)\n"
+                        error_panel += "  2. Run ./run.sh again\n"
+                        error_panel += "  3. Try installing the model again\n"
+                    else:
+                        error_panel += "[bold yellow]Authentication Issue[/bold yellow]\n\n"
+                        error_panel += "This model requires HuggingFace authentication.\n\n"
+                        error_panel += "[bold]To fix this:[/bold]\n"
+                        error_panel += "  1. Get a token from: https://huggingface.co/settings/tokens\n"
+                        error_panel += "  2. Restart the app and try again\n"
+                        error_panel += "  3. You'll be prompted to enter your token\n"
+                    
+                    error_panel += f"\n[dim]Error: {error_str[:200]}...[/dim]"
+                    
+                    tui.show_panel(error_panel, title="Authentication Required", border_style="yellow")
+                    tui.prompt("\nPress Enter to continue...", style="dim")
+                    
+                except ImportError:
+                    print("\n" + "="*80)
+                    print(f"ERROR: {model_name} requires authentication")
+                    if token_saved:
+                        print("Token saved! Please restart the application.")
+                    else:
+                        print("Get token from: https://huggingface.co/settings/tokens")
+                    print("="*80 + "\n")
+            
             return False
 
     def delete_model(self, model_id: str) -> bool:
-        """Delete cached model from disk.
+        """Delete model from disk (dynamically detects local vs cached models).
 
         Args:
-            model_id: Model identifier
+            model_id: Model identifier (can be HF repo name like "org/model" or full path)
 
         Returns:
             True if successful
@@ -1168,18 +1806,68 @@ class HuggingFaceProvider(BaseProvider):
         logger.info(f"Deleting HuggingFace model: {model_id}")
 
         try:
-            # Convert model_id to directory name (org/name -> models--org--name)
-            dir_name = "models--" + model_id.replace("/", "--")
-            model_dir = self.cache_dir / dir_name
+            from pathlib import Path
+            import shutil
+            import subprocess
+            import platform
 
-            if model_dir.exists():
-                import shutil
-                shutil.rmtree(model_dir)
-                logger.info(f"Deleted {model_id}")
-                return True
+            # Check if model_id is a path (local model) or a HF repo name (cached model)
+            model_path = Path(model_id)
+
+            if model_path.exists() and model_path.is_dir():
+                # Local model - model_id is the full path
+                # Use rm -rf on macOS/Linux for better handling of AppleDouble files
+                if platform.system() in ["Darwin", "Linux"]:
+                    try:
+                        subprocess.run(
+                            ["rm", "-rf", str(model_path)],
+                            check=True,
+                            capture_output=True,
+                            text=True
+                        )
+                        logger.info(f"Deleted local model directory (rm -rf): {model_path}")
+                        return True
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"rm -rf failed: {e.stderr}")
+                        # Fall back to shutil
+                        shutil.rmtree(model_path)
+                        logger.info(f"Deleted local model directory (shutil): {model_path}")
+                        return True
+                else:
+                    # Windows - use shutil
+                    shutil.rmtree(model_path)
+                    logger.info(f"Deleted local model directory: {model_path}")
+                    return True
             else:
-                logger.warning(f"Model directory not found: {model_dir}")
-                return False
+                # HuggingFace cached model - model_id is like "org/name"
+                # Convert to cache directory name: org/name -> models--org--name
+                dir_name = "models--" + model_id.replace("/", "--")
+                cache_dir = self.cache_dir / dir_name
+
+                if cache_dir.exists():
+                    # Use rm -rf on macOS/Linux, shutil on Windows
+                    if platform.system() in ["Darwin", "Linux"]:
+                        try:
+                            subprocess.run(
+                                ["rm", "-rf", str(cache_dir)],
+                                check=True,
+                                capture_output=True,
+                                text=True
+                            )
+                            logger.info(f"Deleted cached model (rm -rf): {model_id} from {cache_dir}")
+                            return True
+                        except subprocess.CalledProcessError:
+                            # Fall back to shutil
+                            shutil.rmtree(cache_dir)
+                            logger.info(f"Deleted cached model (shutil): {model_id} from {cache_dir}")
+                            return True
+                    else:
+                        shutil.rmtree(cache_dir)
+                        logger.info(f"Deleted cached model: {model_id} from {cache_dir}")
+                        return True
+                else:
+                    logger.warning(f"Model not found. Tried local: {model_path}, cache: {cache_dir}")
+                    return False
 
         except Exception as e:
             logger.error(f"Failed to delete {model_id}: {e}")

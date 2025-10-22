@@ -165,13 +165,17 @@ class QuantizationOrchestrator:
                 logger.debug("Direct quantization, no conversion needed")
                 return source_path
 
-            # GGUF_TO_GENERIC/MLX/OPENVINO: Dequantize GGUF first
+            # GGUF_TO_GENERIC/MLX/OPENVINO: Dequantize GGUF to FP16 first
             if conversion_path in [
                 ConversionPath.GGUF_TO_GENERIC,
                 ConversionPath.GGUF_TO_MLX,
                 ConversionPath.GGUF_TO_OPENVINO,
             ]:
                 logger.info("Step 1: Dequantizing GGUF to FP16")
+                logger.info(
+                    "Note: GGUF FP16 will be loaded by transformers/mlx-lm/openvino "
+                    "for quantization"
+                )
 
                 # Create intermediate FP16 GGUF file
                 fp16_path = self.create_intermediate_path(task, "_fp16")
@@ -188,7 +192,10 @@ class QuantizationOrchestrator:
                 logger.info(f"Dequantization completed: {fp16_path}")
 
                 # For Generic/MLX/OpenVINO, the respective quantizers will handle
-                # loading the GGUF FP16 file with transformers/mlx-lm
+                # loading the GGUF FP16 file directly
+                # - Generic: Uses transformers with GGUF support (4.45+)
+                # - MLX: Uses mlx-lm which can load GGUF
+                # - OpenVINO: Uses optimum-intel with transformers backend
                 return fp16_path
 
             # GGUF_TO_ADVANCED: Need additional HF conversion

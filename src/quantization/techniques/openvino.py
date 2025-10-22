@@ -130,8 +130,16 @@ class OpenVINOQuantizer(BaseQuantizer):
             model_info: Model to quantize
 
         Returns:
-            Path to model directory (OpenVINO works with HuggingFace model IDs)
+            Path to model directory or GGUF file
         """
+        from ...models.provider import ProviderType
+
+        # For Ollama/GGUF models, return source_path (will be FP16 GGUF after orchestrator)
+        if model_info.provider in [ProviderType.OLLAMA, ProviderType.GGUF]:
+            if model_info.source_path:
+                return model_info.source_path
+            return None
+
         # OpenVINO works with HuggingFace model IDs directly
         # Return None to indicate we use model_id string instead of local path
         return None
@@ -272,13 +280,18 @@ class OpenVINOQuantizer(BaseQuantizer):
         if task.vlm_components:
             logger.info(f"VLM components to quantize: {task.vlm_components}")
 
-        # Check availability
-        available, msg = self.check_availability()
+        # Check availability and auto-install dependencies if needed
+        available, msg = self.check_and_install_dependencies(
+            auto_install=True,
+            show_progress=True
+        )
         if not available:
             task.status = TaskStatus.FAILED
             task.error = msg
+            logger.error(msg)
             return False
-
+        
+        logger.info(f"✓ OpenVINO available: {msg}")
         task.status = TaskStatus.RUNNING
 
         try:
@@ -313,8 +326,19 @@ class OpenVINOQuantizer(BaseQuantizer):
             if progress_callback:
                 progress_callback(20.0, None)
 
+            # Determine input source (GGUF file or HF model ID)
+            model_source = self.get_source_model_path(task.model_info)
+            if model_source and model_source.exists():
+                # Using GGUF file (from Ollama conversion)
+                model_input = str(model_source)
+                logger.info(f"Loading from GGUF file: {model_source}")
+            else:
+                # Using HuggingFace model ID
+                model_input = task.model_info.model_id
+                logger.info(f"Loading from HF model: {model_input}")
+
             # Load and export model to OpenVINO IR format
-            logger.info("Loading model and converting to OpenVINO IR format...")
+            logger.info("Converting to OpenVINO IR format...")
 
             # Create OVConfig with quantization settings
             if compression_config:
@@ -324,7 +348,7 @@ class OpenVINOQuantizer(BaseQuantizer):
 
             # Load model with quantization
             model = OVModelForCausalLM.from_pretrained(
-                task.model_info.model_id,
+                model_input,
                 export=True,
                 config=ov_config,
                 trust_remote_code=True,
@@ -333,11 +357,20 @@ class OpenVINOQuantizer(BaseQuantizer):
             if progress_callback:
                 progress_callback(70.0, None)
 
-            # Load tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(
-                task.model_info.model_id,
-                trust_remote_code=True
-            )
+            # Load tokenizer (use model_input which could be GGUF or HF ID)
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(
+                    model_input,
+                    trust_remote_code=True
+                )
+            except Exception as e:
+                logger.warning(f"Could not load tokenizer from {model_input}: {e}")
+                # Try with original model_id as fallback
+                logger.info(f"Falling back to model_id for tokenizer: {task.model_info.model_id}")
+                tokenizer = AutoTokenizer.from_pretrained(
+                    task.model_info.model_id,
+                    trust_remote_code=True
+                )
 
             # Save quantized model
             logger.info(f"Saving quantized model to {task.output_path}")

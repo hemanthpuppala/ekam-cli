@@ -269,14 +269,17 @@ class GGUFProvider(BaseProvider):
                 n_gpu_layers = -1 if self.use_gpu else 0
 
             # Determine optimal context size based on model
-            # Larger context for newer/hybrid architectures that may need more space
+            # Use larger context windows by default to support conversation history
+            # Most modern GGUF models can handle 4k-8k context efficiently
             if is_jamba:
                 # Jamba and other hybrid models may need larger context
-                n_ctx = 4096
-                logger.info(f"Using extended context window (4096) for hybrid architecture model")
+                n_ctx = 8192
+                logger.info(f"Using extended context window (8192) for hybrid architecture model")
             else:
-                # Standard context for most models
-                n_ctx = 2048
+                # Standard context for most models - increased from 2048 to 4096
+                # This allows for ~3000 token prompts + 1024 token responses
+                n_ctx = 4096
+                logger.info(f"Using standard context window (4096)")
 
             # 2025 FEATURE: Load VLM with vision support
             if is_vlm and mmproj_path:
@@ -555,10 +558,28 @@ class GGUFProvider(BaseProvider):
                 model_name=None  # Will default to ChatML template
             )
 
+            # Get model's context window size
+            model_ctx_size = getattr(handle, 'n_ctx', lambda: 2048)()
+
+            # Tokenize the prompt to get accurate token count
+            prompt_tokens = handle.tokenize(full_prompt.encode('utf-8'))
+            prompt_token_count = len(prompt_tokens)
+
+            # Calculate maximum safe tokens for generation
+            # Reserve some tokens for safety margin (10%)
+            safety_margin = int(model_ctx_size * 0.1)
+            max_safe_tokens = max(1, model_ctx_size - prompt_token_count - safety_margin)
+
+            logger.debug(
+                f"Context window: {model_ctx_size} tokens | "
+                f"Prompt: {prompt_token_count} tokens | "
+                f"Max safe response: {max_safe_tokens} tokens"
+            )
+
             # Build generation parameters with defaults
             gen_params = {
                 "prompt": full_prompt,
-                "max_tokens": 1024,  # Increased for more detailed responses
+                "max_tokens": min(1024, max_safe_tokens),  # Cap at safe limit
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "top_k": 40,
@@ -587,7 +608,16 @@ class GGUFProvider(BaseProvider):
             # Override with custom parameters from session
             if custom_parameters:
                 if "max_tokens" in custom_parameters:
-                    gen_params["max_tokens"] = custom_parameters["max_tokens"]
+                    requested_max = custom_parameters["max_tokens"]
+                    # Cap at safe limit to prevent context overflow
+                    if requested_max > max_safe_tokens:
+                        logger.warning(
+                            f"Requested max_tokens ({requested_max}) exceeds available context "
+                            f"({max_safe_tokens} tokens available). Capping to {max_safe_tokens}."
+                        )
+                        gen_params["max_tokens"] = max_safe_tokens
+                    else:
+                        gen_params["max_tokens"] = requested_max
                 if "temperature" in custom_parameters:
                     gen_params["temperature"] = custom_parameters["temperature"]
                 if "top_p" in custom_parameters:
@@ -602,8 +632,21 @@ class GGUFProvider(BaseProvider):
             try:
                 response = handle.create_completion(**gen_params)
             except Exception as gen_error:
-                # llama_decode errors (-1, -2) indicate generation failures
+                # llama_decode errors (-1, -2) or context window errors
                 error_str = str(gen_error)
+
+                # Check for context window overflow errors
+                if "exceed" in error_str.lower() and "context" in error_str.lower():
+                    raise RuntimeError(
+                        f"Context window overflow: {error_str}\n\n"
+                        f"Context info: {model_ctx_size} tokens total, "
+                        f"{prompt_token_count} used by prompt, "
+                        f"{gen_params['max_tokens']} requested for response.\n\n"
+                        f"Try: (1) Type 'back' to exit and start a new session, "
+                        f"(2) Use /config to reduce max_tokens, or "
+                        f"(3) Reload the model (model context cannot be changed at runtime)"
+                    )
+
                 if "llama_decode" in error_str or "returned -1" in error_str:
                     # Context or generation failure - try with reduced parameters
                     logger.warning(f"Generation failed, retrying with reduced parameters: {gen_error}")
@@ -617,9 +660,14 @@ class GGUFProvider(BaseProvider):
                         model_name=None
                     )
 
+                    # Recalculate safe tokens for retry prompt
+                    retry_tokens = handle.tokenize(retry_prompt.encode('utf-8'))
+                    retry_token_count = len(retry_tokens)
+                    retry_max_safe = max(1, model_ctx_size - retry_token_count - safety_margin)
+
                     retry_params = {
                         "prompt": retry_prompt,
-                        "max_tokens": 512,  # Reduced from 1024
+                        "max_tokens": min(512, retry_max_safe),  # Reduced from 1024
                         "temperature": gen_params["temperature"],
                         "top_p": gen_params["top_p"],
                         "top_k": gen_params["top_k"],
@@ -634,7 +682,7 @@ class GGUFProvider(BaseProvider):
                         logger.error(f"Retry also failed: {retry_error}")
                         raise RuntimeError(
                             f"Text generation failed. This model may have compatibility issues with long responses. "
-                            f"Try: (1) shorter prompts, (2) /clear to reset history, or (3) a different model. "
+                            f"Try: (1) shorter prompts, (2) start a new session, or (3) a different model. "
                             f"Error: {error_str}"
                         )
                 else:
@@ -666,10 +714,10 @@ class GGUFProvider(BaseProvider):
         return False
 
     def delete_model(self, model_id: str) -> bool:
-        """Delete GGUF file from disk.
+        """Delete GGUF file from disk (dynamically resolves path).
 
         Args:
-            model_id: Path to GGUF file
+            model_id: Path to GGUF file (can be relative or absolute)
 
         Returns:
             True if successful
@@ -677,13 +725,20 @@ class GGUFProvider(BaseProvider):
         logger.info(f"Deleting GGUF model: {model_id}")
 
         try:
+            from pathlib import Path
+
             model_path = Path(model_id)
+
+            # Convert to absolute path if relative
+            if not model_path.is_absolute():
+                model_path = model_path.absolute()
+
             if model_path.exists() and model_path.is_file():
                 model_path.unlink()
-                logger.info(f"Deleted GGUF file: {model_path.name}")
+                logger.info(f"Deleted GGUF file: {model_path}")
                 return True
             else:
-                logger.warning(f"GGUF file not found: {model_id}")
+                logger.warning(f"GGUF file not found: {model_path}")
                 return False
 
         except Exception as e:

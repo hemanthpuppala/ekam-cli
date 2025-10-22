@@ -2,8 +2,30 @@
 
 # VLM/LLM CLI Launcher Script
 # Handles prerequisites, environment setup, and application launch
+# Cross-platform: Linux, macOS, Windows (Git Bash)
 
 set -e  # Exit on error
+
+# Detect OS
+if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
+    OS="windows"
+    VENV_ACTIVATE="venv/Scripts/activate"
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    OS="mac"
+    VENV_ACTIVATE="venv/bin/activate"
+else
+    OS="linux"
+    VENV_ACTIVATE="venv/bin/activate"
+fi
+
+# Detect Python command (try python3 first, fall back to python)
+if command -v python3 &> /dev/null; then
+    PYTHON_CMD="python3"
+elif command -v python &> /dev/null; then
+    PYTHON_CMD="python"
+else
+    PYTHON_CMD=""
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -17,16 +39,20 @@ echo
 
 # Check Python version (require 3.8+)
 echo -e "${BLUE}[1/5]${NC} Checking Python version..."
-if ! command -v python3 &> /dev/null; then
-    echo -e "${RED}Error: python3 not found${NC}"
+if [ -z "$PYTHON_CMD" ]; then
+    echo -e "${RED}Error: Python not found${NC}"
     echo "Please install Python 3.8 or higher"
+    if [ "$OS" = "windows" ]; then
+        echo "Download from: https://www.python.org/downloads/"
+        echo "Make sure to check 'Add Python to PATH' during installation"
+    fi
     exit 1
 fi
 
-PYTHON_VERSION=$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
+PYTHON_VERSION=$($PYTHON_CMD -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
 REQUIRED_VERSION="3.8"
 
-if ! python3 -c "import sys; exit(0 if sys.version_info >= (3,8) else 1)"; then
+if ! $PYTHON_CMD -c "import sys; exit(0 if sys.version_info >= (3,8) else 1)"; then
     echo -e "${RED}Error: Python ${PYTHON_VERSION} is too old${NC}"
     echo "Required: Python ${REQUIRED_VERSION}+"
     exit 1
@@ -38,7 +64,7 @@ echo -e "${GREEN}✓${NC} Python ${PYTHON_VERSION} found"
 echo -e "${BLUE}[2/5]${NC} Checking virtual environment..."
 if [ ! -d "venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv venv
+    $PYTHON_CMD -m venv venv
     echo -e "${GREEN}✓${NC} Virtual environment created"
 else
     echo -e "${GREEN}✓${NC} Virtual environment exists"
@@ -46,8 +72,14 @@ fi
 
 # Activate virtual environment
 echo -e "${BLUE}[3/5]${NC} Activating virtual environment..."
-source venv/bin/activate
-echo -e "${GREEN}✓${NC} Virtual environment activated"
+if [ -f "$VENV_ACTIVATE" ]; then
+    source "$VENV_ACTIVATE"
+    echo -e "${GREEN}✓${NC} Virtual environment activated"
+else
+    echo -e "${RED}Error: Virtual environment activation script not found${NC}"
+    echo "Expected: $VENV_ACTIVATE"
+    exit 1
+fi
 
 # Install/update dependencies
 echo -e "${BLUE}[4/5]${NC} Checking dependencies..."
@@ -112,7 +144,7 @@ fi
 
 # Check Python packages
 echo -n "HuggingFace (transformers): "
-if python3 -c "import transformers" 2>/dev/null; then
+if $PYTHON_CMD -c "import transformers" 2>/dev/null; then
     echo -e "${GREEN}✓ Installed${NC}"
     HF_STATUS="installed"
 else
@@ -122,7 +154,7 @@ else
 fi
 
 echo -n "GGUF (llama-cpp-python): "
-if python3 -c "import llama_cpp" 2>/dev/null; then
+if $PYTHON_CMD -c "import llama_cpp" 2>/dev/null; then
     echo -e "${GREEN}✓ Installed${NC}"
     GGUF_STATUS="installed"
 else
@@ -136,16 +168,28 @@ if command -v llama-quantize &> /dev/null; then
     echo -e "${GREEN}✓ Available${NC}"
     echo -e "  ${BLUE}→${NC} llama.cpp tools installed"
     GGUF_QUANT_STATUS="available"
-elif python3 -c "import llama_cpp; exit(0 if hasattr(llama_cpp, 'llama_model_quantize') else 1)" 2>/dev/null; then
+elif $PYTHON_CMD -c "import llama_cpp; exit(0 if hasattr(llama_cpp, 'llama_model_quantize') else 1)" 2>/dev/null; then
     echo -e "${YELLOW}⚠ Partial support${NC}"
     echo -e "  ${BLUE}→${NC} llama-cpp-python installed but llama.cpp CLI tools missing"
-    echo -e "  ${BLUE}→${NC} HF→GGUF conversion requires: ${YELLOW}brew install llama.cpp${NC}"
+    if [ "$OS" = "mac" ]; then
+        echo -e "  ${BLUE}→${NC} HF→GGUF conversion requires: ${YELLOW}brew install llama.cpp${NC}"
+    elif [ "$OS" = "linux" ]; then
+        echo -e "  ${BLUE}→${NC} HF→GGUF conversion requires: ${YELLOW}Build llama.cpp from source${NC}"
+    else
+        echo -e "  ${BLUE}→${NC} HF→GGUF conversion requires: ${YELLOW}Build llama.cpp from source${NC}"
+    fi
     echo -e "  ${BLUE}→${NC} Use Generic quantization for HF models instead"
     GGUF_QUANT_STATUS="partial"
 else
     echo -e "${YELLOW}⚠ Not available${NC}"
     echo -e "  ${BLUE}→${NC} GGUF quantization will not be available"
-    echo -e "  ${BLUE}→${NC} Install: ${YELLOW}brew install llama.cpp${NC}"
+    if [ "$OS" = "mac" ]; then
+        echo -e "  ${BLUE}→${NC} Install: ${YELLOW}brew install llama.cpp${NC}"
+    elif [ "$OS" = "linux" ]; then
+        echo -e "  ${BLUE}→${NC} Install: ${YELLOW}Build llama.cpp from source${NC}"
+    else
+        echo -e "  ${BLUE}→${NC} Install: ${YELLOW}Build llama.cpp from source${NC}"
+    fi
     echo -e "  ${BLUE}→${NC} Or use Generic quantization instead"
     GGUF_QUANT_STATUS="missing"
 fi
@@ -171,7 +215,7 @@ echo
 echo -e "${BLUE}=== Launching VLM/LLM CLI ===${NC}"
 echo -e "${BLUE}→${NC} The application will automatically start Ollama if installed"
 echo
-python3 -m src.core.app
+$PYTHON_CMD -m src.core.app
 
 # Deactivate virtual environment on exit
 deactivate

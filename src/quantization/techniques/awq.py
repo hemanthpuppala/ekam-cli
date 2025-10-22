@@ -130,13 +130,18 @@ class AWQQuantizer(BaseQuantizer):
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting AWQ {task.quant_type.display_name} quantization")
 
-            # Check if autoawq is available
-            available, message = self.check_availability()
+            # Check if autoawq is available and auto-install if needed
+            available, message = self.check_and_install_dependencies(
+                auto_install=True,
+                show_progress=True
+            )
             if not available:
                 task.status = TaskStatus.FAILED
                 task.error = message
                 logger.error(f"AutoAWQ not available: {message}")
                 return False
+            
+            logger.info(f"✓ AutoAWQ available: {message}")
 
             # Update progress: Validating
             if progress_callback:

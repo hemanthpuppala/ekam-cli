@@ -1,46 +1,39 @@
 providers:
   ollama:
     enabled: true
-    host: "http://localhost:11434"
+    host: http://localhost:11434
     timeout_seconds: 120
-
   huggingface:
     enabled: true
-    cache_dir: "~/.cache/huggingface/hub/"
-    device_preference: ["cuda", "mps", "cpu"]
-    # 2025 OPTIMIZATION: Flash Attention automatically enabled if available
-
+    cache_dir: ~/.cache/huggingface/hub/
+    device_preference:
+    - cuda
+    - mps
+    - cpu
+    hf_token: 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
   lm_studio:
     enabled: false
-    host: "http://localhost:1234"
-
+    host: http://localhost:1234
   gguf:
     enabled: true
-    models_dir: "~/models/gguf/"
-    device_preference: ["cuda", "mps", "cpu"]
-    # 2025 FEATURE: VLM support with mmproj files (place mmproj in same directory as model)
-
+    models_dir: ~/models/gguf/
+    device_preference:
+    - cuda
+    - mps
+    - cpu
   quantized:
     enabled: true
-    models_dir: "results/quantizations/"
-    device_preference: ["cuda", "mps", "cpu"]
-
-  # 2025 NEW: MLX provider for Apple Silicon (M1/M2/M3/M4)
-  # Up to 85x faster VLM inference on Mac with native Metal acceleration
+    models_dir: results/quantizations/
+    device_preference:
+    - cuda
+    - mps
+    - cpu
   mlx:
-    enabled: true  # Auto-disabled if not on macOS or MLX not installed
-    models_dir: "~/.cache/mlx/models"
-    # Supports both VLMs (mlx-vlm) and LLMs (mlx-lm)
-    # Install: pip install mlx mlx-lm mlx-vlm
-
-  # 2025 NEW: OpenVINO provider for Intel CPU/iGPU optimization
-  # Optimized for Intel CPUs (AVX-512, VNNI, AMX) and iGPUs
+    enabled: true
+    models_dir: ~/.cache/mlx/models
   openvino:
-    enabled: true  # Auto-disabled if OpenVINO not installed
-    models_dir: "~/.cache/openvino/models"
-    # Supports VLMs: Qwen2-VL, Phi-3.5-Vision, InternVL2
-    # Install: pip install openvino openvino-dev optimum[openvino]
-
+    enabled: true
+    models_dir: ~/.cache/openvino/models
 system:
   max_image_dimension: 1920
   memory_safety_margin_gb: 1.0

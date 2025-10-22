@@ -129,81 +129,96 @@ class QuantizedProvider(BaseProvider):
             except Exception as e:
                 logger.warning(f"Could not read metadata for {gguf_path}: {e}")
 
-        # Model ID: Use full path so we can load it later
-        # Format: "quantized:gguf:/path/to/file.gguf"
-        model_id = f"quantized:gguf:{gguf_path}"
+        # Model ID: Use full absolute path so we can load it later
+        # Format: "quantized:gguf:/absolute/path/to/file.gguf"
+        model_id = f"quantized:gguf:{gguf_path.absolute()}"
 
         # Display name: Extract model name from filename and show quantization type
-        # Example: "_Volumes_..._salamandra-2b_q4_k_m_20251012_221056" → "salamandra-2b [Q4_K_M]"
-        # Example: "_Volumes_..._salamandra-2b_q4_k_m_20251012_221056_f16" → "salamandra-2b [FP16]"
+        # New format (no timestamp): Provider_Model-Name_quanttype[_counter]
+        # Examples: 
+        #   - "Qwen_Qwen3-0.6B_q4_k_m.gguf" → "Qwen/Qwen3-0.6B"
+        #   - "allenai_OLMo-1B_q4_k_m_2.gguf" → "allenai/OLMo-1B" (with counter)
+        # Old format (backward compat): Provider_Model-Name_quanttype_YYYYMMDD_HHMMSS
         filename_stem = gguf_path.stem
 
         # Try to extract meaningful model name from filename
-        # Pattern: ...model-name_quanttype_timestamp or ...model-name_quanttype_timestamp_f16
+        # Pattern: Provider_Model-Name_quanttype[_timestamp][_counter](_f16)
+        name = None
+
         if "_" in filename_stem:
-            # Remove path components (anything before last occurrence of model identifier)
             parts = filename_stem.split("_")
 
-            # Handle FP16 files: remove the trailing "f16" part
+            # Check if ends with "_f16" (FP16 GGUF intermediate file)
+            is_fp16 = len(parts) >= 1 and parts[-1] == "f16"
             if is_fp16 and parts[-1] == "f16":
                 parts = parts[:-1]
 
-            # Find the quantization type in the filename (q4_k_m, q5_k_m, etc.)
+            # Remove trailing counter if present (e.g., "_2", "_3")
+            if len(parts) >= 1 and parts[-1].isdigit() and len(parts[-1]) <= 2:
+                parts = parts[:-1]
+
+            # Remove timestamp parts (YYYYMMDD_HHMMSS) for backward compatibility
+            # Only if they look like timestamps (8 digits + 6 digits)
+            if len(parts) >= 2:
+                if (parts[-1].isdigit() and len(parts[-1]) == 6 and
+                    parts[-2].isdigit() and len(parts[-2]) == 8):
+                    parts = parts[:-2]  # Remove timestamp
+
+            # Find the quantization type in the filename
+            # Some quant types are 3 parts (q4_k_m), others are 2 parts (q8_0)
+            quant_patterns_3 = ["q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k"]
+            quant_patterns_2 = ["q8_0", "q4_0", "q5_0"]
             quant_idx = -1
+
+            # Try 3-part patterns first
             for i, part in enumerate(parts):
-                if part.startswith("q") and i + 2 < len(parts):
-                    # Check if this looks like a quant type (e.g., q4_k_m)
+                if i + 2 < len(parts):
                     potential_quant = "_".join(parts[i:i+3])
-                    if potential_quant in ["q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k", "q8_0"]:
+                    if potential_quant in quant_patterns_3:
                         quant_idx = i
                         break
 
-            # Extract model name (everything before quant type or timestamp)
-            if quant_idx > 0:
-                # Join everything before quant_idx, but try to extract just the model name
-                model_part = "_".join(parts[:quant_idx])
-                # Take the last meaningful part (usually the actual model name)
-                model_name_parts = model_part.split("_")
-                # Find the last part that looks like a model name (not a path component)
-                for i in range(len(model_name_parts) - 1, -1, -1):
-                    if model_name_parts[i] and not model_name_parts[i].startswith("Volumes"):
-                        # Use the last 2 parts as the model name, skipping "models" if present
-                        start_idx = max(0, i - 1)
-                        name_parts = model_name_parts[start_idx:]
-
-                        # Remove "models" prefix if present
-                        if name_parts and name_parts[0] == "models":
-                            name_parts = name_parts[1:]
-
-                        name = "-".join(name_parts) if name_parts else filename_stem
-                        break
-            else:
-                # No quant type found, might be FP16 without quant prefix
-                # Find the last meaningful parts before timestamp
-                model_name_parts = []
-                for i in range(len(parts) - 1, -1, -1):
-                    # Skip timestamp-like parts (8 digits)
-                    if parts[i].isdigit() and len(parts[i]) == 8:
-                        continue
-                    # Skip time-like parts (6 digits)
-                    if parts[i].isdigit() and len(parts[i]) == 6:
-                        continue
-                    # Skip path components
-                    if parts[i].startswith("Volumes"):
-                        continue
-                    # Found meaningful part
-                    if model_name_parts or parts[i]:
-                        model_name_parts.insert(0, parts[i])
-                        # Get at most 2-3 meaningful parts
-                        if len(model_name_parts) >= 2:
+            # Try 2-part patterns if not found
+            if quant_idx == -1:
+                for i, part in enumerate(parts):
+                    if i + 1 < len(parts):
+                        potential_quant = "_".join(parts[i:i+2])
+                        if potential_quant in quant_patterns_2:
+                            quant_idx = i
                             break
 
-                if model_name_parts and model_name_parts[0] == "models":
-                    model_name_parts = model_name_parts[1:]
+            # Extract model name (everything before quant type)
+            if quant_idx > 0:
+                # Join parts before quantization type
+                model_name_parts = parts[:quant_idx]
 
-                name = "-".join(model_name_parts) if model_name_parts else filename_stem
-        else:
-            name = filename_stem
+                # Convert underscores to slashes for provider/model format
+                # Example: ['Qwen', 'Qwen3-0', '6B'] → "Qwen/Qwen3-0.6B"
+                if len(model_name_parts) >= 2:
+                    # First part is usually provider (Qwen, mistralai, etc.)
+                    provider = model_name_parts[0]
+
+                    # Rest is model name - rejoin with dashes
+                    model_parts = model_name_parts[1:]
+
+                    # Handle version numbers split by underscore (e.g., '0' '6B' → '0.6B')
+                    reconstructed = []
+                    for i, p in enumerate(model_parts):
+                        if i > 0 and model_parts[i-1].isdigit() and p and p[0].isdigit():
+                            # This looks like a version split: "3-0" + "6B" → "3-0.6B"
+                            reconstructed[-1] = reconstructed[-1] + "." + p
+                        else:
+                            reconstructed.append(p)
+
+                    model_name = "-".join(reconstructed)
+                    name = f"{provider}/{model_name}"
+                else:
+                    # Fallback: just join with dashes
+                    name = "-".join(model_name_parts)
+
+        # Final fallback: use the original filename stem
+        if not name:
+            name = filename_stem.replace("_", "-")
 
         # Add quantization type tag - make it very clear with descriptions
         if quant_type != "unknown":
@@ -337,29 +352,88 @@ class QuantizedProvider(BaseProvider):
             logger.warning(f"No quantization_metadata.json found for {model_dir}")
             logger.warning("MLX models require metadata file for proper detection")
 
-        # Model ID: Use full path with format prefix
-        # Format: "quantized:hf:/path/to/model_dir"
-        model_id = f"quantized:hf:{model_dir}"
+        # Model ID: Use full absolute path with format prefix
+        # Format: "quantized:hf:/absolute/path/to/model_dir"
+        model_id = f"quantized:hf:{model_dir.absolute()}"
 
-        # Display name - make quantization type very clear
-        name = f"{model_dir.name}"
+        # Display name: Extract clean name from directory, removing module prefixes and quant types
+        # Format: Provider_Model-Name_{module}-{quant_type}[_{counter}]
+        # Examples:
+        #   - "Qwen_Qwen3-0.6B_mlx-int4" → "Qwen/Qwen3-0.6B"
+        #   - "allenai_OLMo-1B_fp16" → "allenai/OLMo-1B"
+        #   - "Qwen_Qwen3-0.6B_mlx-int4_2" → "Qwen/Qwen3-0.6B" (with counter)
+        dir_name = model_dir.name
+        parts = dir_name.split("_")
+
+        # Remove trailing counter if present (e.g., "_2", "_3")
+        # This handles conflicts when the same model is quantized multiple times
+        if len(parts) >= 1 and parts[-1].isdigit() and len(parts[-1]) <= 2:
+            parts = parts[:-1]
+
+        # Remove timestamp parts (YYYYMMDD_HHMMSS) for backwards compatibility with old naming
+        # This handles models quantized before the timestamp removal fix
+        if len(parts) >= 2:
+            if (parts[-1].isdigit() and len(parts[-1]) == 6 and
+                parts[-2].isdigit() and len(parts[-2]) == 8):
+                parts = parts[:-2]  # Remove timestamp
+
+        # Remove module-quant_type (e.g., "mlx-int4", "openvino-int8", "fp16", "q4_k_m")
+        # Look for module prefixes or standalone quant types
+        if len(parts) >= 1:
+            last_part = parts[-1].lower()
+            # Check if last part is a quant type (with or without module prefix)
+            quant_indicators = [
+                "int4", "int8", "int2", "fp16", "bf16", "fp32",
+                "mlx-int4", "mlx-int8", "mlx-int2", "mlx-fp16",
+                "openvino-int4", "openvino-int8", "openvino-fp16",
+                # GGUF types
+                "q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k", "q8_0",
+            ]
+            if last_part in quant_indicators:
+                parts = parts[:-1]  # Remove quant type
+
+        # Reconstruct clean model name
+        if len(parts) >= 2:
+            # First part is provider, rest is model name
+            provider = parts[0]
+            model_parts = parts[1:]
+
+            # Handle version numbers split by underscore (e.g., '0' '6B' → '0.6B')
+            reconstructed = []
+            for i, p in enumerate(model_parts):
+                if i > 0 and model_parts[i-1].isdigit() and p and p[0].isdigit():
+                    reconstructed[-1] = reconstructed[-1] + "." + p
+                else:
+                    reconstructed.append(p)
+
+            model_name = "-".join(reconstructed)
+            clean_name = f"{provider}/{model_name}"
+        else:
+            # Fallback: use what we have
+            clean_name = "-".join(parts) if parts else dir_name
+
+        # Add quantization type label
         if quant_type != "unknown":
-            # Add descriptive quantization type label
             if quant_type == "fp16":
-                name = f"{model_dir.name} [FP16 - Half Precision]"
+                name = f"{clean_name} [FP16 - Half Precision]"
+            elif quant_type == "bf16":
+                name = f"{clean_name} [BF16 - Brain Float16]"
             elif quant_type == "int8":
-                name = f"{model_dir.name} [INT8 - 8-bit Integer]"
+                name = f"{clean_name} [INT8 - 8-bit Integer]"
             elif quant_type == "int4":
                 if is_mlx:
-                    name = f"{model_dir.name} [INT4 MLX] ⚠️ Use MLX tools"
+                    name = f"{clean_name} [INT4 MLX] ⚠️ Use MLX tools"
                 else:
-                    name = f"{model_dir.name} [INT4 - 4-bit Integer]"
+                    name = f"{clean_name} [INT4 - 4-bit Integer]"
+            elif quant_type == "int2":
+                if is_mlx:
+                    name = f"{clean_name} [INT2 MLX] ⚠️ Use MLX tools"
+                else:
+                    name = f"{clean_name} [INT2 - 2-bit Integer]"
             else:
-                name = f"{model_dir.name} [{quant_type.upper()}]"
-
-        # Add MLX indicator if not already added
-        if is_mlx and "[MLX]" not in name and "MLX" not in name:
-            name = f"{name} [MLX Format]"
+                name = f"{clean_name} [{quant_type.upper()}]"
+        else:
+            name = clean_name
 
         # Assess compatibility
         if is_mlx:
@@ -798,21 +872,227 @@ class QuantizedProvider(BaseProvider):
                     str(model_path),
                     trust_remote_code=True
                 )
-                
+
+                # PRODUCTION FIX: Load models with custom configurations (like OLMo)
+                # When models are quantized and saved, custom config classes get copied to the output dir
+                # However, sometimes the modeling_*.py file is missing, which breaks loading
+                #
+                # Multi-strategy loading approach:
+                # 1. Try loading directly with trust_remote_code=True
+                # 2. If modeling file is missing, copy it from original model's HF cache
+                # 3. If that fails, try loading weights with original model architecture
+                # 4. Final fallback: Load from original model_id if available in metadata
+
+                model = None
+                error_messages = []
+
+                # Strategy 1: Try AutoModelForCausalLM (most common for LLMs)
                 try:
+                    logger.debug("Attempting to load with AutoModelForCausalLM...")
                     model = AutoModelForCausalLM.from_pretrained(
                         str(model_path),
                         device_map="auto",
                         low_cpu_mem_usage=True,
                         trust_remote_code=True
                     )
-                except Exception:
-                    # Fallback to AutoModel
-                    model = AutoModel.from_pretrained(
-                        str(model_path),
-                        device_map="auto",
-                        low_cpu_mem_usage=True,
-                        trust_remote_code=True
+                    logger.info("✓ Loaded with AutoModelForCausalLM")
+                except Exception as e:
+                    error_msg = str(e)
+                    error_messages.append(f"AutoModelForCausalLM: {error_msg[:200]}")
+                    logger.debug(f"AutoModelForCausalLM failed: {error_msg}")
+
+                # Strategy 2: If modeling file is missing, try to fix it
+                if model is None and "does not appear to have a file named modeling_" in str(error_messages[-1]):
+                    try:
+                        import json
+                        import shutil
+
+                        logger.info("Detected missing modeling file - attempting to fix...")
+
+                        # Read quantization metadata to get original model
+                        metadata_file = model_path / "quantization_metadata.json"
+                        original_model_id = None
+
+                        if metadata_file.exists():
+                            with open(metadata_file) as f:
+                                metadata = json.load(f)
+                                original_model_id = metadata.get("original_model", None)
+                                logger.info(f"Original model from metadata: {original_model_id}")
+
+                        # Also try to infer from directory name if metadata doesn't have it
+                        if not original_model_id:
+                            # Directory name format: Provider_Model-Name_quant_type
+                            # Example: allenai_OLMo-1B_fp16_1 → allenai/OLMo-1B
+                            dir_name = model_path.name
+                            parts = dir_name.split("_")
+
+                            # Remove quant type and counter at the end
+                            if len(parts) >= 2:
+                                # Try to reconstruct original model ID
+                                # Heuristic: Provider/ModelName format
+                                original_model_id = f"{parts[0]}/{'-'.join(parts[1:-1])}"
+                                # Clean up common quant type suffixes
+                                for suffix in ["fp16", "int8", "int4", "bf16", "mlx-int4", "openvino-int8"]:
+                                    original_model_id = original_model_id.replace(f"-{suffix}", "")
+                                logger.info(f"Inferred original model: {original_model_id}")
+
+                        if original_model_id:
+                            # Strategy 2a: Copy missing modeling file from original model's cache
+                            try:
+                                from transformers.utils import cached_file
+                                from pathlib import Path as P
+
+                                # Get model architecture to find the modeling file name
+                                config_path = model_path / "config.json"
+                                with open(config_path) as f:
+                                    config_json = json.load(f)
+
+                                arch = config_json.get("architectures", [""])[0]
+                                if arch:
+                                    # Infer modeling file name from architecture
+                                    # E.g., OLMoForCausalLM → modeling_olmo.py
+                                    model_type = arch.replace("ForCausalLM", "").replace("Model", "").lower()
+                                    modeling_file = f"modeling_{model_type}.py"
+
+                                    logger.info(f"Looking for {modeling_file} in original model cache...")
+
+                                    # Try to get file from HF cache
+                                    try:
+                                        cached_modeling_file = cached_file(
+                                            original_model_id,
+                                            modeling_file,
+                                            _raise_exceptions_for_missing_entries=False
+                                        )
+
+                                        if cached_modeling_file and P(cached_modeling_file).exists():
+                                            # Copy to quantized model directory
+                                            dest = model_path / modeling_file
+                                            shutil.copy2(cached_modeling_file, dest)
+                                            logger.info(f"✓ Copied {modeling_file} from original model cache")
+
+                                            # Retry loading
+                                            model = AutoModelForCausalLM.from_pretrained(
+                                                str(model_path),
+                                                device_map="auto",
+                                                low_cpu_mem_usage=True,
+                                                trust_remote_code=True
+                                            )
+                                            logger.info("✓ Successfully loaded after copying modeling file!")
+                                    except Exception as copy_error:
+                                        logger.debug(f"Could not copy modeling file: {copy_error}")
+
+                            except Exception as fix_error:
+                                logger.debug(f"Strategy 2a failed: {fix_error}")
+
+                            # Strategy 2b: Load architecture from original model, then load weights
+                            if model is None:
+                                try:
+                                    logger.info(f"Attempting to load architecture from {original_model_id}...")
+
+                                    # Load original model architecture (without weights)
+                                    from transformers import AutoConfig
+                                    config = AutoConfig.from_pretrained(
+                                        original_model_id,
+                                        trust_remote_code=True
+                                    )
+
+                                    # Load model architecture
+                                    base_model = AutoModelForCausalLM.from_config(
+                                        config,
+                                        trust_remote_code=True
+                                    )
+
+                                    # Load quantized weights into the model
+                                    logger.info("Loading quantized weights into model architecture...")
+
+                                    # Auto-install safetensors if needed
+                                    try:
+                                        from safetensors.torch import load_file
+                                    except ImportError:
+                                        logger.info("safetensors not found, installing...")
+                                        from ..utils.dependency_installer import DependencyInstaller
+                                        if DependencyInstaller.install_package("safetensors", auto_install=True, quiet=True):
+                                            from safetensors.torch import load_file
+                                        else:
+                                            raise ImportError("Failed to install safetensors. Please run: pip install safetensors")
+
+                                    import torch
+
+                                    # Load the safetensors file
+                                    weights_file = model_path / "model.safetensors"
+                                    if weights_file.exists():
+                                        state_dict = load_file(str(weights_file))
+                                        base_model.load_state_dict(state_dict)
+
+                                        # Move to device
+                                        if device == "mps":
+                                            base_model = base_model.to("mps")
+                                        elif device == "cuda":
+                                            base_model = base_model.to("cuda")
+                                        else:
+                                            base_model = base_model.to("cpu")
+
+                                        model = base_model
+                                        logger.info(f"✓ Loaded with weights from {original_model_id} architecture")
+                                except Exception as arch_error:
+                                    logger.debug(f"Strategy 2b failed: {arch_error}")
+                                    error_messages.append(f"Architecture loading: {str(arch_error)[:100]}")
+
+                    except Exception as e:
+                        logger.debug(f"Missing modeling file fix failed: {e}")
+
+                # Strategy 3: Try with AutoConfig
+                if model is None:
+                    try:
+                        from transformers import AutoConfig
+
+                        logger.debug("Attempting to load with AutoConfig...")
+                        config = AutoConfig.from_pretrained(
+                            str(model_path),
+                            trust_remote_code=True
+                        )
+
+                        model = AutoModelForCausalLM.from_pretrained(
+                            str(model_path),
+                            config=config,
+                            device_map="auto",
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True
+                        )
+                        logger.info("✓ Loaded with AutoConfig approach")
+                    except Exception as e:
+                        error_msg = str(e)
+                        error_messages.append(f"AutoConfig: {error_msg[:100]}")
+                        logger.debug(f"AutoConfig approach failed: {error_msg}")
+
+                # Strategy 4: Last resort - try AutoModel (generic fallback)
+                if model is None:
+                    try:
+                        logger.debug("Attempting final fallback with AutoModel...")
+                        model = AutoModel.from_pretrained(
+                            str(model_path),
+                            device_map="auto",
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True
+                        )
+                        logger.info("✓ Loaded with AutoModel (generic fallback)")
+                    except Exception as e:
+                        error_msg = str(e)
+                        error_messages.append(f"AutoModel: {error_msg[:100]}")
+                        logger.error(f"AutoModel failed: {error_msg}")
+
+                # If all strategies failed, raise comprehensive error
+                if model is None:
+                    error_summary = "\n  - ".join(error_messages)
+                    raise RuntimeError(
+                        f"Failed to load quantized model from {model_path}\n\n"
+                        f"Tried multiple loading strategies:\n  - {error_summary}\n\n"
+                        f"This may be due to:\n"
+                        f"  • Missing modeling files (modeling_*.py)\n"
+                        f"  • Incompatible model architecture\n"
+                        f"  • Corrupted model files\n"
+                        f"  • Missing dependencies for custom model code\n\n"
+                        f"Recommendation: Re-quantize the model to ensure all files are copied."
                     )
 
                 logger.info(f"Loaded quantized LLM with tokenizer on {device}")
@@ -1120,13 +1400,15 @@ class QuantizedProvider(BaseProvider):
             # CORRECT Signature: generate(model, processor, prompt, image, **kwargs)
             # Note: 'image' can be a single path or list of paths
             # MEMORY FIX: Reduced max_tokens from 1024 to 256 to prevent OOM crashes on 8GB systems
+            # MLX VLM accepts temperature and top_p as kwargs (passed to generate_step)
             response = generate(
                 model,
                 processor,
                 prompt,  # Prompt comes BEFORE image in MLX VLM
                 image_path,  # Image path comes AFTER prompt
                 max_tokens=256,  # Reduced from 1024 to fit in 8GB RAM
-                temp=0.7,
+                temperature=0.7,
+                top_p=0.9,
                 verbose=False
             )
 
@@ -1299,12 +1581,13 @@ class QuantizedProvider(BaseProvider):
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
-            repetition_penalty: Repetition penalty
+            repetition_penalty: Repetition penalty (not used by MLX)
 
         Returns:
             Generated text
         """
         from mlx_lm import generate
+        from mlx_lm.sample_utils import make_sampler
         from ..utils.history_formatter import format_conversation_history
 
         # Format prompt with history
@@ -1319,15 +1602,22 @@ class QuantizedProvider(BaseProvider):
 
         logger.info("Running MLX LLM inference...")
 
-        # MLX generate function
+        # Create sampler with MLX's make_sampler (uses 'temp' not 'temperature')
+        # Note: repetition_penalty is not supported by MLX's make_sampler
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            min_p=0.0,
+            min_tokens_to_keep=1
+        )
+
+        # MLX generate function - pass sampler instead of individual parameters
         response = generate(
             model=model,
             tokenizer=tokenizer,
             prompt=formatted_prompt,
             max_tokens=max_tokens,
-            temp=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
+            sampler=sampler,
             verbose=False
         )
 
@@ -1396,22 +1686,81 @@ class QuantizedProvider(BaseProvider):
             )
 
         # Tokenize and generate
-        inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model_device)
+        logger.debug(f"Tokenizing prompt (length: {len(formatted_prompt)})")
+        inputs = tokenizer(formatted_prompt, return_tensors="pt")
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=temperature > 0,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id
-            )
+        # Validate tokenization output
+        if inputs is None or "input_ids" not in inputs:
+            raise RuntimeError(f"Tokenization failed - tokenizer returned: {inputs}")
+
+        if inputs["input_ids"] is None:
+            raise RuntimeError("Tokenization failed - input_ids is None")
+
+        logger.debug(f"Tokenized successfully: {inputs['input_ids'].shape}")
+
+        # Move tensors to device individually and validate
+        for key, value in list(inputs.items()):
+            if value is None:
+                logger.warning(f"Tokenizer returned None for '{key}', removing from inputs")
+                inputs.pop(key)
+            elif hasattr(value, 'to'):
+                inputs[key] = value.to(model_device)
+
+        # Ensure attention_mask exists (required for generation)
+        if "attention_mask" not in inputs or inputs.get("attention_mask") is None:
+            logger.warning("No attention_mask in inputs, creating one")
+            import torch
+            inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+
+        # Remove token_type_ids if model doesn't use them (e.g., OLMo, Llama)
+        # This prevents "model_kwargs not used" errors
+        if "token_type_ids" in inputs and not getattr(model.config, "type_vocab_size", 0):
+            inputs.pop("token_type_ids")
+
+        logger.debug(f"Final inputs keys: {list(inputs.keys())}")
+
+        # Prepare generation kwargs with proper token IDs
+        gen_kwargs = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "do_sample": temperature > 0,
+        }
+
+        # Only add pad_token_id if it's set
+        if tokenizer.pad_token_id is not None:
+            gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+        elif tokenizer.eos_token_id is not None:
+            # Fallback: use eos_token as pad_token
+            gen_kwargs["pad_token_id"] = tokenizer.eos_token_id
+
+        # Only add eos_token_id if it's set
+        if tokenizer.eos_token_id is not None:
+            gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
+
+        logger.debug(f"Generation kwargs: {gen_kwargs}")
+
+        try:
+            with torch.no_grad():
+                outputs = model.generate(**inputs, **gen_kwargs)
+
+            logger.debug(f"Generation complete. Output shape: {outputs.shape if outputs is not None else 'None'}")
+
+            if outputs is None:
+                raise RuntimeError("model.generate() returned None")
+
+        except Exception as gen_error:
+            logger.error(f"Generation failed: {gen_error}", exc_info=True)
+            raise RuntimeError(f"Model generation failed: {gen_error}")
 
         # Decode only new tokens
         input_length = inputs["input_ids"].shape[1]
         generated_tokens = outputs[0][input_length:]
+
+        if generated_tokens is None or len(generated_tokens) == 0:
+            logger.warning("No tokens were generated")
+            return "I don't have a response."
+
         response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
         # Clean response
@@ -1595,22 +1944,80 @@ class QuantizedProvider(BaseProvider):
                 )
             
             # Tokenize and generate
-            inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model_device)
-            
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=temperature > 0,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id
-                )
-            
+            logger.debug(f"Tokenizing prompt (length: {len(formatted_prompt)})")
+            inputs = tokenizer(formatted_prompt, return_tensors="pt")
+
+            # Validate tokenization output
+            if inputs is None or "input_ids" not in inputs:
+                raise RuntimeError(f"Tokenization failed - tokenizer returned: {inputs}")
+
+            if inputs["input_ids"] is None:
+                raise RuntimeError("Tokenization failed - input_ids is None")
+
+            logger.debug(f"Tokenized successfully: {inputs['input_ids'].shape}")
+
+            # Move tensors to device individually and validate
+            for key, value in list(inputs.items()):
+                if value is None:
+                    logger.warning(f"Tokenizer returned None for '{key}', removing from inputs")
+                    inputs.pop(key)
+                elif hasattr(value, 'to'):
+                    inputs[key] = value.to(model_device)
+
+            # Ensure attention_mask exists (required for generation)
+            if "attention_mask" not in inputs or inputs.get("attention_mask") is None:
+                logger.warning("No attention_mask in inputs, creating one")
+                import torch
+                inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+
+            # Remove token_type_ids if model doesn't use them (e.g., OLMo, Llama)
+            if "token_type_ids" in inputs and not getattr(model.config, "type_vocab_size", 0):
+                inputs.pop("token_type_ids")
+
+            logger.debug(f"Final inputs keys: {list(inputs.keys())}")
+
+            # Prepare generation kwargs with proper token IDs
+            gen_kwargs = {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "do_sample": temperature > 0,
+            }
+
+            # Only add pad_token_id if it's set
+            if tokenizer.pad_token_id is not None:
+                gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+            elif tokenizer.eos_token_id is not None:
+                # Fallback: use eos_token as pad_token
+                gen_kwargs["pad_token_id"] = tokenizer.eos_token_id
+
+            # Only add eos_token_id if it's set
+            if tokenizer.eos_token_id is not None:
+                gen_kwargs["eos_token_id"] = tokenizer.eos_token_id
+
+            logger.debug(f"Generation kwargs: {gen_kwargs}")
+
+            try:
+                with torch.no_grad():
+                    outputs = model.generate(**inputs, **gen_kwargs)
+
+                logger.debug(f"Generation complete. Output shape: {outputs.shape if outputs is not None else 'None'}")
+
+                if outputs is None:
+                    raise RuntimeError("model.generate() returned None")
+
+            except Exception as gen_error:
+                logger.error(f"Generation failed: {gen_error}", exc_info=True)
+                raise RuntimeError(f"Model generation failed: {gen_error}")
+
             # Decode only new tokens
             input_length = inputs["input_ids"].shape[1]
             generated_tokens = outputs[0][input_length:]
+
+            if generated_tokens is None or len(generated_tokens) == 0:
+                logger.warning("No tokens were generated")
+                return "I don't have a response."
+
             response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
             
             # Clean response
@@ -1808,6 +2215,11 @@ class QuantizedProvider(BaseProvider):
 
             model_path = Path(parts[2])
 
+            # Handle both relative and absolute paths
+            # If path is relative, make it absolute (for backward compatibility)
+            if not model_path.is_absolute():
+                model_path = model_path.absolute()
+
             if not model_path.exists():
                 logger.error(f"Model path does not exist: {model_path}")
                 return False
@@ -1815,18 +2227,56 @@ class QuantizedProvider(BaseProvider):
             if model_path.is_file():
                 # Delete GGUF file
                 model_path.unlink()
+                logger.info(f"Deleted GGUF file: {model_path}")
+
                 # Delete metadata if exists
                 metadata_file = model_path.with_suffix(".json")
                 if metadata_file.exists():
                     metadata_file.unlink()
-            elif model_path.is_dir():
-                # Delete HF directory
-                import shutil
-                shutil.rmtree(model_path)
+                    logger.info(f"Deleted metadata file: {metadata_file}")
 
-            logger.info(f"Deleted quantized model: {model_id}")
+                # Delete F16 intermediate file if exists (GGUF quantization creates these)
+                f16_file = model_path.parent / f"{model_path.stem}_f16.gguf"
+                if f16_file.exists():
+                    f16_file.unlink()
+                    logger.info(f"Deleted F16 intermediate file: {f16_file}")
+
+            elif model_path.is_dir():
+                # Delete HF/MLX directory
+                import shutil
+                try:
+                    shutil.rmtree(model_path)
+                    logger.info(f"Deleted model directory: {model_path}")
+                except PermissionError as pe:
+                    logger.error(f"Permission denied deleting {model_path}: {pe}")
+                    logger.info("Trying to delete files individually...")
+                    # Try to delete files individually
+                    for item in model_path.rglob("*"):
+                        if item.is_file():
+                            try:
+                                item.unlink()
+                            except Exception:
+                                pass
+                    # Try to remove directory again
+                    try:
+                        shutil.rmtree(model_path)
+                    except Exception as cleanup_error:
+                        logger.warning(f"Could not fully clean up {model_path}: {cleanup_error}")
+
+            # Update model cache to remove this model
+            try:
+                self.cache.invalidate_model(str(model_path))
+            except Exception as cache_error:
+                logger.debug(f"Could not invalidate cache for {model_path}: {cache_error}")
+
+            logger.info(f"Successfully deleted quantized model: {model_id}")
             return True
 
+        except FileNotFoundError as fnf:
+            # Model already deleted or never existed
+            logger.warning(f"Model path not found (already deleted?): {fnf}")
+            # Still return True since the goal (model not existing) is achieved
+            return True
         except Exception as e:
-            logger.error(f"Failed to delete model {model_id}: {e}")
+            logger.error(f"Failed to delete model {model_id}: {e}", exc_info=True)
             return False

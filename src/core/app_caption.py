@@ -351,6 +351,9 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
             end_time = time.perf_counter()
             elapsed_ms = (end_time - start_time) * 1000
 
+            # Log raw VLM response (before any cleaning/processing) - FULL response without truncation
+            logger.debug(f"Raw VLM Caption response ({len(response)} chars): {response}")
+
             # Store exchange in session if using history
             if use_history and active_session:
                 active_session.add_exchange(caption_prompt, response, elapsed_ms)
