@@ -118,18 +118,23 @@ class QuantizationOrchestrator:
 
         Args:
             task: Quantization task
-            suffix: File suffix (e.g., "_fp16.gguf", "_hf")
+            suffix: File suffix (e.g., "_fp16", "_hf")
 
         Returns:
             Path for intermediate file
         """
         base_name = task.output_path.stem
-        if task.output_path.suffix == ".gguf":
-            # It's a file output, create intermediate file
+
+        # For GGUF intermediate files, always add .gguf extension
+        # This is needed so the Generic/MLX/OpenVINO quantizers can detect GGUF files
+        if suffix == "_fp16":  # FP16 GGUF intermediate
+            intermediate = self.temp_dir / f"{base_name}{suffix}.gguf"
+        elif task.output_path.suffix == ".gguf":
+            # It's a GGUF file output, create intermediate GGUF file
             intermediate = self.temp_dir / f"{base_name}{suffix}.gguf"
         else:
-            # It's a directory output, create intermediate directory
-            intermediate = self.temp_dir / f"{base_name}{suffix}"
+            # It's a directory output (HF/MLX/OpenVINO), intermediate is still GGUF
+            intermediate = self.temp_dir / f"{base_name}{suffix}.gguf"
 
         return intermediate
 
