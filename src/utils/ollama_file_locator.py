@@ -145,11 +145,10 @@ class OllamaFileLocator:
     def _parse_blob_hash(self, modelfile: str) -> Optional[str]:
         """Parse blob hash from modelfile content.
 
-        Expected format:
+        Expected formats:
+            FROM /path/to/.ollama/models/blobs/sha256-abc123def456...
             FROM blob:sha256-abc123def456...
-
-        Also supports:
-            FROM @sha256:abc123def456...  (alternative format)
+            FROM @sha256:abc123def456...
 
         Args:
             modelfile: Modelfile content
@@ -157,25 +156,26 @@ class OllamaFileLocator:
         Returns:
             Blob hash (e.g., "sha256-abc123..."), or None if not found
         """
-        # Pattern 1: blob:sha256-abc123...
-        pattern1 = r"FROM\s+blob:(sha256-[a-f0-9]+)"
+        # Pattern 1: Full path to blob file
+        # FROM /Users/user/.ollama/models/blobs/sha256-abc123...
+        pattern1 = r"FROM\s+(?:.*/)?(sha256-[a-f0-9]+)"
         match = re.search(pattern1, modelfile, re.IGNORECASE)
         if match:
             return match.group(1)
 
-        # Pattern 2: @sha256:abc123... (convert to sha256-abc123...)
-        pattern2 = r"FROM\s+@(sha256):([a-f0-9]+)"
+        # Pattern 2: blob:sha256-abc123...
+        pattern2 = r"FROM\s+blob:(sha256-[a-f0-9]+)"
         match = re.search(pattern2, modelfile, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+        # Pattern 3: @sha256:abc123... (convert to sha256-abc123...)
+        pattern3 = r"FROM\s+@(sha256):([a-f0-9]+)"
+        match = re.search(pattern3, modelfile, re.IGNORECASE)
         if match:
             hash_type = match.group(1)
             hash_value = match.group(2)
             return f"{hash_type}-{hash_value}"
-
-        # Pattern 3: Just the hash (fallback)
-        pattern3 = r"FROM\s+(sha256-[a-f0-9]+)"
-        match = re.search(pattern3, modelfile, re.IGNORECASE)
-        if match:
-            return match.group(1)
 
         logger.debug(f"No blob hash found in modelfile:\n{modelfile}")
         return None
