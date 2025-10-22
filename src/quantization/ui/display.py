@@ -399,10 +399,12 @@ def ask_quantization_method(model_info: ModelInfo) -> str:
     """
     from ...models.endpoints import ProviderType, ModelType
 
-    # Only show this menu for HuggingFace models
-    if model_info.provider != ProviderType.HUGGINGFACE:
-        return "gguf"  # GGUF models use direct GGUF quantization
+    # For pure GGUF files (not Ollama), only GGUF requantization is supported
+    # Ollama and HuggingFace models can use all quantization methods
+    if model_info.provider == ProviderType.GGUF:
+        return "gguf"  # Pure GGUF files only support GGUF requantization
 
+    # For Ollama and HuggingFace models, show the full quantization method menu
     # Check if CUDA GPU is available (required for Advanced methods)
     has_cuda = False
     try:
@@ -485,6 +487,7 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
 {system_header}
 
 [bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)
+[bold]Provider:[/bold] {model_info.provider.value.upper() if hasattr(model_info.provider, 'value') else str(model_info.provider).upper()}
 [bold]Type:[/bold] {model_type_str}{vlm_note}
 
 [bold]1. Generic Quantization[/bold] [dim](FP16/INT8/INT4)[/dim] [green]✓ Available[/green]
@@ -502,12 +505,12 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   • {"Works with VLMs (quantizes entire model)" if is_vlm else "Works with all LLMs"}
   • Slower processing time
 
-{"[bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else "[dim][bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+{f"[bold]3. {"GGUF Requantization" if model_info.provider == ProviderType.OLLAMA else "GGUF Conversion"}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else f"[dim][bold]3. {"GGUF Requantization" if model_info.provider == ProviderType.OLLAMA else "GGUF Conversion"}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• {"Requantize Ollama model to different GGUF level" if model_info.provider == ProviderType.OLLAMA else "Convert HF model to GGUF format"}" if not is_vlm else f"[dim]• {"Requantize Ollama model to different GGUF level" if model_info.provider == ProviderType.OLLAMA else "Convert HF model to GGUF format"}[/dim]"}
   {"• Maximum compatibility (llama.cpp, Ollama)" if not is_vlm else "[dim]• Maximum compatibility (llama.cpp, Ollama)[/dim]"}
   {"• CPU-optimized for inference" if not is_vlm else "[dim]• CPU-optimized for inference[/dim]"}
-  {"• Portable across platforms" if not is_vlm else "[dim]• Portable across platforms[/dim]"}
   {"• Output: .gguf format" if not is_vlm else "[dim]• Output: .gguf format[/dim]"}
-  {"• Takes longer (includes conversion step)" if not is_vlm else "[dim]• Takes longer (includes conversion step)[/dim]"}
+  {f"• {"Fast process (direct requantization)" if model_info.provider == ProviderType.OLLAMA else "Takes longer (includes conversion step)"}" if not is_vlm else f"[dim]• {"Fast process (direct requantization)" if model_info.provider == ProviderType.OLLAMA else "Takes longer (includes conversion step)"}[/dim]"}
   {"• Stable for LLMs" if not is_vlm else "[dim]• [red]NOT SUPPORTED for VLMs[/red] (llama.cpp limitation)[/dim]"}
 
 {"[bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [green]✓ Available[/green]" if is_apple_silicon and has_mlx else "[dim][bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [red]✗ Disabled[/red][/dim]"}
@@ -542,6 +545,7 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
 {system_header}
 
 [bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)
+[bold]Provider:[/bold] {model_info.provider.value.upper() if hasattr(model_info.provider, 'value') else str(model_info.provider).upper()}
 [bold]Type:[/bold] {model_type_str}{vlm_note}
 
 [bold]1. Generic Quantization[/bold] [dim](FP16 only)[/dim] [green]✓ Available[/green]
@@ -560,7 +564,8 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   • Disabled methods: Generic INT8/INT4, BitsAndBytes, GPTQ, AWQ
   • 💡 Use Generic FP16 or GGUF instead[/dim]
 
-{"[bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else "[dim][bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+{f"[bold]3. {"GGUF Requantization" if model_info.provider == ProviderType.OLLAMA else "GGUF Conversion"}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else f"[dim][bold]3. {"GGUF Requantization" if model_info.provider == ProviderType.OLLAMA else "GGUF Conversion"}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• {"Requantize Ollama model to different GGUF level" if model_info.provider == ProviderType.OLLAMA else "Convert HF model to GGUF format"}" if not is_vlm else f"[dim]• {"Requantize Ollama model to different GGUF level" if model_info.provider == ProviderType.OLLAMA else "Convert HF model to GGUF format"}[/dim]"}
   {"• Maximum compatibility (llama.cpp, Ollama)" if not is_vlm else "[dim]• Maximum compatibility (llama.cpp, Ollama)[/dim]"}
   {"• CPU-optimized for inference" if not is_vlm else "[dim]• CPU-optimized for inference[/dim]"}
   {"• Multiple bit depths available:" if not is_vlm else "[dim]• Multiple bit depths available:[/dim]"}
@@ -568,7 +573,7 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
     {"- Q5_K_M: ~60% of original (better quality)" if not is_vlm else "[dim]- Q5_K_M: ~60% of original (better quality)[/dim]"}
     {"- Q8_0: ~90% of original (minimal quality loss)" if not is_vlm else "[dim]- Q8_0: ~90% of original (minimal quality loss)[/dim]"}
   {"• Output: .gguf format" if not is_vlm else "[dim]• Output: .gguf format[/dim]"}
-  {"• Slower process (includes conversion step)" if not is_vlm else "[dim]• Slower process (includes conversion step)[/dim]"}
+  {f"• {"Fast process (direct requantization)" if model_info.provider == ProviderType.OLLAMA else "Slower process (includes conversion step)"}" if not is_vlm else f"[dim]• {"Fast process (direct requantization)" if model_info.provider == ProviderType.OLLAMA else "Slower process (includes conversion step)"}[/dim]"}
   {"• Works for pure LLMs" if not is_vlm else "[dim]• [red]NOT SUPPORTED for VLMs[/red] (llama.cpp doesn't support VLM architectures)[/dim]"}
 
 {"[bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [green]✓ Available[/green]" if is_apple_silicon and has_mlx else "[dim][bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [red]✗ Disabled[/red][/dim]"}
