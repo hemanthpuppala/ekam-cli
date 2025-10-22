@@ -141,10 +141,14 @@ class BackgroundJobManager:
                         task.error = f"Quantization method {method_family} not yet implemented"
                         success = False
 
-                # STEP 3: Clean up intermediate files if conversion was used
+                # STEP 3: Keep intermediate files for user (don't cleanup)
+                # Users may want to use the FP16 GGUF file for other purposes
                 if converted_path and success:
-                    logger.info("Cleaning up intermediate conversion files")
-                    self.orchestrator.cleanup_intermediate_files(task)
+                    logger.info(f"Intermediate file preserved: {converted_path}")
+                    logger.info("You can use this FP16 GGUF file with llama.cpp or Ollama")
+                elif converted_path and not success:
+                    logger.info(f"Quantization failed, but intermediate file saved: {converted_path}")
+                    logger.info("You can use this FP16 GGUF file directly or try a different quantization method")
 
                 # Update completion time
                 if success:

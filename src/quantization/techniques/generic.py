@@ -457,17 +457,38 @@ class GenericQuantizer(BaseQuantizer):
                 continue
         
         if model is None:
-            raise RuntimeError(
-                f"Failed to load model with any strategy.\n\n"
-                f"Platform: {caps.platform.value}\n"
-                f"Device: {caps.device_type.value}\n"
-                f"Tried: {', '.join([s[0] for s in model_strategies])}\n\n"
-                f"Last error: {str(last_error)[:200]}\n\n"
-                f"Try:\n"
-                f"  1. Check model files are complete\n"
-                f"  2. Ensure enough RAM ({caps.available_ram_gb:.1f}GB available)\n"
-                f"  3. Try FP16 instead of INT8/INT4 if memory limited\n"
-            )
+            # Check if this is a GGUF file (from Ollama conversion)
+            is_gguf = model_path_str.endswith('.gguf')
+
+            if is_gguf:
+                raise RuntimeError(
+                    f"\n{'='*60}\n"
+                    f"GENERIC QUANTIZATION FROM OLLAMA NOT YET SUPPORTED\n"
+                    f"{'='*60}\n\n"
+                    f"Good news: Your Ollama model was successfully converted to FP16!\n"
+                    f"📁 Intermediate file saved: {model_path_str}\n\n"
+                    f"However: transformers cannot load GGUF files for further quantization.\n"
+                    f"GGUF is designed for inference (llama.cpp), not quantization pipelines.\n\n"
+                    f"✅ What you can do:\n"
+                    f"  1. Use the FP16 GGUF file with llama.cpp or Ollama\n"
+                    f"  2. Try GGUF requantization (option 3) instead\n"
+                    f"  3. Download the original HuggingFace model for Generic quantization\n\n"
+                    f"💡 Recommended: Use GGUF requantization for Ollama models\n"
+                    f"   Example: Q8_0 → Q5_K_S, Q4_K_M → Q3_K_S\n"
+                    f"{'='*60}\n"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to load model with any strategy.\n\n"
+                    f"Platform: {caps.platform.value}\n"
+                    f"Device: {caps.device_type.value}\n"
+                    f"Tried: {', '.join([s[0] for s in model_strategies])}\n\n"
+                    f"Last error: {str(last_error)[:200]}\n\n"
+                    f"Try:\n"
+                    f"  1. Check model files are complete\n"
+                    f"  2. Ensure enough RAM ({caps.available_ram_gb:.1f}GB available)\n"
+                    f"  3. Try FP16 instead of INT8/INT4 if memory limited\n"
+                )
 
         return model
 
