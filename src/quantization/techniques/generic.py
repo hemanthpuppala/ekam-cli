@@ -546,9 +546,13 @@ class GenericQuantizer(BaseQuantizer):
                 model_identifier = str(model_path)
                 logger.info(f"Quantizing model from local path: {model_path}")
 
-                # Validate and repair model directory for local paths
-                logger.info(f"Validating model directory: {model_path}")
-                self._validate_and_repair_model(model_path)
+                # Validate and repair model directory for HF models only
+                # Skip validation for GGUF files (from Ollama/GGUF providers)
+                if model_path.suffix != '.gguf':
+                    logger.info(f"Validating model directory: {model_path}")
+                    self._validate_and_repair_model(model_path)
+                else:
+                    logger.info(f"GGUF file detected, skipping HF validation: {model_path}")
             else:
                 # Use model_id (HF will find cached model or download)
                 model_identifier = task.model_info.model_id
