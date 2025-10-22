@@ -40,6 +40,7 @@ class QuantizationManager:
         Supports:
         - GGUF models: Direct quantization (Q4/Q5/Q6/Q8)
         - HuggingFace models: Via GGUF conversion or generic quantization (FP16/INT8/INT4)
+        - Ollama models: GGUF requantization + format conversion (FP16/INT8/INT4/MLX/OpenVINO)
 
         Args:
             all_models: List of all available models
@@ -57,8 +58,20 @@ class QuantizationManager:
             # HuggingFace models: GGUF conversion + quantization OR generic quantization
             elif model.provider == ProviderType.HUGGINGFACE:
                 quantizable.append(model)
+            # Ollama models: GGUF requantization + multi-format conversion
+            elif model.provider == ProviderType.OLLAMA:
+                # Only include if we have source_path (blob location)
+                if model.source_path:
+                    quantizable.append(model)
+                else:
+                    logger.debug(f"Skipping Ollama model {model.name} - no source_path")
 
-        logger.info(f"Found {len(quantizable)} quantizable models (GGUF: {sum(1 for m in quantizable if m.provider == ProviderType.GGUF)}, HF: {sum(1 for m in quantizable if m.provider == ProviderType.HUGGINGFACE)})")
+        logger.info(
+            f"Found {len(quantizable)} quantizable models "
+            f"(GGUF: {sum(1 for m in quantizable if m.provider == ProviderType.GGUF)}, "
+            f"HF: {sum(1 for m in quantizable if m.provider == ProviderType.HUGGINGFACE)}, "
+            f"Ollama: {sum(1 for m in quantizable if m.provider == ProviderType.OLLAMA)})"
+        )
         return quantizable
 
     def get_recommendations(
@@ -72,7 +85,7 @@ class QuantizationManager:
         Args:
             model_info: Model to quantize
             use_gpu: Whether GPU will be used
-            method: Quantization method ("generic", "advanced", "gguf", "gguf_conversion")
+            method: Quantization method ("generic", "advanced", "gguf", "gguf_conversion", "mlx", "openvino")
 
         Returns:
             List of recommendations
@@ -129,6 +142,49 @@ class QuantizationManager:
                     method_family="Generic",
                     use_gpu=use_gpu,
                 )
+        # Ollama models: GGUF requantization is primary, also support conversions
+        elif model_info.provider == ProviderType.OLLAMA:
+            # Ollama models are GGUF-based, route based on method
+            if method == "gguf" or method == "gguf_conversion":
+                # GGUF requantization (Q4→Q3, Q4→Q5, etc.)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="GGUF",
+                    use_gpu=use_gpu,
+                )
+            elif method == "mlx":
+                # Convert GGUF → MLX format
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="MLX",
+                    use_gpu=False,
+                )
+            elif method == "openvino":
+                # Convert GGUF → OpenVINO format
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="OpenVINO",
+                    use_gpu=False,
+                )
+            elif method == "advanced":
+                # Convert GGUF → HF → GPTQ/AWQ/BnB (with warnings)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Advanced",
+                    use_gpu=use_gpu,
+                )
+            else:
+                # Generic: Convert GGUF → FP16/INT8/INT4
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Generic",
+                    use_gpu=use_gpu,
+                )
 
         return []
 
@@ -157,18 +213,59 @@ class QuantizationManager:
         # Generate task ID
         task_id = f"quant_{uuid.uuid4().hex[:8]}"
 
-        # Generate output filename/directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = f"{model_info.model_id.replace('/', '_')}_{quant_type.value}_{timestamp}"
+        # Extract clean model name from model_id
+        # Format: "provider/model-name" or "model-name"
+        clean_model_id = model_info.model_id.replace('/', '_').replace(':', '_')
 
-        # MLX and OpenVINO output to directories, others to files
-        if module in [QuantizationModule.MLX, QuantizationModule.OPENVINO]:
-            # Directory output for MLX/OpenVINO
-            output_path = self.output_dir / base_name
+        # Build descriptive name with module prefix for special modules
+        # Format: {model_name}_{module}-{quant_type}
+        # Examples:
+        #   - MLX INT4: Qwen_Qwen3-0.6B_mlx-int4
+        #   - OpenVINO INT8: Qwen_Qwen3-0.6B_openvino-int8
+        #   - GGUF Q4_K_M: Qwen_Qwen3-0.6B_q4_k_m (no module prefix for GGUF)
+        #   - Generic INT4: Qwen_Qwen3-0.6B_int4 (no module prefix for generic)
+        #
+        # NO TIMESTAMPS in the path to avoid module import issues with transformers
+
+        if module == QuantizationModule.MLX:
+            # MLX quantization - add "mlx-" prefix to quant type
+            module_prefix = "mlx-"
+        elif module == QuantizationModule.OPENVINO:
+            # OpenVINO quantization - add "openvino-" prefix to quant type
+            module_prefix = "openvino-"
         else:
-            # File output for GGUF, Generic, etc.
-            output_filename = f"{base_name}{quant_type.file_extension}"
+            # GGUF, Generic, Advanced (GPTQ/AWQ/BnB) - no module prefix
+            module_prefix = ""
+
+        base_name = f"{clean_model_id}_{module_prefix}{quant_type.value}"
+
+        # Determine output type: directory or file
+        # GGUF quantization outputs to .gguf files
+        # All others (MLX, OpenVINO, Generic, GPTQ, AWQ, BnB) output to directories using save_pretrained()
+        if module == QuantizationModule.LLAMA_CPP:
+            # GGUF outputs to files with .gguf extension
+            output_filename = f"{base_name}.gguf"
             output_path = self.output_dir / output_filename
+            
+            # Handle conflicts: if file exists, append number before extension
+            if output_path.exists():
+                counter = 1
+                while (self.output_dir / f"{base_name}_{counter}.gguf").exists():
+                    counter += 1
+                output_path = self.output_dir / f"{base_name}_{counter}.gguf"
+                logger.info(f"Output file exists, using: {output_path.name}")
+        else:
+            # Directory output for MLX, OpenVINO, Generic, GPTQ, AWQ, BnB
+            # All these use save_pretrained() which creates a directory with model files
+            output_path = self.output_dir / base_name
+            
+            # Handle conflicts: if directory exists, append number
+            if output_path.exists():
+                counter = 1
+                while (self.output_dir / f"{base_name}_{counter}").exists():
+                    counter += 1
+                output_path = self.output_dir / f"{base_name}_{counter}"
+                logger.info(f"Output directory exists, using: {output_path.name}")
 
         # Create task
         task = QuantizationTask(

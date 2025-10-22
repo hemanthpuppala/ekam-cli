@@ -14,6 +14,7 @@ from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..utils.history_formatter import format_qa_history
+from ..utils.ollama_file_locator import OllamaFileLocator
 from .base import BaseProvider
 
 
@@ -34,6 +35,10 @@ class OllamaProvider(BaseProvider):
         # Initialize metadata cache for efficient model inspection
         self.metadata_cache = ModelMetadataCache()
         logger.debug("Initialized model metadata cache")
+
+        # Initialize file locator for quantization support
+        self.file_locator = OllamaFileLocator()
+        logger.debug("Initialized Ollama file locator for quantization")
 
     def discover_models(self) -> list[ModelInfo]:
         """Discover available models from Ollama server.
@@ -99,6 +104,13 @@ class OllamaProvider(BaseProvider):
                 model_type = ModelType.LLM
                 capabilities = [EndpointType.TEXT]
 
+            # Get source path for quantization support
+            source_path = self.file_locator.get_model_path(name)
+            if source_path:
+                logger.debug(f"Located source file for {name}: {source_path}")
+            else:
+                logger.debug(f"Could not locate source file for {name}")
+
             # Create ModelInfo with metadata
             return ModelInfo(
                 model_id=name,
@@ -115,6 +127,7 @@ class OllamaProvider(BaseProvider):
                 compatibility=CompatibilityStatus.PERFECT_FIT,
                 compatibility_message="Compatibility not yet assessed",
                 is_installed=True,
+                source_path=source_path,
             )
         else:
             # Fallback: metadata inspection failed, use API introspection
@@ -122,6 +135,9 @@ class OllamaProvider(BaseProvider):
             size_bytes = model_data.get("size", 0)
             size_gb = size_bytes / (1024**3)
             model_type, capabilities = self._classify_model_dynamic(name)
+
+            # Get source path for quantization support (even in fallback)
+            source_path = self.file_locator.get_model_path(name)
 
             return ModelInfo(
                 model_id=name,
@@ -133,6 +149,7 @@ class OllamaProvider(BaseProvider):
                 compatibility=CompatibilityStatus.PERFECT_FIT,
                 compatibility_message="Compatibility not yet assessed",
                 is_installed=True,
+                source_path=source_path,
             )
 
     def _classify_model_dynamic(self, name: str) -> tuple[ModelType, list[EndpointType]]:

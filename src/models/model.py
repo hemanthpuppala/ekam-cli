@@ -1,6 +1,7 @@
 """Model information and metadata."""
 
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field, computed_field
@@ -48,6 +49,15 @@ class ModelInfo(BaseModel):
     vram_gb: Optional[float] = None  # Estimated VRAM requirement in GB
     params_exact: Optional[bool] = None  # True if params_billions is exact, False if estimated
     ram_exact: Optional[bool] = None  # True if ram_gb is exact, False if estimated
+
+    # Quantization support - path to actual model file/directory
+    source_path: Optional[Path] = Field(
+        default=None,
+        description="Path to actual model file or directory for quantization. "
+                    "For GGUF: path to .gguf file. "
+                    "For HuggingFace: path to model directory. "
+                    "For Ollama: path to blob file in ~/.ollama/models/blobs/"
+    )
 
     @computed_field
     @property
