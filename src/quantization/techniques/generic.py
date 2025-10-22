@@ -561,19 +561,20 @@ class GenericQuantizer(BaseQuantizer):
 
             # Get model identifier (can be local path or HF model ID)
             # For HuggingFace models, use model_id directly - transformers will find cached version
+            # For Ollama models, orchestrator will provide converted HF directory path
             model_path = self.get_source_model_path(task.model_info)
             if model_path and model_path.exists():
                 # Local path exists - use it
                 model_identifier = str(model_path)
                 logger.info(f"Quantizing model from local path: {model_path}")
 
-                # Validate and repair model directory for HF models only
-                # Skip validation for GGUF files (from Ollama/GGUF providers)
-                if model_path.suffix != '.gguf':
+                # Validate and repair model directory
+                # Note: Ollama models are converted to HF format by orchestrator before reaching here
+                if model_path.is_dir():
                     logger.info(f"Validating model directory: {model_path}")
                     self._validate_and_repair_model(model_path)
                 else:
-                    logger.info(f"GGUF file detected, skipping HF validation: {model_path}")
+                    logger.info(f"Model file: {model_path}")
             else:
                 # Use model_id (HF will find cached model or download)
                 model_identifier = task.model_info.model_id

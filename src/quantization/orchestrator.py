@@ -26,6 +26,7 @@ from ..models.model import ModelInfo
 from ..models.provider import ProviderType
 from .models import QuantizationTask, QuantizationType, TaskStatus
 from .converters.gguf_dequantizer import GGUFDequantizer
+from .converters.gguf_to_hf import GGUFToHFConverter
 
 
 class ConversionPath(Enum):
@@ -58,6 +59,7 @@ class QuantizationOrchestrator:
 
         # Initialize converters
         self.gguf_dequantizer = GGUFDequantizer()
+        self.gguf_to_hf_converter = GGUFToHFConverter()
 
         logger.debug(f"Initialized QuantizationOrchestrator (intermediate: {self.intermediate_dir})")
 
@@ -173,16 +175,53 @@ class QuantizationOrchestrator:
                 logger.debug("Direct quantization, no conversion needed")
                 return source_path
 
-            # GGUF_TO_GENERIC/MLX/OPENVINO: Dequantize GGUF to FP16 first
+            # GGUF_TO_GENERIC: Dequantize + Convert to HF format
+            if conversion_path == ConversionPath.GGUF_TO_GENERIC:
+                logger.info("Step 1: Dequantizing GGUF to FP16")
+
+                # Create intermediate FP16 GGUF file
+                fp16_path = self.create_intermediate_path(task, "_fp16")
+
+                # Dequantize
+                success = self.gguf_dequantizer.convert(
+                    source_path, fp16_path, progress_callback
+                )
+
+                if not success:
+                    logger.error("Dequantization failed")
+                    return None
+
+                logger.info(f"Dequantization completed: {fp16_path}")
+
+                # Step 2: Convert GGUF FP16 → HuggingFace format
+                logger.info("Step 2: Converting FP16 GGUF to HuggingFace format")
+
+                # Create HF output directory
+                base_name = task.output_path.stem
+                hf_path = self.intermediate_dir / f"{base_name}_hf"
+
+                # Convert to HF
+                success = self.gguf_to_hf_converter.convert(
+                    fp16_path, hf_path, progress_callback
+                )
+
+                if not success:
+                    logger.error("GGUF→HF conversion failed")
+                    logger.info(f"FP16 GGUF file saved at: {fp16_path}")
+                    logger.info("You can use this FP16 GGUF with llama.cpp or Ollama")
+                    return None
+
+                logger.info(f"HuggingFace conversion completed: {hf_path}")
+                return hf_path
+
+            # GGUF_TO_MLX/OPENVINO: Dequantize GGUF to FP16 (direct GGUF loading)
             if conversion_path in [
-                ConversionPath.GGUF_TO_GENERIC,
                 ConversionPath.GGUF_TO_MLX,
                 ConversionPath.GGUF_TO_OPENVINO,
             ]:
                 logger.info("Step 1: Dequantizing GGUF to FP16")
                 logger.info(
-                    "Note: GGUF FP16 will be loaded by transformers/mlx-lm/openvino "
-                    "for quantization"
+                    "Note: GGUF FP16 will be loaded by mlx-lm/openvino for quantization"
                 )
 
                 # Create intermediate FP16 GGUF file
@@ -199,14 +238,12 @@ class QuantizationOrchestrator:
 
                 logger.info(f"Dequantization completed: {fp16_path}")
 
-                # For Generic/MLX/OpenVINO, the respective quantizers will handle
-                # loading the GGUF FP16 file directly
-                # - Generic: Uses transformers with GGUF support (4.45+)
+                # For MLX/OpenVINO, they will handle loading GGUF FP16 directly
                 # - MLX: Uses mlx-lm which can load GGUF
                 # - OpenVINO: Uses optimum-intel with transformers backend
                 return fp16_path
 
-            # GGUF_TO_ADVANCED: Need additional HF conversion
+            # GGUF_TO_ADVANCED: Dequantize + Convert to HF for GPTQ/AWQ/BnB
             if conversion_path == ConversionPath.GGUF_TO_ADVANCED:
                 logger.warning(
                     "Advanced quantization (GPTQ/AWQ/BnB) from GGUF involves "
@@ -214,22 +251,38 @@ class QuantizationOrchestrator:
                 )
 
                 # Step 1: Dequantize to FP16
+                logger.info("Step 1: Dequantizing GGUF to FP16")
                 fp16_path = self.create_intermediate_path(task, "_fp16")
                 success = self.gguf_dequantizer.convert(
                     source_path, fp16_path, progress_callback
                 )
 
                 if not success:
+                    logger.error("Dequantization failed")
                     return None
 
+                logger.info(f"Dequantization completed: {fp16_path}")
+
                 # Step 2: Convert GGUF FP16 → HF format
-                # This would need a GGUFToHFConverter (not implemented yet)
-                # For now, return fp16_path and let quantizer handle it
-                logger.warning(
-                    "GGUF→HF conversion not yet implemented. "
-                    "Advanced quantization may not work."
+                logger.info("Step 2: Converting FP16 GGUF to HuggingFace format")
+
+                # Create HF output directory
+                base_name = task.output_path.stem
+                hf_path = self.intermediate_dir / f"{base_name}_hf"
+
+                # Convert to HF
+                success = self.gguf_to_hf_converter.convert(
+                    fp16_path, hf_path, progress_callback
                 )
-                return fp16_path
+
+                if not success:
+                    logger.error("GGUF→HF conversion failed")
+                    logger.info(f"FP16 GGUF file saved at: {fp16_path}")
+                    logger.info("You can use this FP16 GGUF with llama.cpp or Ollama")
+                    return None
+
+                logger.info(f"HuggingFace conversion completed: {hf_path}")
+                return hf_path
 
             logger.error(f"Unknown conversion path: {conversion_path}")
             return None
