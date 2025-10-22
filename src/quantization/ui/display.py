@@ -490,12 +490,13 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
 [bold]Provider:[/bold] {model_info.provider.value.upper() if hasattr(model_info.provider, 'value') else str(model_info.provider).upper()}
 [bold]Type:[/bold] {model_type_str}{vlm_note}
 
-[bold]1. Generic Quantization[/bold] [dim](FP16/INT8/INT4)[/dim] [green]✓ Available[/green]
+{f"[bold]1. Generic Quantization[/bold] [dim](FP16/INT8/INT4)[/dim] {'[yellow]⚠ Limited[/yellow]' if model_info.provider == ProviderType.OLLAMA else '[green]✓ Available[/green]'}" if has_cuda else f"[bold]1. Generic Quantization[/bold] [dim](FP16 only)[/dim] {'[yellow]⚠ Limited[/yellow]' if model_info.provider == ProviderType.OLLAMA else '[green]✓ Available[/green]'}"}
   • Simple PyTorch quantization
   • Works on CPU and GPU
   • Output: .safetensors format
   • Best for: Quick size reduction, all devices
   • {"Quantizes entire VLM (vision + language)" if is_vlm else "Stable for all models"}
+  {f"• [yellow]⚠ Ollama models: Use GGUF (option 3) instead[/yellow]" if model_info.provider == ProviderType.OLLAMA else ""}
 
 [bold]2. Advanced 4-bit Quantization[/bold] [dim](GPTQ/AWQ/BnB)[/dim] [green]✓ Available[/green]
   • High-quality 4-bit quantization
