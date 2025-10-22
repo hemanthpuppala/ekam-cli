@@ -291,6 +291,29 @@ class MLXQuantizer(BaseQuantizer):
         task.status = TaskStatus.RUNNING
 
         try:
+            # VALIDATION 3: Check if source is a GGUF file (from Ollama conversion)
+            source_path = self.get_source_model_path(task.model_info)
+            if source_path and source_path.suffix == '.gguf':
+                logger.error(f"MLX cannot load GGUF files: {source_path}")
+                task.status = TaskStatus.FAILED
+                task.error = (
+                    f"\n{'='*60}\n"
+                    f"MLX QUANTIZATION FROM OLLAMA NOT YET SUPPORTED\n"
+                    f"{'='*60}\n\n"
+                    f"Good news: Your Ollama model was successfully converted to FP16!\n"
+                    f"📁 Intermediate file saved: {source_path}\n\n"
+                    f"However: MLX cannot load GGUF files for quantization.\n"
+                    f"MLX requires HuggingFace format models, not GGUF files.\n\n"
+                    f"✅ What you can do:\n"
+                    f"  1. Use the FP16 GGUF file with llama.cpp or Ollama\n"
+                    f"  2. Try GGUF requantization (option 3) instead\n"
+                    f"  3. Download the original HuggingFace model for MLX quantization\n\n"
+                    f"💡 Recommended: Use GGUF requantization for Ollama models\n"
+                    f"   Example: Q8_0 → Q5_K_S, Q4_K_M → Q3_K_S\n"
+                    f"{'='*60}\n"
+                )
+                return False
+
             # Check if output path already exists
             if task.output_path.exists():
                 import shutil

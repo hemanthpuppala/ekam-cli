@@ -45,19 +45,21 @@ class QuantizationOrchestrator:
     and quantizers to achieve the desired output format.
     """
 
-    def __init__(self, temp_dir: Optional[Path] = None):
+    def __init__(self, intermediate_dir: Optional[Path] = None):
         """Initialize orchestrator.
 
         Args:
-            temp_dir: Directory for intermediate files
+            intermediate_dir: Directory for intermediate files (saved for user)
         """
-        self.temp_dir = temp_dir or Path("results/quantizations/.temp")
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        # Save intermediate files in main quantizations folder, not .temp
+        # Users can use these FP16 GGUF files with llama.cpp or Ollama
+        self.intermediate_dir = intermediate_dir or Path("results/quantizations")
+        self.intermediate_dir.mkdir(parents=True, exist_ok=True)
 
         # Initialize converters
         self.gguf_dequantizer = GGUFDequantizer()
 
-        logger.debug(f"Initialized QuantizationOrchestrator (temp: {self.temp_dir})")
+        logger.debug(f"Initialized QuantizationOrchestrator (intermediate: {self.intermediate_dir})")
 
     def determine_conversion_path(
         self, model_info: ModelInfo, target_quant_type: QuantizationType
@@ -121,20 +123,21 @@ class QuantizationOrchestrator:
             suffix: File suffix (e.g., "_fp16", "_hf")
 
         Returns:
-            Path for intermediate file
+            Path for intermediate file in results/quantizations/
         """
         base_name = task.output_path.stem
 
         # For GGUF intermediate files, always add .gguf extension
         # This is needed so the Generic/MLX/OpenVINO quantizers can detect GGUF files
+        # Save in main quantizations folder so users can easily find and use them
         if suffix == "_fp16":  # FP16 GGUF intermediate
-            intermediate = self.temp_dir / f"{base_name}{suffix}.gguf"
+            intermediate = self.intermediate_dir / f"{base_name}{suffix}.gguf"
         elif task.output_path.suffix == ".gguf":
             # It's a GGUF file output, create intermediate GGUF file
-            intermediate = self.temp_dir / f"{base_name}{suffix}.gguf"
+            intermediate = self.intermediate_dir / f"{base_name}{suffix}.gguf"
         else:
             # It's a directory output (HF/MLX/OpenVINO), intermediate is still GGUF
-            intermediate = self.temp_dir / f"{base_name}{suffix}.gguf"
+            intermediate = self.intermediate_dir / f"{base_name}{suffix}.gguf"
 
         return intermediate
 
@@ -238,13 +241,16 @@ class QuantizationOrchestrator:
     def cleanup_intermediate_files(self, task: QuantizationTask) -> None:
         """Clean up intermediate conversion files.
 
+        Note: This method is no longer used. Intermediate files are preserved
+        for users to use with llama.cpp or Ollama.
+
         Args:
             task: Quantization task
         """
         try:
-            # Clean up temp directory for this task
+            # Clean up intermediate directory for this task
             task_temp_pattern = task.output_path.stem + "*"
-            for temp_file in self.temp_dir.glob(task_temp_pattern):
+            for temp_file in self.intermediate_dir.glob(task_temp_pattern):
                 if temp_file.is_file():
                     temp_file.unlink()
                     logger.debug(f"Removed intermediate file: {temp_file}")
