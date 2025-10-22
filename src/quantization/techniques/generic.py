@@ -123,7 +123,8 @@ class GenericQuantizer(BaseQuantizer):
     def get_source_model_path(self, model_info: ModelInfo) -> Optional[Path]:
         """Get source model path for quantization.
 
-        Generic quantization works with HuggingFace models.
+        Generic quantization works with HuggingFace models and Ollama models.
+        For Ollama/GGUF models, they need to be converted to FP16 first.
 
         Args:
             model_info: Model to quantize
@@ -131,19 +132,27 @@ class GenericQuantizer(BaseQuantizer):
         Returns:
             Path to model directory, or None if not compatible
         """
-        # Generic quantization works with HuggingFace models
-        if model_info.provider != ProviderType.HUGGINGFACE:
+        # HuggingFace models - direct support
+        if model_info.provider == ProviderType.HUGGINGFACE:
+            # Check if model_id is a local path (from ./models directory or manual path)
+            if model_info.model_id:
+                model_path = Path(model_info.model_id)
+                # If it's an absolute path and exists, it's a local model
+                if model_path.exists() and model_path.is_absolute():
+                    return model_path
+
+            # model_id is HuggingFace ID (e.g., "Qwen/Qwen3-VL-4B-Instruct")
+            # Return None - transformers will find it in cache
             return None
 
-        # Check if model_id is a local path (from ./models directory or manual path)
-        if model_info.model_id:
-            model_path = Path(model_info.model_id)
-            # If it's an absolute path and exists, it's a local model
-            if model_path.exists() and model_path.is_absolute():
-                return model_path
+        # Ollama/GGUF models - use source_path (will be converted by orchestrator)
+        elif model_info.provider in [ProviderType.OLLAMA, ProviderType.GGUF]:
+            # The orchestrator will convert GGUF → FP16 GGUF
+            # Then we load the FP16 GGUF with transformers
+            if model_info.source_path:
+                return model_info.source_path
+            return None
 
-        # model_id is HuggingFace ID (e.g., "Qwen/Qwen3-VL-4B-Instruct")
-        # Return None - transformers will find it in cache
         return None
 
     def estimate_output_size(
