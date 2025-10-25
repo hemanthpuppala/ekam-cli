@@ -71,6 +71,7 @@ class BitsAndBytesQuantizer(BaseQuantizer):
         """Get source model path for quantization.
 
         BitsAndBytes works with HuggingFace models.
+        Note: Ollama/GGUF models are converted to HF format by orchestrator first.
 
         Args:
             model_info: Model to quantize
@@ -78,6 +79,16 @@ class BitsAndBytesQuantizer(BaseQuantizer):
         Returns:
             Path to model directory, or None if not compatible
         """
+        # Check if source_path is a converted HF directory (from Ollama/GGUF)
+        # The orchestrator updates source_path after GGUF→HF conversion
+        if model_info.source_path and model_info.source_path.exists():
+            # If it's a directory with config.json, it's a HF model
+            if model_info.source_path.is_dir():
+                config_file = model_info.source_path / "config.json"
+                if config_file.exists():
+                    logger.info(f"Using converted HF model: {model_info.source_path}")
+                    return model_info.source_path
+
         # BitsAndBytes works with HuggingFace models
         if model_info.provider != ProviderType.HUGGINGFACE:
             return None
