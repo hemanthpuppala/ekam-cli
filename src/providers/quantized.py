@@ -1,5 +1,6 @@
 """Quantized models provider - discovers models from results/quantizations/."""
 
+import gc
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -38,6 +39,29 @@ class QuantizedProvider(BaseProvider):
         logger.debug("Initialized model metadata cache")
 
         logger.info(f"QuantizedProvider initialized: {self.quantized_dir}")
+
+    def _cleanup_memory(self, device: str):
+        """Clean up memory before CPU fallback to maximize available RAM.
+
+        Args:
+            device: Current device ("mps", "cuda", or "cpu")
+        """
+        # Force garbage collection
+        gc.collect()
+        logger.debug("Garbage collection triggered")
+
+        # Clear GPU cache if on GPU
+        if device in ["cuda", "mps"]:
+            try:
+                import torch
+                if device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    logger.debug("CUDA cache cleared")
+                elif device == "mps":
+                    # MPS doesn't have explicit cache clearing, but we can still GC
+                    logger.debug("MPS memory freed via garbage collection")
+            except Exception as e:
+                logger.debug(f"Could not clear GPU cache: {e}")
 
     def discover_models(self) -> list[ModelInfo]:
         """Discover all quantized models.
@@ -873,6 +897,8 @@ class QuantizedProvider(BaseProvider):
                                                 if target_device != "cpu":
                                                     logger.debug(f"Device {target_device} has insufficient memory for VLM: {str(fallback_e)[:100]}")
                                                     logger.info(f"Falling back to CPU loading for VLM (model will run slower)")
+                                                    # Clean up memory before CPU fallback
+                                                    self._cleanup_memory(target_device)
                                                     # Final fallback: load on CPU
                                                     try:
                                                         load_kwargs["device_map"] = {"": "cpu"}
@@ -991,6 +1017,8 @@ class QuantizedProvider(BaseProvider):
                                     if device != "cpu":
                                         logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
                                         logger.info(f"Falling back to CPU loading (model will run slower)")
+                                        # Clean up memory before CPU fallback
+                                        self._cleanup_memory(device)
                                         # Final fallback: load on CPU
                                         try:
                                             model = AutoModelForCausalLM.from_pretrained(
@@ -1115,6 +1143,8 @@ class QuantizedProvider(BaseProvider):
                                                             if device != "cpu":
                                                                 logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
                                                                 logger.info(f"Falling back to CPU loading (model will run slower)")
+                                                                # Clean up memory before CPU fallback
+                                                                self._cleanup_memory(device)
                                                                 # Final fallback: load on CPU
                                                                 try:
                                                                     model = AutoModelForCausalLM.from_pretrained(
@@ -1240,6 +1270,8 @@ class QuantizedProvider(BaseProvider):
                                         if device != "cpu":
                                             logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
                                             logger.info(f"Falling back to CPU loading (model will run slower)")
+                                            # Clean up memory before CPU fallback
+                                            self._cleanup_memory(device)
                                             # Final fallback: load on CPU
                                             try:
                                                 model = AutoModelForCausalLM.from_pretrained(
@@ -1299,6 +1331,8 @@ class QuantizedProvider(BaseProvider):
                                         if device != "cpu":
                                             logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
                                             logger.info(f"Falling back to CPU loading (model will run slower)")
+                                            # Clean up memory before CPU fallback
+                                            self._cleanup_memory(device)
                                             # Final fallback: load on CPU
                                             try:
                                                 model = AutoModel.from_pretrained(
