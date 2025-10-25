@@ -750,27 +750,69 @@ class GenericQuantizer(BaseQuantizer):
             if not is_vlm:
                 # Load tokenizer for LLM (or VLM fallback)
                 logger.info("Loading tokenizer...")
-                try:
-                    logger.debug(f"Trying to load tokenizer with trust_remote_code from: {model_identifier}")
-                    with suppress_transformers_output():
-                        processor_or_tokenizer = AutoTokenizer.from_pretrained(
-                            model_identifier,
-                            trust_remote_code=True
-                        )
-                    logger.info("Tokenizer loaded successfully with trust_remote_code")
-                except Exception as e:
-                    last_error = e
-                    logger.warning(f"Could not load tokenizer with trust_remote_code: {e}")
 
-                    # Fallback: try without trust_remote_code
+                # For converted Ollama models (from GGUF→HF), the tokenizer won't be in the directory
+                # So we try multiple strategies:
+                tokenizer_sources = []
+
+                # Strategy 1: Direct path (HF model with tokenizer files)
+                tokenizer_sources.append((model_identifier, "Local model directory"))
+
+                # Strategy 2: Architecture-based default tokenizer
+                # For Ollama models converted to HF, use the architecture to get a canonical tokenizer
+                try:
+                    if Path(model_identifier).is_dir():
+                        # This is a local directory - check if it has tokenizer files
+                        dir_path = Path(model_identifier)
+                        has_tokenizer_files = any(
+                            (dir_path / f).exists()
+                            for f in ['tokenizer.json', 'tokenizer.model', 'vocab.json', 'tokenizer_config.json']
+                        )
+
+                        if not has_tokenizer_files:
+                            # Try to get architecture and load canonical tokenizer
+                            try:
+                                config = model.config
+                                model_type = config.model_type if hasattr(config, 'model_type') else None
+
+                                if model_type:
+                                    # Map model types to canonical HF tokenizer models
+                                    canonical_tokenizers = {
+                                        'gemma': 'google/gemma-7b',
+                                        'llama': 'meta-llama/Llama-2-7b',
+                                        'mistral': 'mistralai/Mistral-7B-v0.1',
+                                        'qwen2': 'Qwen/Qwen2-7B',
+                                        'gpt2': 'gpt2',
+                                        'phi': 'microsoft/phi-2',
+                                    }
+
+                                    canonical_model = canonical_tokenizers.get(model_type, model_type)
+                                    tokenizer_sources.append((canonical_model, f"Canonical tokenizer for {model_type}"))
+                                    logger.debug(f"Will try canonical tokenizer: {canonical_model}")
+                            except Exception as e:
+                                logger.debug(f"Could not detect architecture for canonical tokenizer: {e}")
+                except Exception as e:
+                    logger.debug(f"Error checking for tokenizer files: {e}")
+
+                # Try each tokenizer source
+                for tokenizer_source, description in tokenizer_sources:
                     try:
-                        logger.debug("Attempting to load tokenizer without trust_remote_code...")
+                        logger.debug(f"Attempting to load tokenizer: {description} from {tokenizer_source}")
                         with suppress_transformers_output():
-                            processor_or_tokenizer = AutoTokenizer.from_pretrained(model_identifier)
-                        logger.info("Tokenizer loaded successfully without trust_remote_code")
-                    except Exception as e2:
-                        last_error = e2
-                        logger.error(f"Tokenizer loading failed (second attempt): {e2}")
+                            processor_or_tokenizer = AutoTokenizer.from_pretrained(
+                                tokenizer_source,
+                                trust_remote_code=True
+                            )
+                        logger.info(f"✓ Tokenizer loaded successfully from: {description}")
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(f"Failed to load from {description}: {e}")
+                        continue
+
+                # If all attempts failed
+                if processor_or_tokenizer is None:
+                    logger.error(f"Could not load tokenizer from any source")
 
             if processor_or_tokenizer is None:
                 # All attempts failed - provide detailed error
