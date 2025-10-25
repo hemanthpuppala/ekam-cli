@@ -392,17 +392,61 @@ def ask_quantization_method(model_info: ModelInfo) -> str:
         model_info: Model to be quantized
 
     Returns:
-        "generic", "advanced", or "gguf_conversion"
+        "generic", "advanced", "gguf_conversion", "dequantization", "mlx", or "openvino"
 
     Raises:
         UserExitException: If user wants to exit
     """
     from ...models.endpoints import ProviderType, ModelType
 
-    # For pure GGUF files (not Ollama), only GGUF requantization is supported
-    # Ollama and HuggingFace models can use all quantization methods
+    # For pure GGUF files (not Ollama), show GGUF and dequantization options
     if model_info.provider == ProviderType.GGUF:
-        return "gguf"  # Pure GGUF files only support GGUF requantization
+        # GGUF models can be requantized or dequantized
+        # Show a simple menu with both options
+        tui.clear_screen()
+        menu_text = f"""[bold cyan]GGUF Model Options[/bold cyan]
+
+[bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)
+[bold]Provider:[/bold] GGUF
+
+[bold]1. GGUF Requantization[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓[/green]
+  • Re-quantize to different GGUF compression level
+  • Useful: Optimize existing quantization, change compression ratio
+  • Output: .gguf format
+
+[bold]2. Dequantization[/bold] [dim](→ FP16/FP32 GGUF or HuggingFace)[/dim] [green]✓[/green]
+  • Recover full precision from quantized GGUF
+  • Useful: Convert to other formats, recover full quality
+  • Outputs: FP16/FP32 GGUF or HuggingFace safetensors
+
+[bold]Navigation:[/bold]
+  [b] Go back | [m] Main menu | [h] Home
+"""
+        tui.show_panel(menu_text, title="GGUF Model Options", border_style="cyan")
+
+        while True:
+            choice = tui.prompt("Choose [1/2/b/m/h]:", style="cyan").strip().lower()
+
+            from .navigation import check_navigation_input, NavigationException, NavigationAction
+
+            nav_action = check_navigation_input(choice)
+            if nav_action:
+                if nav_action == NavigationAction.BACK:
+                    raise UserExitException("User cancelled")
+                elif nav_action == NavigationAction.MAIN_MENU:
+                    raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+                elif nav_action == NavigationAction.HOME:
+                    raise NavigationException(NavigationAction.HOME, "User requested home menu")
+
+            if choice == "1":
+                logger.info(f"User selected GGUF requantization for {model_info.name}")
+                return "gguf"
+            elif choice == "2":
+                logger.info(f"User selected dequantization for {model_info.name}")
+                return "dequantization"
+            else:
+                tui.show_error("Invalid choice. Enter 1, 2, or 'b' to go back")
+                continue
 
     # For Ollama and HuggingFace models, show the full quantization method menu
     # Check if CUDA GPU is available (required for Advanced methods)
@@ -528,16 +572,24 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   {"• Output: OpenVINO IR format" if has_openvino else "[dim]• Output: OpenVINO IR format[/dim]"}
   {"• " if has_openvino else ""}{"[red]Requires: pip install openvino optimum[openvino][/red]" if not has_openvino else ""}
 
+{f"[bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [green]✓ Available[/green]" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim][bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• Recover full precision from {'Ollama/quantized GGUF' if model_info.provider == ProviderType.OLLAMA else 'HuggingFace'} model" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Recover full precision from model[/dim]"}
+  {f"• Output: FP16/FP32 GGUF or HuggingFace safetensors" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Output: FP16/FP32 GGUF or HuggingFace safetensors[/dim]"}
+  {f"• Useful: Convert between formats, prepare for advanced quantization" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Useful: Convert between formats[/dim]"}
+
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
-[dim]Recommendation: {"Use Generic (1), Advanced (2), or MLX (4)" if is_vlm else "Use Advanced (2), MLX (4), or GGUF (3)"}[/dim]"""
+[dim]Recommendation: {"Use Generic (1), Advanced (2), or MLX (4)" if is_vlm else "Use Advanced (2), MLX (4), or GGUF (3)"}{"" if model_info.provider != ProviderType.OLLAMA else " (or Dequantization (6) for Ollama models)"}[/dim]"""
         # Determine valid choices
         base_choices = ["1", "2"] if is_vlm else ["1", "2", "3"]
         if is_apple_silicon and has_mlx:
             base_choices.append("4")
         if has_openvino:
             base_choices.append("5")
+        # Add dequantization for Ollama and HF models (non-VLM)
+        if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE]:
+            base_choices.append("6")
         valid_choices = base_choices
     else:
         # No CUDA - show all 3 options but gray out Advanced
@@ -591,6 +643,11 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   {"• Output: OpenVINO IR format" if has_openvino else "[dim]• Output: OpenVINO IR format[/dim]"}
   {"• " if has_openvino else ""}{"[red]Requires: pip install openvino optimum[openvino][/red]" if not has_openvino else ""}
 
+{f"[bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [green]✓ Available[/green]" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim][bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• Recover full precision from {'Ollama/quantized GGUF' if model_info.provider == ProviderType.OLLAMA else 'HuggingFace'} model" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Recover full precision from model[/dim]"}
+  {f"• Output: FP16/FP32 GGUF or HuggingFace safetensors" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Output: FP16/FP32 GGUF or HuggingFace safetensors[/dim]"}
+  {f"• Useful: Convert between formats, prepare for advanced quantization" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Useful: Convert between formats[/dim]"}
+
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
@@ -607,13 +664,16 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
             base_choices.append("4")  # MLX
         if has_openvino:
             base_choices.append("5")  # OpenVINO
+        # Add dequantization for Ollama and HF models (non-VLM)
+        if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE]:
+            base_choices.append("6")
         valid_choices = base_choices
 
     tui.show_panel(menu_text, title="Quantization Method Selection", border_style="cyan")
 
     while True:
         # Dynamic prompt based on available options
-        choice = tui.prompt("Choose [1/2/3/4/5/b/m/h]:", style="cyan").strip().lower()
+        choice = tui.prompt("Choose [1/2/3/4/5/6/b/m/h]:", style="cyan").strip().lower()
 
         # Check for navigation hotkeys
         from .navigation import check_navigation_input, NavigationException, NavigationAction
@@ -666,6 +726,9 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
         elif choice == "5":
             logger.info(f"User selected OpenVINO quantization for {model_info.name}")
             return "openvino"
+        elif choice == "6":
+            logger.info(f"User selected Dequantization for {model_info.name}")
+            return "dequantization"
 
 
 def ask_vlm_quantization_scope(model_info: ModelInfo, quant_method: str = None) -> str:

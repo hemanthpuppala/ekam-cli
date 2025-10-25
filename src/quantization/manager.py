@@ -85,24 +85,42 @@ class QuantizationManager:
         Args:
             model_info: Model to quantize
             use_gpu: Whether GPU will be used
-            method: Quantization method ("generic", "advanced", "gguf", "gguf_conversion", "mlx", "openvino")
+            method: Quantization method ("generic", "advanced", "gguf", "gguf_conversion", "dequantization", "mlx", "openvino")
 
         Returns:
             List of recommendations
         """
         from ..models.provider import ProviderType
 
-        # GGUF models: Direct quantization
+        # GGUF models: Direct quantization or dequantization
         if model_info.provider == ProviderType.GGUF:
-            return get_quantization_recommendations(
-                model_info=model_info,
-                system_specs=self.system_specs,
-                method_family="GGUF",
-                use_gpu=use_gpu,
-            )
-        # HuggingFace models: Support Generic, Advanced, and GGUF conversion
+            if method == "dequantization":
+                # Dequantization: Convert quantized GGUF to full precision
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Dequantization",
+                    use_gpu=use_gpu,
+                )
+            else:
+                # Default: GGUF requantization (Q4→Q3, Q4→Q5, etc.)
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="GGUF",
+                    use_gpu=use_gpu,
+                )
+        # HuggingFace models: Support Generic, Advanced, GGUF conversion, Dequantization, MLX, OpenVINO
         elif model_info.provider == ProviderType.HUGGINGFACE:
-            if method == "gguf_conversion":
+            if method == "dequantization":
+                # Dequantization: Convert to full precision GGUF or HF format
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Dequantization",
+                    use_gpu=use_gpu,
+                )
+            elif method == "gguf_conversion":
                 # GGUF conversion + quantization
                 return get_quantization_recommendations(
                     model_info=model_info,
@@ -142,10 +160,18 @@ class QuantizationManager:
                     method_family="Generic",
                     use_gpu=use_gpu,
                 )
-        # Ollama models: GGUF requantization is primary, also support conversions
+        # Ollama models: GGUF requantization, dequantization, or conversions
         elif model_info.provider == ProviderType.OLLAMA:
             # Ollama models are GGUF-based, route based on method
-            if method == "gguf" or method == "gguf_conversion":
+            if method == "dequantization":
+                # Dequantization: Convert quantized GGUF to full precision
+                return get_quantization_recommendations(
+                    model_info=model_info,
+                    system_specs=self.system_specs,
+                    method_family="Dequantization",
+                    use_gpu=use_gpu,
+                )
+            elif method == "gguf" or method == "gguf_conversion":
                 # GGUF requantization (Q4→Q3, Q4→Q5, etc.)
                 return get_quantization_recommendations(
                     model_info=model_info,
@@ -240,13 +266,23 @@ class QuantizationManager:
         base_name = f"{clean_model_id}_{module_prefix}{quant_type.value}"
 
         # Determine output type: directory or file
-        # GGUF quantization outputs to .gguf files
-        # All others (MLX, OpenVINO, Generic, GPTQ, AWQ, BnB) output to directories using save_pretrained()
-        if module == QuantizationModule.LLAMA_CPP:
+        # GGUF outputs (.gguf files):
+        #   - GGUF quantization (Q4/Q5/Q6/Q8)
+        #   - Dequantization to GGUF (DEQUANT_FP16_GGUF, DEQUANT_FP32_GGUF)
+        # Directory outputs (save_pretrained):
+        #   - MLX, OpenVINO, Generic, GPTQ, AWQ, BnB
+        #   - Dequantization to HF (DEQUANT_FP16_HF, DEQUANT_FP32_HF)
+
+        is_gguf_output = (
+            module == QuantizationModule.LLAMA_CPP and
+            "_hf" not in quant_type.value  # HF formats contain "_hf" in the enum value
+        )
+
+        if is_gguf_output:
             # GGUF outputs to files with .gguf extension
             output_filename = f"{base_name}.gguf"
             output_path = self.output_dir / output_filename
-            
+
             # Handle conflicts: if file exists, append number before extension
             if output_path.exists():
                 counter = 1
@@ -256,9 +292,10 @@ class QuantizationManager:
                 logger.info(f"Output file exists, using: {output_path.name}")
         else:
             # Directory output for MLX, OpenVINO, Generic, GPTQ, AWQ, BnB
+            # Also for HF dequantization outputs
             # All these use save_pretrained() which creates a directory with model files
             output_path = self.output_dir / base_name
-            
+
             # Handle conflicts: if directory exists, append number
             if output_path.exists():
                 counter = 1

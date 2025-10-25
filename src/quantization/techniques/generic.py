@@ -779,6 +779,8 @@ class GenericQuantizer(BaseQuantizer):
                                     # Map model types to canonical HF tokenizer models
                                     canonical_tokenizers = {
                                         'gemma': 'google/gemma-7b',
+                                        'gemma2': 'google/gemma2-9b',
+                                        'gemma3': 'google/gemma3-8b',
                                         'llama': 'meta-llama/Llama-2-7b',
                                         'mistral': 'mistralai/Mistral-7B-v0.1',
                                         'qwen2': 'Qwen/Qwen2-7B',
@@ -786,7 +788,21 @@ class GenericQuantizer(BaseQuantizer):
                                         'phi': 'microsoft/phi-2',
                                     }
 
-                                    canonical_model = canonical_tokenizers.get(model_type, model_type)
+                                    # Try exact match first, then try base type (for variants like "gemma3" -> "gemma")
+                                    canonical_model = canonical_tokenizers.get(model_type)
+
+                                    if not canonical_model:
+                                        # Try to extract base type (e.g., "gemma3" -> "gemma")
+                                        import re
+                                        base_match = re.match(r'^([a-z]+)', model_type)
+                                        if base_match:
+                                            base_type = base_match.group(1)
+                                            canonical_model = canonical_tokenizers.get(base_type)
+
+                                        if not canonical_model:
+                                            # Last resort: use model_type as-is (will likely fail, but provides useful error)
+                                            canonical_model = model_type
+
                                     tokenizer_sources.append((canonical_model, f"Canonical tokenizer for {model_type}"))
                                     logger.debug(f"Will try canonical tokenizer: {canonical_model}")
                             except Exception as e:
@@ -796,19 +812,33 @@ class GenericQuantizer(BaseQuantizer):
 
                 # Try each tokenizer source
                 for tokenizer_source, description in tokenizer_sources:
-                    try:
-                        logger.debug(f"Attempting to load tokenizer: {description} from {tokenizer_source}")
-                        with suppress_transformers_output():
-                            processor_or_tokenizer = AutoTokenizer.from_pretrained(
-                                tokenizer_source,
-                                trust_remote_code=True
-                            )
-                        logger.info(f"✓ Tokenizer loaded successfully from: {description}")
+                    # Special handling for gemma3 and gemma2: if primary fails, try fallbacks
+                    sources_to_try = [tokenizer_source]
+                    if tokenizer_source == 'google/gemma3-8b':
+                        sources_to_try.extend(['google/gemma2-9b', 'google/gemma-7b'])
+                    elif tokenizer_source == 'google/gemma2-9b':
+                        sources_to_try.append('google/gemma-7b')
+
+                    for current_source in sources_to_try:
+                        try:
+                            logger.debug(f"Attempting to load tokenizer: {description} from {current_source}")
+                            with suppress_transformers_output():
+                                processor_or_tokenizer = AutoTokenizer.from_pretrained(
+                                    current_source,
+                                    trust_remote_code=True
+                                )
+                            logger.info(f"✓ Tokenizer loaded successfully from: {description} ({current_source})")
+                            break
+                        except Exception as e:
+                            last_error = e
+                            logger.debug(f"Failed to load from {current_source}: {e}")
+                            if current_source != sources_to_try[-1]:
+                                logger.debug(f"Trying fallback source...")
+                            continue
+
+                    # If we successfully loaded the tokenizer, break out of outer loop
+                    if processor_or_tokenizer is not None:
                         break
-                    except Exception as e:
-                        last_error = e
-                        logger.debug(f"Failed to load from {description}: {e}")
-                        continue
 
                 # If all attempts failed
                 if processor_or_tokenizer is None:

@@ -20,7 +20,7 @@ def get_quantization_recommendations(
     Args:
         model_info: Model to quantize
         system_specs: System specifications
-        method_family: Quantization method family (GGUF, GPTQ, AWQ, BNB, Advanced, Generic)
+        method_family: Quantization method family (GGUF, GPTQ, AWQ, BNB, Advanced, Generic, Dequantization, MLX, OpenVINO)
         use_gpu: Whether GPU is available and will be used
 
     Returns:
@@ -32,6 +32,8 @@ def get_quantization_recommendations(
         recommendations = _get_generic_recommendations(model_info, system_specs, use_gpu)
     elif method_family == "GGUF":
         recommendations = _get_gguf_recommendations(model_info, system_specs)
+    elif method_family == "Dequantization":
+        recommendations = _get_dequantization_recommendations(model_info, system_specs)
     elif method_family == "MLX":
         recommendations = _get_mlx_recommendations(model_info, system_specs)
     elif method_family == "OpenVINO":
@@ -556,7 +558,7 @@ def _get_openvino_recommendations(
     model_info: ModelInfo, system_specs: SystemSpecs
 ) -> list[QuantizationRecommendation]:
     """Get OpenVINO quantization recommendations (Intel CPU/iGPU).
-    
+
     OpenVINO NNCF supports: INT4, INT8, FP16
     NOT supported: INT2, INT3, INT5, INT6 (not available in NNCF)
     """
@@ -606,6 +608,135 @@ def _get_openvino_recommendations(
                 quality_score=quality,
                 speed_score=speed,
                 best_for=best_for + " (Intel CPUs/iGPUs)",
+                requires_gpu=False,
+                is_available=is_available,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    return recommendations
+
+
+def _get_dequantization_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs
+) -> list[QuantizationRecommendation]:
+    """Get dequantization/conversion recommendations (convert to full precision format).
+
+    Supports:
+    1. Quantized GGUF → FP16/FP32 GGUF (dequantization)
+    2. Quantized GGUF → FP16/FP32 HuggingFace (dequantization + conversion)
+    3. Ollama models → FP16/FP32 GGUF or HF (conversion)
+    4. HuggingFace models → FP16/FP32 GGUF or HF (format conversion)
+
+    Useful for:
+    1. Converting Ollama models to other frameworks
+    2. Recovering full quality from quantized models
+    3. Converting between model formats while ensuring full precision
+    4. Preparing models for advanced quantization (GPTQ, AWQ, etc.)
+    """
+    from ...models.endpoints import ModelType
+
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    # Determine source model availability
+    from ...models.provider import ProviderType
+    is_gguf_file = model_info.provider == ProviderType.GGUF
+    is_ollama_model = model_info.provider == ProviderType.OLLAMA
+    is_hf_model = model_info.provider == ProviderType.HUGGINGFACE
+
+    # Check if source exists
+    has_source = False
+    source_type = None
+
+    if is_gguf_file:
+        # For GGUF files, check local disk
+        has_source = bool(model_info.source_path and model_info.source_path.exists() and model_info.source_path.suffix.lower() == ".gguf")
+        source_type = "gguf_file"
+    elif is_ollama_model:
+        # For Ollama models, check model_id exists (managed by Ollama, not local disk)
+        has_source = bool(model_info.model_id)
+        source_type = "ollama"
+    elif is_hf_model:
+        # For HF models, they can be local or remote - just need model_id
+        has_source = bool(model_info.model_id)
+        source_type = "huggingface"
+
+    # Dequantization configurations: (type, size_factor, quality, speed, best_for)
+    # Quality is always high (recovering full precision)
+    # Speed depends on conversion complexity
+    dequant_configs = [
+        # GGUF outputs: Single-step dequantization (faster)
+        (QuantizationType.DEQUANT_FP16_GGUF, 2.0, 10, 8, "Ollama/llama.cpp, full FP16 quality"),
+        (QuantizationType.DEQUANT_FP32_GGUF, 4.0, 10, 7, "Ollama/llama.cpp, maximum precision"),
+        # HF outputs: Two-step conversion (slower but more compatible)
+        (QuantizationType.DEQUANT_FP16_HF, 2.0, 10, 7, "HuggingFace, PyTorch, TransformersJS"),
+        (QuantizationType.DEQUANT_FP32_HF, 4.0, 10, 6, "HuggingFace, maximum precision"),
+    ]
+
+    for quant_type, size_factor, quality, speed, best_for in dequant_configs:
+        estimated_size = original_size_gb * size_factor
+
+        # Time estimates
+        # GGUF file: ~1-2 min per GB (direct dequantization)
+        # Ollama: ~2-3 min per GB (pull + dequantize)
+        # HF→GGUF: ~3-4 min per GB (convert + dequant)
+        # HF→HF: ~2-3 min per GB (format conversion)
+        is_hf_output = "hf" in quant_type.value
+
+        if source_type == "gguf_file" and not is_hf_output:
+            time_per_gb = 1.5  # Direct GGUF dequant
+        elif source_type == "ollama" and not is_hf_output:
+            time_per_gb = 2.0  # Ollama pull + dequant
+        elif is_hf_output:
+            time_per_gb = 3.5  # Two-step conversion
+        else:
+            time_per_gb = 2.5  # Default
+
+        estimated_time = original_size_gb * time_per_gb
+
+        # Determine availability - support all three model types
+        if not has_source:
+            is_available = False
+            if is_gguf_file:
+                unavailable_reason = "Source GGUF file not found on disk."
+            elif is_ollama_model:
+                unavailable_reason = "Ollama model not registered. Install via: ollama pull <model>"
+            else:
+                unavailable_reason = "HuggingFace model identifier not found."
+            reason = f"{quant_type.display_name}: NOT available. {unavailable_reason}"
+        else:
+            is_available = True
+            unavailable_reason = ""
+            reason = f"{quant_type.display_name}: "
+
+            # Add operation description based on source and target
+            if is_hf_output:
+                if source_type == "gguf_file" or source_type == "ollama":
+                    reason += f"Convert GGUF → FP{32 if 'fp32' in quant_type.value else 16} HuggingFace. "
+                else:
+                    reason += f"Convert to FP{32 if 'fp32' in quant_type.value else 16} HuggingFace format. "
+            else:
+                reason += f"Dequantize → FP{32 if 'fp32' in quant_type.value else 16} GGUF. "
+
+            # Add RAM check
+            if estimated_size < system_specs.available_ram_gb * 0.7:
+                reason += f"Fits in RAM ({estimated_size:.1f}GB / {system_specs.available_ram_gb:.1f}GB). "
+            else:
+                reason += f"⚠️  May need {estimated_size:.1f}GB (available: {system_specs.available_ram_gb:.1f}GB). "
+
+            reason += f"Est. time: ~{estimated_time:.0f} min."
+
+        recommendations.append(
+            QuantizationRecommendation(
+                quant_type=quant_type,
+                module=QuantizationModule.LLAMA_CPP,
+                reason=reason,
+                estimated_size_gb=estimated_size,
+                estimated_time_minutes=estimated_time,
+                quality_score=quality,
+                speed_score=speed,
+                best_for=best_for,
                 requires_gpu=False,
                 is_available=is_available,
                 unavailable_reason=unavailable_reason,

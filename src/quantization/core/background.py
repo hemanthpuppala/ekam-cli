@@ -15,6 +15,7 @@ from ..techniques.awq import AWQQuantizer
 from ..techniques.bnb import BitsAndBytesQuantizer
 from ..techniques.mlx import MLXQuantizer
 from ..techniques.openvino import OpenVINOQuantizer
+from ..techniques.dequantization import DequantizationQuantizer
 from ..models import QuantizationTask, TaskStatus, QuantizationModule
 from ..orchestrator import QuantizationOrchestrator
 
@@ -41,6 +42,7 @@ class BackgroundJobManager:
         self.bnb_quantizer = BitsAndBytesQuantizer()
         self.mlx_quantizer = MLXQuantizer()
         self.openvino_quantizer = OpenVINOQuantizer()
+        self.dequantization_quantizer = DequantizationQuantizer()
 
         # Initialize orchestrator for multi-step conversions
         self.orchestrator = QuantizationOrchestrator()
@@ -136,6 +138,8 @@ class BackgroundJobManager:
                         success = self.awq_quantizer.quantize(task, progress_wrapper)
                     elif method_family == "BitsAndBytes":
                         success = self.bnb_quantizer.quantize(task, progress_wrapper)
+                    elif method_family == "Dequantization":
+                        success = self.dequantization_quantizer.quantize(task, progress_wrapper)
                     else:
                         task.status = TaskStatus.FAILED
                         task.error = f"Quantization method {method_family} not yet implemented"

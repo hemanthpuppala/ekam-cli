@@ -54,6 +54,12 @@ class QuantizationType(Enum):
     BNB_4BIT_NF4 = "bnb_4bit_nf4"
     BNB_4BIT_FP4 = "bnb_4bit_fp4"
 
+    # Dequantization options (convert quantized models to full precision)
+    DEQUANT_FP16_GGUF = "dequant_fp16_gguf"  # Any quant → FP16 GGUF (for llama.cpp/Ollama)
+    DEQUANT_FP16_HF = "dequant_fp16_hf"      # Any quant → FP16 HuggingFace safetensors
+    DEQUANT_FP32_GGUF = "dequant_fp32_gguf"  # Any quant → FP32 GGUF
+    DEQUANT_FP32_HF = "dequant_fp32_hf"      # Any quant → FP32 HuggingFace safetensors
+
     @property
     def display_name(self) -> str:
         """Human-readable name."""
@@ -82,6 +88,11 @@ class QuantizationType(Enum):
             self.BNB_8BIT: "BitsAndBytes 8-bit",
             self.BNB_4BIT_NF4: "BitsAndBytes 4-bit NF4",
             self.BNB_4BIT_FP4: "BitsAndBytes 4-bit FP4",
+            # Dequantization
+            self.DEQUANT_FP16_GGUF: "Dequant → FP16 GGUF",
+            self.DEQUANT_FP16_HF: "Dequant → FP16 HuggingFace",
+            self.DEQUANT_FP32_GGUF: "Dequant → FP32 GGUF",
+            self.DEQUANT_FP32_HF: "Dequant → FP32 HuggingFace",
         }
         return names.get(self, self.value)
 
@@ -96,13 +107,19 @@ class QuantizationType(Enum):
             return ".safetensors"
         elif "awq" in self.value:
             return ".safetensors"
+        elif "dequant" in self.value:
+            # Dequantization: GGUF or HF based on type
+            if "gguf" in self.value:
+                return ".gguf"
+            else:
+                return ".safetensors"
         else:  # BitsAndBytes
             return ".safetensors"
 
     @property
     def method_family(self) -> str:
-        """Quantization method family (Generic, GGUF, GPTQ, AWQ, BNB).
-        
+        """Quantization method family (Generic, GGUF, GPTQ, AWQ, BNB, Dequantization).
+
         Returns:
             Method family string for categorization and UI display
         """
@@ -118,6 +135,9 @@ class QuantizationType(Enum):
         # AWQ quantization (Activation-aware Weight Quantization)
         elif "awq" in self.value:
             return "AWQ"
+        # Dequantization (convert quantized models to full precision)
+        elif "dequant" in self.value:
+            return "Dequantization"
         # BitsAndBytes quantization (HuggingFace native)
         else:
             return "BitsAndBytes"

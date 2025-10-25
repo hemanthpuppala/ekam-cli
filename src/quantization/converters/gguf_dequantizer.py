@@ -93,16 +93,18 @@ class GGUFDequantizer(BaseConverter):
         source_path: Path,
         output_path: Path,
         progress_callback: Optional[Callable[[float, Optional[float]], None]] = None,
+        target_precision: str = "f16",
     ) -> bool:
-        """Dequantize GGUF to FP16.
+        """Dequantize GGUF to full precision (FP16 or FP32).
 
         Note: llama.cpp doesn't have a direct dequantize command.
-        We use F16 quantization type which effectively means "no quantization".
+        We use F16/F32 quantization types which effectively means "no quantization".
 
         Args:
             source_path: Path to quantized GGUF file
-            output_path: Path for FP16 GGUF output
+            output_path: Path for dequantized GGUF output
             progress_callback: Optional progress callback
+            target_precision: Target precision ("f16" or "f32"). Defaults to "f16".
 
         Returns:
             True if successful
@@ -113,17 +115,26 @@ class GGUFDequantizer(BaseConverter):
             logger.error(message)
             return False
 
-        logger.info(f"Dequantizing {source_path} to FP16: {output_path}")
+        # Validate target precision
+        target_precision = target_precision.lower()
+        if target_precision not in ["f16", "f32"]:
+            logger.error(f"Invalid target precision: {target_precision}. Use 'f16' or 'f32'")
+            return False
+
+        precision_name = "FP32" if target_precision == "f32" else "FP16"
+        precision_type = "F32" if target_precision == "f32" else "F16"
+
+        logger.info(f"Dequantizing {source_path} to {precision_name}: {output_path}")
 
         try:
-            # Use F16 type for dequantization
+            # Use F16/F32 type for dequantization
             # Need --allow-requantize because source is already quantized
             cmd = [
                 str(self.quantize_binary),
                 "--allow-requantize",  # Required for requantizing from quantized models
                 str(source_path),
                 str(output_path),
-                "F16",  # FP16 quantization (effectively dequantization)
+                precision_type,  # FP16 or FP32 quantization (effectively dequantization)
             ]
 
             logger.info(f"Running: {' '.join(cmd)}")
@@ -162,21 +173,24 @@ class GGUFDequantizer(BaseConverter):
             logger.error(f"Dequantization error: {e}", exc_info=True)
             return False
 
-    def estimate_output_size(self, source_path: Path) -> float:
-        """Estimate FP16 output size.
+    def estimate_output_size(self, source_path: Path, target_precision: str = "f16") -> float:
+        """Estimate dequantized output size.
 
         FP16 is approximately 2x the size of Q4 and 1.8x the size of Q8.
+        FP32 is approximately 4x the size of Q4.
 
         Args:
             source_path: Source GGUF file
+            target_precision: Target precision ("f16" or "f32")
 
         Returns:
             Estimated size in GB
         """
         try:
             source_size_gb = source_path.stat().st_size / (1024**3)
-            # Rough estimate: FP16 is 2x Q4_K_M
-            return source_size_gb * 2.0
+            # Rough estimate based on target precision
+            factor = 4.0 if target_precision.lower() == "f32" else 2.0
+            return source_size_gb * factor
         except Exception:
             return 0.0
 
@@ -186,4 +200,4 @@ class GGUFDequantizer(BaseConverter):
         Returns:
             Description string
         """
-        return "GGUF Dequantizer (Quantized → FP16)"
+        return "GGUF Dequantizer (Quantized → FP16/FP32)"
