@@ -35,6 +35,7 @@ import torch
 from loguru import logger
 
 from .base import BaseConverter
+from .gguf_dequant import Dequantizer, QuantType as DequantQuantType
 
 
 class GGUFValueType(Enum):
@@ -302,6 +303,39 @@ class GGUFReader:
         self.tensors: Dict[str, Dict[str, Any]] = {}
         self.architecture: Optional[str] = None
 
+    def _estimate_bytes_per_element(self, quant_type: "GGMLQuantizationType", n_elements: int) -> int:
+        """Estimate bytes needed for tensor data based on quantization type.
+
+        Args:
+            quant_type: GGML quantization type
+            n_elements: Number of elements in tensor
+
+        Returns:
+            Estimated number of bytes
+        """
+        # Bytes per element for each type (approximate)
+        bytes_map = {
+            GGMLQuantizationType.F32: 4,      # 32-bit float
+            GGMLQuantizationType.F16: 2,      # 16-bit float
+            GGMLQuantizationType.Q8_0: (34 * n_elements) // 32,  # 2 scale + 32 values per block
+            GGMLQuantizationType.Q8_1: (36 * n_elements) // 32,  # 2 scale + 2 offset + 32 values
+            GGMLQuantizationType.Q4_0: (18 * n_elements) // 32,  # 2 scale + 16 packed 4-bit values
+            GGMLQuantizationType.Q4_1: (20 * n_elements) // 32,  # 2 scale + 2 min + 16 packed 4-bit values
+            GGMLQuantizationType.Q4_K: (n_elements + 127) // 128,  # ~1 byte per element (blocks of 256)
+            GGMLQuantizationType.Q5_0: (22 * n_elements) // 32,
+            GGMLQuantizationType.Q5_1: (24 * n_elements) // 32,
+            GGMLQuantizationType.Q5_K: (n_elements + 127) // 128,
+            GGMLQuantizationType.Q6_K: ((n_elements * 3) + 127) // 128,
+            GGMLQuantizationType.Q2_K: (n_elements + 255) // 256,
+            GGMLQuantizationType.Q3_K: ((n_elements + 32) // 33) * 16,
+            GGMLQuantizationType.I8: 1,
+            GGMLQuantizationType.I16: 2,
+            GGMLQuantizationType.I32: 4,
+            GGMLQuantizationType.I64: 8,
+        }
+
+        return bytes_map.get(quant_type, (n_elements * 4))  # Default to 4 bytes per element
+
     def read(self) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
         """Read and parse GGUF file.
 
@@ -470,28 +504,42 @@ class GGUFReader:
             # Calculate number of elements
             n_elements = int(np.prod(shape))
 
-            # Read and dequantize based on quantization type
-            if quant_type == GGMLQuantizationType.F32:
-                # Read FP32 directly
-                data = np.fromfile(f, dtype=np.float32, count=n_elements)
-                tensor = torch.from_numpy(data).reshape(shape)
+            # Read raw tensor data
+            # Calculate bytes needed (estimate based on quant type)
+            bytes_per_element = self._estimate_bytes_per_element(quant_type, n_elements)
+            raw_data = f.read(bytes_per_element)
 
-            elif quant_type == GGMLQuantizationType.F16:
-                # Read FP16 directly
-                data = np.fromfile(f, dtype=np.float16, count=n_elements)
+            try:
+                # Dequantize using universal dequantizer
+                if quant_type == GGMLQuantizationType.F32:
+                    # Read FP32 directly
+                    data = np.frombuffer(raw_data, dtype=np.float32, count=n_elements)
+
+                elif quant_type == GGMLQuantizationType.F16:
+                    # Read FP16 and convert to FP32
+                    data = np.frombuffer(raw_data, dtype=np.float16, count=n_elements).astype(np.float32)
+
+                else:
+                    # Use universal dequantizer for all quantized formats
+                    try:
+                        # Map GGML type to Dequant type
+                        dequant_type = DequantQuantType(quant_type.value)
+                        data = Dequantizer.dequantize(raw_data, dequant_type, n_elements)
+                        logger.debug(f"Dequantized {name} from {quant_type.name}")
+                    except (ValueError, NotImplementedError) as e:
+                        logger.warning(f"Dequantization for {quant_type.name} not supported: {e}")
+                        logger.warning(f"Skipping tensor {name}")
+                        continue
+
+                # Reshape and convert to tensor
                 tensor = torch.from_numpy(data).reshape(shape).to(torch.float32)
+                tensors[name] = tensor
+                logger.debug(f"Loaded tensor: {name} {list(shape)} ({quant_type.name})")
 
-            else:
-                # Quantized format - needs dequantization
-                logger.warning(
-                    f"Tensor {name} uses quantization {quant_type.name}, "
-                    f"dequantization required but not yet implemented. "
-                    f"Skipping tensor."
-                )
+            except Exception as e:
+                logger.error(f"Failed to process tensor {name}: {e}")
+                logger.debug(f"Raw data size: {len(raw_data)} bytes, expected ~{bytes_per_element}")
                 continue
-
-            tensors[name] = tensor
-            logger.debug(f"Loaded tensor: {name} {list(shape)} ({quant_type.name})")
 
         return tensors
 
