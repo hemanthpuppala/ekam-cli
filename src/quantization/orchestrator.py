@@ -17,13 +17,14 @@ Examples:
 """
 
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 from enum import Enum
 
 from loguru import logger
 
 from ..models.model import ModelInfo
 from ..models.provider import ProviderType
+from ..models.endpoints import ModelType
 from .models import QuantizationTask, QuantizationType, TaskStatus
 from .converters.gguf_dequantizer import GGUFDequantizer
 from .converters.gguf_to_hf import GGUFToHFConverter
@@ -37,6 +38,25 @@ class ConversionPath(Enum):
     GGUF_TO_MLX = "gguf_to_mlx"  # GGUF → FP16 → MLX
     GGUF_TO_OPENVINO = "gguf_to_openvino"  # GGUF → FP16 → OpenVINO
     GGUF_TO_ADVANCED = "gguf_to_advanced"  # GGUF → FP16 → HF → GPTQ/AWQ/BnB
+
+
+class QuantizationDirective(Enum):
+    """Instructions from orchestrator to quantizer about what to do.
+
+    Used to tell quantizers whether to:
+    - SKIP: Stop after conversion (FP16 is already final output)
+    - QUANTIZE_INT8: Convert to INT8 after conversion to FP16
+    - QUANTIZE_INT4: Convert to INT4 after conversion to FP16
+    - QUANTIZE: Generic quantization instruction (use method_family to determine exact type)
+    """
+    SKIP = "skip"  # FP16 generic: Final output ready, no quantization needed
+    QUANTIZE_INT8 = "quantize_int8"  # INT8 generic: Need to apply INT8 quantization
+    QUANTIZE_INT4 = "quantize_int4"  # INT4 generic: Need to apply INT4 quantization
+    QUANTIZE = "quantize"  # Generic quantization: Let quantizer decide based on type
+    CONTINUE_GGUF = "continue_gguf"  # GGUF re-quantization: Proceed with quantizer
+    CONTINUE_MLX = "continue_mlx"  # MLX quantization: Let MLX quantizer handle
+    CONTINUE_OPENVINO = "continue_openvino"  # OpenVINO: Let OpenVINO quantizer handle
+    CONTINUE_ADVANCED = "continue_advanced"  # Advanced (GPTQ/AWQ/BnB): Let quantizer handle
 
 
 class QuantizationOrchestrator:
@@ -65,46 +85,121 @@ class QuantizationOrchestrator:
 
     def determine_conversion_path(
         self, model_info: ModelInfo, target_quant_type: QuantizationType
-    ) -> ConversionPath:
-        """Determine the conversion path needed for quantization.
+    ) -> Tuple[ConversionPath, QuantizationDirective]:
+        """Determine the conversion path and quantization directive.
+
+        Orchestrator is intelligent about what needs to happen:
+        - FP16 is NOT a quantization, it's just dtype conversion (final output after conversion)
+        - INT8/INT4/etc are real quantizations (require quantizer after conversion)
+        - VLMs (Vision-Language Models) have special restrictions
 
         Args:
             model_info: Source model information
             target_quant_type: Target quantization type
 
         Returns:
-            ConversionPath enum indicating the required workflow
+            Tuple of (ConversionPath, QuantizationDirective) indicating workflow and what quantizer should do
+
+        Raises:
+            ValueError: If VLM is selected with unsupported quantization method
         """
+        # Check if this is a VLM (Vision-Language Model)
+        is_vlm = model_info.model_type == ModelType.VLM
+
         # Check source provider
         is_ollama = model_info.provider == ProviderType.OLLAMA
         is_gguf = model_info.provider == ProviderType.GGUF
         is_hf = model_info.provider == ProviderType.HUGGINGFACE
 
-        # Check target quantization family
+        # Check target quantization type and family
         target_family = target_quant_type.method_family
 
-        # CASE 1: GGUF/Ollama → GGUF quantization (direct requantization)
-        if (is_ollama or is_gguf) and target_family == "GGUF":
-            return ConversionPath.DIRECT
+        # ========== VLM INCOMPATIBILITY CHECKS ==========
+        # GGUF: VLMs cannot be converted to GGUF (llama.cpp doesn't support vision encoders)
+        if is_vlm and target_family == "GGUF":
+            raise ValueError(
+                f"❌ GGUF quantization is NOT supported for Vision-Language Models (VLMs)\n\n"
+                f"Why: llama.cpp doesn't support vision encoders (CLIP, ViT) or multimodal architectures.\n\n"
+                f"Available alternatives for VLMs:\n"
+                f"  • Generic FP16 (size: 50%, quality: perfect) - RECOMMENDED\n"
+                f"  • Generic INT8 (size: 25%, CUDA required, component-level with language-only)\n"
+                f"  • Generic INT4 (size: 12.5%, CUDA required, component-level with language-only)\n"
+                f"  • BitsAndBytes (HuggingFace integration, CUDA required)\n"
+                f"  • MLX INT4 (Apple Silicon, component-level support)\n"
+            )
 
-        # CASE 2: Ollama/GGUF → Generic/MLX/OpenVINO/Advanced
-        # Needs dequantization + format conversion
+        # GPTQ: Not designed for VLMs
+        if is_vlm and target_family == "GPTQ":
+            raise ValueError(
+                f"❌ GPTQ quantization is NOT supported for Vision-Language Models (VLMs)\n\n"
+                f"Why: GPTQ is specifically designed for language-only models.\n\n"
+                f"Available alternatives for VLMs:\n"
+                f"  • Generic FP16 (RECOMMENDED) or INT8/INT4\n"
+                f"  • BitsAndBytes (CUDA required)\n"
+                f"  • MLX INT4 (Apple Silicon)\n"
+            )
+
+        # AWQ: Not designed for VLMs
+        if is_vlm and target_family == "AWQ":
+            raise ValueError(
+                f"❌ AWQ quantization is NOT supported for Vision-Language Models (VLMs)\n\n"
+                f"Why: AWQ is specifically designed for language-only models.\n\n"
+                f"Available alternatives for VLMs:\n"
+                f"  • Generic FP16 (RECOMMENDED) or INT8/INT4\n"
+                f"  • BitsAndBytes (CUDA required)\n"
+                f"  • MLX INT4 (Apple Silicon)\n"
+            )
+
+        # ========== STANDARD CONVERSION LOGIC ==========
+
+        # CASE 1: GGUF/Ollama → GGUF quantization (direct requantization)
+        # No conversion needed, quantizer handles it directly
+        if (is_ollama or is_gguf) and target_family == "GGUF":
+            return ConversionPath.DIRECT, QuantizationDirective.CONTINUE_GGUF
+
+        # CASE 2: Ollama/GGUF → Generic quantization
+        # Special handling: FP16 is NOT a quantization, INT8/INT4/etc are
         if is_ollama or is_gguf:
             if target_family == "Generic":
-                return ConversionPath.GGUF_TO_GENERIC
+                # IMPORTANT: FP16 is just dtype conversion, not quantization
+                # After GGUF → FP16 GGUF → FP16 Safetensors, we're DONE
+                # For INT8/INT4/etc, we need to quantize after conversion
+                if target_quant_type == QuantizationType.FP16:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.SKIP
+                elif target_quant_type == QuantizationType.INT8:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE_INT8
+                elif target_quant_type == QuantizationType.INT4:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE_INT4
+                elif target_quant_type == QuantizationType.INT6:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE
+                elif target_quant_type == QuantizationType.INT3:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE
+                elif target_quant_type == QuantizationType.INT2:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE
+                else:
+                    return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE
+
             elif target_family == "MLX":
-                return ConversionPath.GGUF_TO_MLX
+                # MLX supports VLMs (experimental)
+                return ConversionPath.GGUF_TO_MLX, QuantizationDirective.CONTINUE_MLX
+
             elif target_family == "OpenVINO":
-                return ConversionPath.GGUF_TO_OPENVINO
+                # OpenVINO supports VLMs (experimental)
+                return ConversionPath.GGUF_TO_OPENVINO, QuantizationDirective.CONTINUE_OPENVINO
+
             elif target_family in ["GPTQ", "AWQ", "BitsAndBytes"]:
-                return ConversionPath.GGUF_TO_ADVANCED
+                return ConversionPath.GGUF_TO_ADVANCED, QuantizationDirective.CONTINUE_ADVANCED
+
+            # Fallback for other families
+            return ConversionPath.GGUF_TO_GENERIC, QuantizationDirective.QUANTIZE
 
         # CASE 3: HuggingFace → Any (already supported, direct)
+        # No conversion needed, quantizer handles it directly
         if is_hf:
-            return ConversionPath.DIRECT
+            return ConversionPath.DIRECT, QuantizationDirective.QUANTIZE
 
         # Default: direct quantization
-        return ConversionPath.DIRECT
+        return ConversionPath.DIRECT, QuantizationDirective.QUANTIZE
 
     def needs_conversion(self, conversion_path: ConversionPath) -> bool:
         """Check if conversion is needed before quantization.

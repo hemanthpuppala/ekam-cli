@@ -226,6 +226,7 @@ class QuantizationTask:
     background: bool = False
     intermediate_file: Optional[Path] = None  # For GGUF: FP16 intermediate file
     vlm_components: Optional[str] = None  # For VLMs: "vision", "language", "both", or None
+    quantizer_directive: Optional[str] = None  # From orchestrator: "skip", "quantize", "quantize_int8", etc.
 
     @property
     def elapsed_seconds(self) -> Optional[float]:
@@ -271,6 +272,7 @@ class QuantizationTask:
             "background": self.background,
             "intermediate_file": str(self.intermediate_file) if self.intermediate_file else None,
             "vlm_components": self.vlm_components,
+            "quantizer_directive": self.quantizer_directive,
         }
 
     @classmethod
@@ -364,6 +366,7 @@ class QuantizationTask:
             background=data.get("background", False),
             intermediate_file=Path(data["intermediate_file"]) if data.get("intermediate_file") else None,
             vlm_components=data.get("vlm_components"),
+            quantizer_directive=data.get("quantizer_directive"),
         )
 
         # Restore timestamps

@@ -804,47 +804,117 @@ class QuantizedProvider(BaseProvider):
                         for model_class_name in model_classes:
                             try:
                                 logger.info(f"Trying to load VLM with {model_class_name}...")
-                                
+
                                 # Prepare loading kwargs
                                 load_kwargs = {
                                     "low_cpu_mem_usage": True,
                                     "trust_remote_code": True
                                 }
-                                
+
                                 # Use explicit device for Qwen3+MPS workaround, otherwise use device_map
                                 if target_device == 'cpu':
                                     load_kwargs["device_map"] = {"": "cpu"}  # Force CPU
                                     logger.debug("Loading with forced CPU device map")
                                 else:
                                     load_kwargs["device_map"] = "auto"
-                                
-                                if model_class_name == 'AutoModelForVision2Seq':
-                                    from transformers import AutoModelForVision2Seq
-                                    model = AutoModelForVision2Seq.from_pretrained(
-                                        str(model_path),
-                                        **load_kwargs
-                                    )
-                                elif model_class_name == 'AutoModelForCausalLM':
-                                    from transformers import AutoModelForCausalLM
-                                    model = AutoModelForCausalLM.from_pretrained(
-                                        str(model_path),
-                                        **load_kwargs
-                                    )
-                                else:  # AutoModel
-                                    model = AutoModel.from_pretrained(
-                                        str(model_path),
-                                        **load_kwargs
-                                    )
-                                
+
+                                # Try loading with initial kwargs
+                                model = None
+                                try:
+                                    if model_class_name == 'AutoModelForVision2Seq':
+                                        from transformers import AutoModelForVision2Seq
+                                        model = AutoModelForVision2Seq.from_pretrained(
+                                            str(model_path),
+                                            **load_kwargs
+                                        )
+                                    elif model_class_name == 'AutoModelForCausalLM':
+                                        from transformers import AutoModelForCausalLM
+                                        model = AutoModelForCausalLM.from_pretrained(
+                                            str(model_path),
+                                            **load_kwargs
+                                        )
+                                    else:  # AutoModel
+                                        model = AutoModel.from_pretrained(
+                                            str(model_path),
+                                            **load_kwargs
+                                        )
+                                except Exception as e:
+                                    # Handle disk offloading error: "trying to offload the whole model to the disk"
+                                    # This happens on CPU/Metal with limited memory when device_map="auto"
+                                    error_str = str(e).lower()
+                                    if "offload" in error_str or "disk" in error_str:
+                                        logger.debug(f"device_map='auto' caused error: {str(e)[:100]}")
+                                        logger.debug(f"Retrying with explicit device {target_device}")
+                                        # Retry with explicit device placement
+                                        try:
+                                            load_kwargs["device_map"] = {"": target_device}
+
+                                            if model_class_name == 'AutoModelForVision2Seq':
+                                                from transformers import AutoModelForVision2Seq
+                                                model = AutoModelForVision2Seq.from_pretrained(
+                                                    str(model_path),
+                                                    **load_kwargs
+                                                )
+                                            elif model_class_name == 'AutoModelForCausalLM':
+                                                from transformers import AutoModelForCausalLM
+                                                model = AutoModelForCausalLM.from_pretrained(
+                                                    str(model_path),
+                                                    **load_kwargs
+                                                )
+                                            else:  # AutoModel
+                                                model = AutoModel.from_pretrained(
+                                                    str(model_path),
+                                                    **load_kwargs
+                                                )
+                                        except Exception as fallback_e:
+                                            fallback_error_str = str(fallback_e).lower()
+                                            # Check if this is a memory/buffer error
+                                            if "buffer" in fallback_error_str or "memory" in fallback_error_str or "cuda" in fallback_error_str or "out of" in fallback_error_str:
+                                                if target_device != "cpu":
+                                                    logger.debug(f"Device {target_device} has insufficient memory for VLM: {str(fallback_e)[:100]}")
+                                                    logger.info(f"Falling back to CPU loading for VLM (model will run slower)")
+                                                    # Final fallback: load on CPU
+                                                    try:
+                                                        load_kwargs["device_map"] = {"": "cpu"}
+
+                                                        if model_class_name == 'AutoModelForVision2Seq':
+                                                            from transformers import AutoModelForVision2Seq
+                                                            model = AutoModelForVision2Seq.from_pretrained(
+                                                                str(model_path),
+                                                                **load_kwargs
+                                                            )
+                                                        elif model_class_name == 'AutoModelForCausalLM':
+                                                            from transformers import AutoModelForCausalLM
+                                                            model = AutoModelForCausalLM.from_pretrained(
+                                                                str(model_path),
+                                                                **load_kwargs
+                                                            )
+                                                        else:  # AutoModel
+                                                            model = AutoModel.from_pretrained(
+                                                                str(model_path),
+                                                                **load_kwargs
+                                                            )
+                                                    except Exception as cpu_e:
+                                                        logger.debug(f"CPU loading for VLM also failed: {str(cpu_e)[:100]}")
+                                                        raise
+                                                else:
+                                                    logger.debug(f"Already on CPU, cannot fall back further: {str(fallback_e)[:100]}")
+                                                    raise
+                                            else:
+                                                logger.debug(f"VLM fallback failed with different error: {str(fallback_e)[:100]}")
+                                                raise
+                                    else:
+                                        raise
+
                                 # Verify the model has generate method
                                 if not hasattr(model, 'generate'):
                                     logger.warning(f"{model_class_name} loaded but has no .generate() method")
                                     model = None
                                     continue
-                                
+
                                 logger.info(f"✓ Successfully loaded VLM with {model_class_name}")
                                 break
-                                
+
                             except Exception as e:
                                 logger.debug(f"{model_class_name} failed: {e}")
                                 continue
@@ -889,13 +959,58 @@ class QuantizedProvider(BaseProvider):
                 # Strategy 1: Try AutoModelForCausalLM (most common for LLMs)
                 try:
                     logger.debug("Attempting to load with AutoModelForCausalLM...")
-                    model = AutoModelForCausalLM.from_pretrained(
-                        str(model_path),
-                        device_map="auto",
-                        low_cpu_mem_usage=True,
-                        trust_remote_code=True
-                    )
-                    logger.info("✓ Loaded with AutoModelForCausalLM")
+                    model = None
+                    try:
+                        model = AutoModelForCausalLM.from_pretrained(
+                            str(model_path),
+                            device_map="auto",
+                            low_cpu_mem_usage=True,
+                            trust_remote_code=True
+                        )
+                        logger.info("✓ Loaded with AutoModelForCausalLM")
+                    except Exception as e:
+                        # Handle disk offloading error: "trying to offload the whole model to the disk"
+                        # This happens on CPU/Metal with limited memory
+                        error_str = str(e).lower()
+                        if "offload" in error_str or "disk" in error_str:
+                            logger.debug(f"device_map='auto' caused error (likely disk offloading): {str(e)[:100]}")
+                            logger.debug(f"Falling back to explicit device placement: {device}")
+                            # Retry with explicit device instead of device_map
+                            try:
+                                model = AutoModelForCausalLM.from_pretrained(
+                                    str(model_path),
+                                    device_map={"": device},  # Explicit device placement
+                                    low_cpu_mem_usage=True,
+                                    trust_remote_code=True
+                                )
+                                logger.info(f"✓ Loaded with AutoModelForCausalLM (explicit device: {device})")
+                            except Exception as fallback_e:
+                                fallback_error_str = str(fallback_e).lower()
+                                # Check if this is a memory/buffer error
+                                if "buffer" in fallback_error_str or "memory" in fallback_error_str or "cuda" in fallback_error_str or "out of" in fallback_error_str:
+                                    if device != "cpu":
+                                        logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
+                                        logger.info(f"Falling back to CPU loading (model will run slower)")
+                                        # Final fallback: load on CPU
+                                        try:
+                                            model = AutoModelForCausalLM.from_pretrained(
+                                                str(model_path),
+                                                device_map={"": "cpu"},
+                                                low_cpu_mem_usage=True,
+                                                trust_remote_code=True
+                                            )
+                                            logger.info(f"✓ Loaded with AutoModelForCausalLM on CPU (trading performance for compatibility)")
+                                        except Exception as cpu_e:
+                                            logger.debug(f"CPU loading also failed: {str(cpu_e)[:100]}")
+                                            raise
+                                    else:
+                                        logger.debug(f"Already on CPU, cannot fall back further: {str(fallback_e)[:100]}")
+                                        raise
+                                else:
+                                    logger.debug(f"Fallback failed with different error: {str(fallback_e)[:100]}")
+                                    raise
+                        else:
+                            raise
                 except Exception as e:
                     error_msg = str(e)
                     error_messages.append(f"AutoModelForCausalLM: {error_msg[:200]}")
@@ -971,13 +1086,55 @@ class QuantizedProvider(BaseProvider):
                                             logger.info(f"✓ Copied {modeling_file} from original model cache")
 
                                             # Retry loading
-                                            model = AutoModelForCausalLM.from_pretrained(
-                                                str(model_path),
-                                                device_map="auto",
-                                                low_cpu_mem_usage=True,
-                                                trust_remote_code=True
-                                            )
-                                            logger.info("✓ Successfully loaded after copying modeling file!")
+                                            try:
+                                                model = AutoModelForCausalLM.from_pretrained(
+                                                    str(model_path),
+                                                    device_map="auto",
+                                                    low_cpu_mem_usage=True,
+                                                    trust_remote_code=True
+                                                )
+                                                logger.info("✓ Successfully loaded after copying modeling file!")
+                                            except Exception as e:
+                                                # Fallback if device_map="auto" tries disk offloading
+                                                error_str = str(e).lower()
+                                                if "offload" in error_str or "disk" in error_str:
+                                                    logger.debug(f"device_map='auto' caused error: {str(e)[:100]}")
+                                                    logger.debug(f"Retrying with explicit device: {device}")
+                                                    try:
+                                                        model = AutoModelForCausalLM.from_pretrained(
+                                                            str(model_path),
+                                                            device_map={"": device},
+                                                            low_cpu_mem_usage=True,
+                                                            trust_remote_code=True
+                                                        )
+                                                        logger.info("✓ Successfully loaded after copying modeling file!")
+                                                    except Exception as fallback_e:
+                                                        fallback_error_str = str(fallback_e).lower()
+                                                        # Check if this is a memory/buffer error
+                                                        if "buffer" in fallback_error_str or "memory" in fallback_error_str or "cuda" in fallback_error_str or "out of" in fallback_error_str:
+                                                            if device != "cpu":
+                                                                logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
+                                                                logger.info(f"Falling back to CPU loading (model will run slower)")
+                                                                # Final fallback: load on CPU
+                                                                try:
+                                                                    model = AutoModelForCausalLM.from_pretrained(
+                                                                        str(model_path),
+                                                                        device_map={"": "cpu"},
+                                                                        low_cpu_mem_usage=True,
+                                                                        trust_remote_code=True
+                                                                    )
+                                                                    logger.info("✓ Successfully loaded on CPU after copying modeling file!")
+                                                                except Exception as cpu_e:
+                                                                    logger.debug(f"CPU loading also failed: {str(cpu_e)[:100]}")
+                                                                    raise
+                                                            else:
+                                                                logger.debug(f"Already on CPU, cannot fall back further: {str(fallback_e)[:100]}")
+                                                                raise
+                                                        else:
+                                                            logger.debug(f"Fallback failed with different error: {str(fallback_e)[:100]}")
+                                                            raise
+                                                else:
+                                                    raise
                                     except Exception as copy_error:
                                         logger.debug(f"Could not copy modeling file: {copy_error}")
 
@@ -1052,14 +1209,58 @@ class QuantizedProvider(BaseProvider):
                             trust_remote_code=True
                         )
 
-                        model = AutoModelForCausalLM.from_pretrained(
-                            str(model_path),
-                            config=config,
-                            device_map="auto",
-                            low_cpu_mem_usage=True,
-                            trust_remote_code=True
-                        )
-                        logger.info("✓ Loaded with AutoConfig approach")
+                        try:
+                            model = AutoModelForCausalLM.from_pretrained(
+                                str(model_path),
+                                config=config,
+                                device_map="auto",
+                                low_cpu_mem_usage=True,
+                                trust_remote_code=True
+                            )
+                            logger.info("✓ Loaded with AutoConfig approach")
+                        except Exception as e:
+                            # Fallback for disk offloading
+                            error_str = str(e).lower()
+                            if "offload" in error_str or "disk" in error_str:
+                                logger.debug(f"device_map='auto' caused error (likely disk offloading): {str(e)[:100]}")
+                                logger.debug(f"Retrying with explicit device: {device}")
+                                try:
+                                    model = AutoModelForCausalLM.from_pretrained(
+                                        str(model_path),
+                                        config=config,
+                                        device_map={"": device},
+                                        low_cpu_mem_usage=True,
+                                        trust_remote_code=True
+                                    )
+                                    logger.info("✓ Loaded with AutoConfig approach (explicit device)")
+                                except Exception as fallback_e:
+                                    fallback_error_str = str(fallback_e).lower()
+                                    # Check if this is a memory/buffer error
+                                    if "buffer" in fallback_error_str or "memory" in fallback_error_str or "cuda" in fallback_error_str or "out of" in fallback_error_str:
+                                        if device != "cpu":
+                                            logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
+                                            logger.info(f"Falling back to CPU loading (model will run slower)")
+                                            # Final fallback: load on CPU
+                                            try:
+                                                model = AutoModelForCausalLM.from_pretrained(
+                                                    str(model_path),
+                                                    config=config,
+                                                    device_map={"": "cpu"},
+                                                    low_cpu_mem_usage=True,
+                                                    trust_remote_code=True
+                                                )
+                                                logger.info("✓ Loaded with AutoConfig approach on CPU")
+                                            except Exception as cpu_e:
+                                                logger.debug(f"CPU loading also failed: {str(cpu_e)[:100]}")
+                                                raise
+                                        else:
+                                            logger.debug(f"Already on CPU, cannot fall back further: {str(fallback_e)[:100]}")
+                                            raise
+                                    else:
+                                        logger.debug(f"Fallback failed with different error: {str(fallback_e)[:100]}")
+                                        raise
+                            else:
+                                raise
                     except Exception as e:
                         error_msg = str(e)
                         error_messages.append(f"AutoConfig: {error_msg[:100]}")
@@ -1069,13 +1270,55 @@ class QuantizedProvider(BaseProvider):
                 if model is None:
                     try:
                         logger.debug("Attempting final fallback with AutoModel...")
-                        model = AutoModel.from_pretrained(
-                            str(model_path),
-                            device_map="auto",
-                            low_cpu_mem_usage=True,
-                            trust_remote_code=True
-                        )
-                        logger.info("✓ Loaded with AutoModel (generic fallback)")
+                        try:
+                            model = AutoModel.from_pretrained(
+                                str(model_path),
+                                device_map="auto",
+                                low_cpu_mem_usage=True,
+                                trust_remote_code=True
+                            )
+                            logger.info("✓ Loaded with AutoModel (generic fallback)")
+                        except Exception as e:
+                            # Fallback for disk offloading
+                            error_str = str(e).lower()
+                            if "offload" in error_str or "disk" in error_str:
+                                logger.debug(f"device_map='auto' caused error (likely disk offloading): {str(e)[:100]}")
+                                logger.debug(f"Retrying with explicit device: {device}")
+                                try:
+                                    model = AutoModel.from_pretrained(
+                                        str(model_path),
+                                        device_map={"": device},
+                                        low_cpu_mem_usage=True,
+                                        trust_remote_code=True
+                                    )
+                                    logger.info(f"✓ Loaded with AutoModel on {device} (explicit device)")
+                                except Exception as fallback_e:
+                                    fallback_error_str = str(fallback_e).lower()
+                                    # Check if this is a memory/buffer error
+                                    if "buffer" in fallback_error_str or "memory" in fallback_error_str or "cuda" in fallback_error_str or "out of" in fallback_error_str:
+                                        if device != "cpu":
+                                            logger.debug(f"Device {device} has insufficient memory: {str(fallback_e)[:100]}")
+                                            logger.info(f"Falling back to CPU loading (model will run slower)")
+                                            # Final fallback: load on CPU
+                                            try:
+                                                model = AutoModel.from_pretrained(
+                                                    str(model_path),
+                                                    device_map={"": "cpu"},
+                                                    low_cpu_mem_usage=True,
+                                                    trust_remote_code=True
+                                                )
+                                                logger.info(f"✓ Loaded with AutoModel on CPU (generic fallback)")
+                                            except Exception as cpu_e:
+                                                logger.debug(f"CPU loading also failed: {str(cpu_e)[:100]}")
+                                                raise
+                                        else:
+                                            logger.debug(f"Already on CPU, cannot fall back further: {str(fallback_e)[:100]}")
+                                            raise
+                                    else:
+                                        logger.debug(f"Fallback failed with different error: {str(fallback_e)[:100]}")
+                                        raise
+                            else:
+                                raise
                     except Exception as e:
                         error_msg = str(e)
                         error_messages.append(f"AutoModel: {error_msg[:100]}")
