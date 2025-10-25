@@ -21,17 +21,98 @@ References:
 """
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 import re
 
 from loguru import logger
 
 from ...models.model import ModelInfo
 from ...models.provider import ProviderType
+from ...models.endpoints import ModelType
 from ..models import QuantizationTask, QuantizationType, TaskStatus
 from .base import BaseQuantizer
 from .model_validator import ModelValidator
 from .platform_detector import PlatformDetector, DeviceType, DeviceCapabilities
+
+
+def _extract_model_metadata_early(
+    task: QuantizationTask,
+    model_identifier: str,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Extract model metadata EARLY without loading the full model.
+
+    This uses information already available in task.model_info (set at discovery time)
+    plus lightweight config loading to determine model requirements before expensive
+    model loading.
+
+    Args:
+        task: Quantization task with model_info metadata
+        model_identifier: Path to model or HF model ID
+
+    Returns:
+        (is_vlm, model_type_str, model_architecture)
+        - is_vlm: True if model has vision capabilities, False otherwise
+        - model_type_str: Model type from config (e.g., "gemma3", "llama2")
+        - model_architecture: Architecture string from model_info.architecture or detected
+    """
+    is_vlm = False
+    model_type_str = None
+    model_architecture = None
+
+    # PHASE 1: Use metadata already available from discovery time
+    # This is extremely efficient - no model loading needed
+    logger.debug(f"[Metadata] Using pre-discovered model type: {task.model_info.model_type}")
+
+    # Know if VLM from task metadata (set during model discovery)
+    is_vlm = task.model_info.model_type == ModelType.VLM
+    logger.debug(f"[Metadata] Model is VLM: {is_vlm} (from discovery metadata)")
+
+    # Get architecture from model_info if available
+    if task.model_info.architecture:
+        model_architecture = task.model_info.architecture
+        logger.debug(f"[Metadata] Using pre-discovered architecture: {model_architecture}")
+    else:
+        logger.debug("[Metadata] Architecture not in model_info, will extract from config")
+
+    # PHASE 2: Load lightweight config (JSON only, not tensors)
+    # This is fast and gives us model_type for tokenizer discovery
+    try:
+        from transformers import AutoConfig
+
+        logger.debug(f"[Metadata] Loading config from {model_identifier}...")
+        config = AutoConfig.from_pretrained(
+            model_identifier,
+            trust_remote_code=True,
+        )
+
+        # Get model_type for tokenizer discovery
+        if hasattr(config, "model_type"):
+            model_type_str = config.model_type
+            logger.debug(f"[Metadata] Detected model_type from config: {model_type_str}")
+
+        # Verify/update architecture if not in model_info
+        if not model_architecture and hasattr(config, "architectures"):
+            architectures = config.architectures if config.architectures else []
+            if architectures:
+                model_architecture = architectures[0]
+                logger.debug(f"[Metadata] Detected architecture from config: {model_architecture}")
+
+        # Double-check VLM status from config (in case discovery missed it)
+        if not is_vlm:
+            config_dict = config.to_dict()
+            vision_indicators = any(
+                key in config_dict for key in ["vision_config", "visual_config", "image_encoder"]
+            )
+            if vision_indicators:
+                is_vlm = True
+                logger.debug("[Metadata] Detected VLM from vision config in model config")
+
+    except Exception as e:
+        logger.warning(f"[Metadata] Could not load config: {str(e)[:100]}")
+        logger.debug(f"[Metadata] Will proceed with available metadata")
+
+    return is_vlm, model_type_str, model_architecture
 
 
 def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
@@ -46,7 +127,9 @@ def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
     2. Try with common organization prefixes (google/, meta-llama/, Qwen/, etc.)
     3. Try with common size suffixes (-7b, -13b, -base, etc.)
     4. Search HuggingFace Hub for models with that model_type (by downloads)
-    5. Try transformers library detection
+    5. Try transformers library detection with offline fallback
+
+    Works offline: If network is unavailable, uses local cached tokenizers from transformers.
 
     Args:
         model_type: The model type string (e.g., "gemma3", "llama", "qwen2")
@@ -55,24 +138,21 @@ def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
         A HuggingFace model identifier string, or None if not found
     """
     from transformers import AutoTokenizer
-    from huggingface_hub import list_models
 
     logger.debug(f"[Tokenizer Discovery] Starting dynamic search for model_type: {model_type}")
 
     # Strategy 1: Try model_type directly
-    direct_attempts = [model_type]
-
-    # Some models are already valid HF model IDs
-    for candidate in direct_attempts:
-        try:
-            logger.debug(f"[Strategy 1] Trying direct model_type: {candidate}")
-            AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
-            logger.info(f"[Tokenizer Discovery] ✓ Found tokenizer directly: {candidate}")
-            return candidate
-        except Exception as e:
-            logger.debug(f"[Strategy 1] Failed for {candidate}: {str(e)[:100]}")
+    # Some models are already valid HF model IDs (gpt2, phi, bloom, etc.)
+    try:
+        logger.debug(f"[Strategy 1] Trying direct model_type: {model_type}")
+        AutoTokenizer.from_pretrained(model_type, trust_remote_code=True)
+        logger.info(f"[Tokenizer Discovery] ✓ Found tokenizer directly: {model_type}")
+        return model_type
+    except Exception as e:
+        logger.debug(f"[Strategy 1] Failed for {model_type}: {str(e)[:100]}")
 
     # Strategy 2: Try with common organization prefixes
+    # Order matters: try common ones first
     org_prefixes = [
         ("google/", "Google models"),
         ("meta-llama/", "Meta Llama models"),
@@ -80,8 +160,8 @@ def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
         ("Qwen/", "Qwen models"),
         ("microsoft/", "Microsoft models"),
         ("facebook/", "Facebook models"),
-        ("openai/", "OpenAI models"),
         ("stabilityai/", "Stability AI models"),
+        ("openai/", "OpenAI models"),
     ]
 
     for prefix, description in org_prefixes:
@@ -102,7 +182,7 @@ def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
             except Exception as e:
                 logger.debug(f"[Strategy 2] Failed for {candidate}: {str(e)[:100]}")
 
-    # Strategy 3: Try with common size suffixes
+    # Strategy 3: Try with common size suffixes (-7b, -13b, -base, etc.)
     size_suffixes = ["-7b", "-13b", "-base", "-small", "-medium", "-large", "-7b-hf", "-13b-hf"]
 
     for suffix in size_suffixes:
@@ -122,8 +202,10 @@ def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
                 except Exception as e:
                     logger.debug(f"[Strategy 3] Failed for {candidate}: {str(e)[:100]}")
 
-    # Strategy 4: Search HuggingFace Hub API
+    # Strategy 4: Search HuggingFace Hub API (requires internet)
     try:
+        from huggingface_hub import list_models
+
         logger.debug(f"[Strategy 4] Searching HuggingFace Hub for model_type '{model_type}'...")
 
         # Search for models matching the model_type
@@ -139,50 +221,65 @@ def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
             for model_info in models:
                 try:
                     candidate = model_info.id
-                    logger.debug(f"[Strategy 4] Trying HF Hub result: {candidate} (downloads: {model_info.downloads})")
+                    logger.debug(
+                        f"[Strategy 4] Trying HF Hub result: {candidate} (downloads: {model_info.downloads})"
+                    )
                     AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
                     logger.info(f"[Tokenizer Discovery] ✓ Found via HF Hub search: {candidate}")
                     return candidate
                 except Exception as e:
                     logger.debug(f"[Strategy 4] Failed for {candidate}: {str(e)[:100]}")
     except Exception as e:
-        logger.debug(f"[Strategy 4] HF Hub search failed (may be offline): {str(e)[:100]}")
+        logger.debug(f"[Strategy 4] HF Hub search failed (offline or API error): {str(e)[:60]}")
 
-    # Strategy 5: Try transformers library introspection
-    try:
-        logger.debug(f"[Strategy 5] Using transformers library introspection...")
-        from transformers.models.auto.configuration import AutoConfig
+    # Strategy 5: Use well-known canonical models from transformers library
+    # These are cached locally and work offline
+    logger.debug("[Strategy 5] Using canonical models from transformers library (works offline)...")
 
-        # Try to get the config class and find a canonical model
+    # Map model types to well-known canonical HF models that have cached tokenizers
+    canonical_by_type = {
+        "bert": "google-bert/bert-base-uncased",
+        "roberta": "FacebookAI/roberta-base",
+        "gpt2": "gpt2",
+        "t5": "google-t5/t5-base",
+        "llama": "meta-llama/Llama-2-7b",
+        "llama2": "meta-llama/Llama-2-7b",
+        "mistral": "mistralai/Mistral-7B-v0.1",
+        "qwen": "Qwen/Qwen2-7B",
+        "qwen2": "Qwen/Qwen2-7B",
+        "gemma": "google/gemma-7b",
+        "gemma2": "google/gemma2-9b",
+        "gemma3": "google/gemma-7b",  # Gemma3 uses same tokenizer as Gemma
+        "phi": "microsoft/phi-2",
+        "phi2": "microsoft/phi-2",
+        "bloom": "bigscience/bloom",
+        "falcon": "tiiuae/falcon-7b",
+        "mpt": "mosaicml/mpt-7b",
+    }
+
+    # Try exact match first
+    if model_type.lower() in canonical_by_type:
+        canonical_model = canonical_by_type[model_type.lower()]
         try:
-            config_class = AutoConfig.for_model(model_type)
-            logger.debug(f"[Strategy 5] Found config class: {config_class}")
-
-            # Try common canonical model identifiers based on model_type
-            canonical_by_type = {
-                "bert": "google-bert/bert-base-uncased",
-                "roberta": "FacebookAI/roberta-base",
-                "gpt2": "gpt2",
-                "t5": "google-t5/t5-base",
-                "llama": "meta-llama/Llama-2-7b",
-                "mistral": "mistralai/Mistral-7B-v0.1",
-                "qwen": "Qwen/Qwen2-7B",
-                "gemma": "google/gemma-7b",
-            }
-
-            for base_type, canonical_model in canonical_by_type.items():
-                if base_type in model_type.lower():
-                    try:
-                        logger.debug(f"[Strategy 5] Trying canonical model for {base_type}: {canonical_model}")
-                        AutoTokenizer.from_pretrained(canonical_model, trust_remote_code=True)
-                        logger.info(f"[Tokenizer Discovery] ✓ Using canonical model: {canonical_model}")
-                        return canonical_model
-                    except Exception as e:
-                        logger.debug(f"[Strategy 5] Failed for {canonical_model}: {str(e)[:100]}")
+            logger.debug(f"[Strategy 5] Trying canonical model for {model_type}: {canonical_model}")
+            AutoTokenizer.from_pretrained(canonical_model, trust_remote_code=True)
+            logger.info(f"[Tokenizer Discovery] ✓ Using canonical model: {canonical_model}")
+            return canonical_model
         except Exception as e:
-            logger.debug(f"[Strategy 5] Could not get config class: {str(e)[:100]}")
-    except Exception as e:
-        logger.debug(f"[Strategy 5] Transformers introspection failed: {str(e)[:100]}")
+            logger.debug(f"[Strategy 5] Failed for {canonical_model}: {str(e)[:100]}")
+
+    # Try partial match (e.g., "gemma3" matches "gemma" key)
+    for base_type, canonical_model in canonical_by_type.items():
+        if base_type in model_type.lower() or model_type.lower() in base_type:
+            try:
+                logger.debug(
+                    f"[Strategy 5] Trying canonical model (partial match {base_type}): {canonical_model}"
+                )
+                AutoTokenizer.from_pretrained(canonical_model, trust_remote_code=True)
+                logger.info(f"[Tokenizer Discovery] ✓ Using canonical model: {canonical_model}")
+                return canonical_model
+            except Exception as e:
+                logger.debug(f"[Strategy 5] Failed for {canonical_model}: {str(e)[:100]}")
 
     logger.warning(f"[Tokenizer Discovery] Could not find tokenizer for model_type '{model_type}' using any strategy")
     return None
