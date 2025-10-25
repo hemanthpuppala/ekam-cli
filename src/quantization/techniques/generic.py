@@ -22,6 +22,7 @@ References:
 
 from pathlib import Path
 from typing import Callable, Optional
+import re
 
 from loguru import logger
 
@@ -31,6 +32,160 @@ from ..models import QuantizationTask, QuantizationType, TaskStatus
 from .base import BaseQuantizer
 from .model_validator import ModelValidator
 from .platform_detector import PlatformDetector, DeviceType, DeviceCapabilities
+
+
+def _find_canonical_tokenizer_model(model_type: str) -> Optional[str]:
+    """
+    Dynamically find a canonical tokenizer model for a given model_type.
+
+    This function implements a universal, future-proof strategy for finding
+    tokenizer models without hardcoding every variant. Works across all model types.
+
+    Strategy (in order of preference):
+    1. Try model_type directly (works for: gpt2, phi, bloom, etc.)
+    2. Try with common organization prefixes (google/, meta-llama/, Qwen/, etc.)
+    3. Try with common size suffixes (-7b, -13b, -base, etc.)
+    4. Search HuggingFace Hub for models with that model_type (by downloads)
+    5. Try transformers library detection
+
+    Args:
+        model_type: The model type string (e.g., "gemma3", "llama", "qwen2")
+
+    Returns:
+        A HuggingFace model identifier string, or None if not found
+    """
+    from transformers import AutoTokenizer
+    from huggingface_hub import list_models
+
+    logger.debug(f"[Tokenizer Discovery] Starting dynamic search for model_type: {model_type}")
+
+    # Strategy 1: Try model_type directly
+    direct_attempts = [model_type]
+
+    # Some models are already valid HF model IDs
+    for candidate in direct_attempts:
+        try:
+            logger.debug(f"[Strategy 1] Trying direct model_type: {candidate}")
+            AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+            logger.info(f"[Tokenizer Discovery] ✓ Found tokenizer directly: {candidate}")
+            return candidate
+        except Exception as e:
+            logger.debug(f"[Strategy 1] Failed for {candidate}: {str(e)[:100]}")
+
+    # Strategy 2: Try with common organization prefixes
+    org_prefixes = [
+        ("google/", "Google models"),
+        ("meta-llama/", "Meta Llama models"),
+        ("mistralai/", "Mistral models"),
+        ("Qwen/", "Qwen models"),
+        ("microsoft/", "Microsoft models"),
+        ("facebook/", "Facebook models"),
+        ("openai/", "OpenAI models"),
+        ("stabilityai/", "Stability AI models"),
+    ]
+
+    for prefix, description in org_prefixes:
+        # Capitalize first letter for consistency with HF naming
+        capitalized = model_type[0].upper() + model_type[1:] if model_type else ""
+        candidates = [
+            f"{prefix}{capitalized}",
+            f"{prefix}{model_type}",
+            f"{prefix}{model_type.replace('_', '-')}",
+        ]
+
+        for candidate in candidates:
+            try:
+                logger.debug(f"[Strategy 2] Trying {description}: {candidate}")
+                AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+                logger.info(f"[Tokenizer Discovery] ✓ Found tokenizer with org prefix: {candidate}")
+                return candidate
+            except Exception as e:
+                logger.debug(f"[Strategy 2] Failed for {candidate}: {str(e)[:100]}")
+
+    # Strategy 3: Try with common size suffixes
+    size_suffixes = ["-7b", "-13b", "-base", "-small", "-medium", "-large", "-7b-hf", "-13b-hf"]
+
+    for suffix in size_suffixes:
+        for prefix, _ in org_prefixes:
+            capitalized = model_type[0].upper() + model_type[1:] if model_type else ""
+            candidates = [
+                f"{prefix}{capitalized}{suffix}",
+                f"{prefix}{model_type}{suffix}",
+            ]
+
+            for candidate in candidates:
+                try:
+                    logger.debug(f"[Strategy 3] Trying with size suffix: {candidate}")
+                    AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+                    logger.info(f"[Tokenizer Discovery] ✓ Found tokenizer with suffix: {candidate}")
+                    return candidate
+                except Exception as e:
+                    logger.debug(f"[Strategy 3] Failed for {candidate}: {str(e)[:100]}")
+
+    # Strategy 4: Search HuggingFace Hub API
+    try:
+        logger.debug(f"[Strategy 4] Searching HuggingFace Hub for model_type '{model_type}'...")
+
+        # Search for models matching the model_type
+        models = list_models(
+            search=model_type,
+            library_name="transformers",
+            sort="downloads",
+            direction=-1,
+            limit=10  # Get top 10
+        )
+
+        if models:
+            for model_info in models:
+                try:
+                    candidate = model_info.id
+                    logger.debug(f"[Strategy 4] Trying HF Hub result: {candidate} (downloads: {model_info.downloads})")
+                    AutoTokenizer.from_pretrained(candidate, trust_remote_code=True)
+                    logger.info(f"[Tokenizer Discovery] ✓ Found via HF Hub search: {candidate}")
+                    return candidate
+                except Exception as e:
+                    logger.debug(f"[Strategy 4] Failed for {candidate}: {str(e)[:100]}")
+    except Exception as e:
+        logger.debug(f"[Strategy 4] HF Hub search failed (may be offline): {str(e)[:100]}")
+
+    # Strategy 5: Try transformers library introspection
+    try:
+        logger.debug(f"[Strategy 5] Using transformers library introspection...")
+        from transformers.models.auto.configuration import AutoConfig
+
+        # Try to get the config class and find a canonical model
+        try:
+            config_class = AutoConfig.for_model(model_type)
+            logger.debug(f"[Strategy 5] Found config class: {config_class}")
+
+            # Try common canonical model identifiers based on model_type
+            canonical_by_type = {
+                "bert": "google-bert/bert-base-uncased",
+                "roberta": "FacebookAI/roberta-base",
+                "gpt2": "gpt2",
+                "t5": "google-t5/t5-base",
+                "llama": "meta-llama/Llama-2-7b",
+                "mistral": "mistralai/Mistral-7B-v0.1",
+                "qwen": "Qwen/Qwen2-7B",
+                "gemma": "google/gemma-7b",
+            }
+
+            for base_type, canonical_model in canonical_by_type.items():
+                if base_type in model_type.lower():
+                    try:
+                        logger.debug(f"[Strategy 5] Trying canonical model for {base_type}: {canonical_model}")
+                        AutoTokenizer.from_pretrained(canonical_model, trust_remote_code=True)
+                        logger.info(f"[Tokenizer Discovery] ✓ Using canonical model: {canonical_model}")
+                        return canonical_model
+                    except Exception as e:
+                        logger.debug(f"[Strategy 5] Failed for {canonical_model}: {str(e)[:100]}")
+        except Exception as e:
+            logger.debug(f"[Strategy 5] Could not get config class: {str(e)[:100]}")
+    except Exception as e:
+        logger.debug(f"[Strategy 5] Transformers introspection failed: {str(e)[:100]}")
+
+    logger.warning(f"[Tokenizer Discovery] Could not find tokenizer for model_type '{model_type}' using any strategy")
+    return None
 
 
 class GenericQuantizer(BaseQuantizer):
@@ -758,8 +913,8 @@ class GenericQuantizer(BaseQuantizer):
                 # Strategy 1: Direct path (HF model with tokenizer files)
                 tokenizer_sources.append((model_identifier, "Local model directory"))
 
-                # Strategy 2: Architecture-based default tokenizer
-                # For Ollama models converted to HF, use the architecture to get a canonical tokenizer
+                # Strategy 2: Dynamic discovery - use the new universal tokenizer finder
+                # This works for ANY model type (gemma, llama, qwen, etc.)
                 try:
                     if Path(model_identifier).is_dir():
                         # This is a local directory - check if it has tokenizer files
@@ -770,75 +925,38 @@ class GenericQuantizer(BaseQuantizer):
                         )
 
                         if not has_tokenizer_files:
-                            # Try to get architecture and load canonical tokenizer
+                            # Use dynamic tokenizer discovery
                             try:
                                 config = model.config
                                 model_type = config.model_type if hasattr(config, 'model_type') else None
 
                                 if model_type:
-                                    # Map model types to canonical HF tokenizer models
-                                    canonical_tokenizers = {
-                                        'gemma': 'google/gemma-7b',
-                                        'gemma2': 'google/gemma2-9b',
-                                        'gemma3': 'google/gemma3-8b',
-                                        'llama': 'meta-llama/Llama-2-7b',
-                                        'mistral': 'mistralai/Mistral-7B-v0.1',
-                                        'qwen2': 'Qwen/Qwen2-7B',
-                                        'gpt2': 'gpt2',
-                                        'phi': 'microsoft/phi-2',
-                                    }
+                                    logger.debug(f"No tokenizer files found, using dynamic discovery for model_type: {model_type}")
+                                    canonical_model = _find_canonical_tokenizer_model(model_type)
 
-                                    # Try exact match first, then try base type (for variants like "gemma3" -> "gemma")
-                                    canonical_model = canonical_tokenizers.get(model_type)
-
-                                    if not canonical_model:
-                                        # Try to extract base type (e.g., "gemma3" -> "gemma")
-                                        import re
-                                        base_match = re.match(r'^([a-z]+)', model_type)
-                                        if base_match:
-                                            base_type = base_match.group(1)
-                                            canonical_model = canonical_tokenizers.get(base_type)
-
-                                        if not canonical_model:
-                                            # Last resort: use model_type as-is (will likely fail, but provides useful error)
-                                            canonical_model = model_type
-
-                                    tokenizer_sources.append((canonical_model, f"Canonical tokenizer for {model_type}"))
-                                    logger.debug(f"Will try canonical tokenizer: {canonical_model}")
+                                    if canonical_model:
+                                        tokenizer_sources.append((canonical_model, f"Dynamically discovered tokenizer for {model_type}"))
+                                        logger.debug(f"Will try discovered tokenizer: {canonical_model}")
                             except Exception as e:
-                                logger.debug(f"Could not detect architecture for canonical tokenizer: {e}")
+                                logger.debug(f"Could not detect architecture for tokenizer discovery: {e}")
                 except Exception as e:
                     logger.debug(f"Error checking for tokenizer files: {e}")
 
                 # Try each tokenizer source
                 for tokenizer_source, description in tokenizer_sources:
-                    # Special handling for gemma3 and gemma2: if primary fails, try fallbacks
-                    sources_to_try = [tokenizer_source]
-                    if tokenizer_source == 'google/gemma3-8b':
-                        sources_to_try.extend(['google/gemma2-9b', 'google/gemma-7b'])
-                    elif tokenizer_source == 'google/gemma2-9b':
-                        sources_to_try.append('google/gemma-7b')
-
-                    for current_source in sources_to_try:
-                        try:
-                            logger.debug(f"Attempting to load tokenizer: {description} from {current_source}")
-                            with suppress_transformers_output():
-                                processor_or_tokenizer = AutoTokenizer.from_pretrained(
-                                    current_source,
-                                    trust_remote_code=True
-                                )
-                            logger.info(f"✓ Tokenizer loaded successfully from: {description} ({current_source})")
-                            break
-                        except Exception as e:
-                            last_error = e
-                            logger.debug(f"Failed to load from {current_source}: {e}")
-                            if current_source != sources_to_try[-1]:
-                                logger.debug(f"Trying fallback source...")
-                            continue
-
-                    # If we successfully loaded the tokenizer, break out of outer loop
-                    if processor_or_tokenizer is not None:
+                    try:
+                        logger.debug(f"Attempting to load tokenizer from: {description} ({tokenizer_source})")
+                        with suppress_transformers_output():
+                            processor_or_tokenizer = AutoTokenizer.from_pretrained(
+                                tokenizer_source,
+                                trust_remote_code=True
+                            )
+                        logger.info(f"✓ Tokenizer loaded successfully from: {description}")
                         break
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(f"Failed to load from {tokenizer_source}: {e}")
+                        continue
 
                 # If all attempts failed
                 if processor_or_tokenizer is None:
