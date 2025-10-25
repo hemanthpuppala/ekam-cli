@@ -833,14 +833,112 @@ class GenericQuantizer(BaseQuantizer):
                 logger.info(f"Quantizing model using HF model ID: {model_identifier}")
                 # Skip validation for HF model IDs (transformers handles it)
 
-            # Update progress: Loading model
+            # PHASE 1: Extract model metadata EARLY (before expensive model loading)
+            # This uses pre-discovered info from model_info + lightweight config loading
             task.stage = "Loading"
-            task.substage = "Loading model from disk"
+            task.substage = "Extracting model metadata"
+            if progress_callback:
+                progress_callback(8.0, None)
+            task.progress = 8.0
+
+            logger.info("[Phase 1] Extracting model metadata early...")
+            is_vlm, model_type_str, model_architecture = _extract_model_metadata_early(task, model_identifier)
+            logger.info(
+                f"[Phase 1] Model metadata: VLM={is_vlm}, model_type={model_type_str}, arch={model_architecture}"
+            )
+
+            # PHASE 2: Load tokenizer/processor BEFORE full model (optimal sequence!)
+            # This way if tokenizer fails, we fail early before expensive model loading
+            task.substage = "Loading tokenizer/processor"
             if progress_callback:
                 progress_callback(10.0, None)
             task.progress = 10.0
 
-            logger.info(f"Loading model from {model_identifier}")
+            logger.info("[Phase 2] Loading tokenizer/processor (before model)...")
+
+            processor_or_tokenizer = None
+            last_error = None
+
+            # Determine what we need based on early metadata
+            if is_vlm:
+                # For VLMs: Try loading processor first
+                logger.info("[Phase 2] Detected VLM - loading processor...")
+                try:
+                    from transformers import AutoProcessor
+
+                    with suppress_transformers_output():
+                        processor_or_tokenizer = AutoProcessor.from_pretrained(
+                            model_identifier,
+                            trust_remote_code=True,
+                        )
+                    logger.info("[Phase 2] ✓ Processor loaded successfully (VLM)")
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"[Phase 2] Failed to load processor for VLM, falling back to tokenizer: {str(e)[:100]}"
+                    )
+                    is_vlm = False  # Fall back to tokenizer loading below
+
+            # Load tokenizer if not VLM or if VLM processor loading failed
+            if not is_vlm:
+                logger.info("[Phase 2] Loading tokenizer for LLM (or VLM fallback)...")
+
+                # Build list of tokenizer sources to try
+                tokenizer_sources = []
+
+                # Try 1: Local tokenizer files (if they exist in the HF directory)
+                tokenizer_sources.append((model_identifier, "Local tokenizer files"))
+
+                # Try 2: Dynamic discovery based on model_type
+                # This is the key improvement - uses our universal tokenizer discovery
+                if model_type_str:
+                    logger.debug(f"[Phase 2] Using dynamic discovery for model_type: {model_type_str}")
+                    canonical_model = _find_canonical_tokenizer_model(model_type_str)
+                    if canonical_model:
+                        tokenizer_sources.append((canonical_model, f"Canonical tokenizer for {model_type_str}"))
+                        logger.debug(f"[Phase 2] Will try canonical tokenizer: {canonical_model}")
+                else:
+                    logger.debug("[Phase 2] No model_type available, will try local files only")
+
+                # Try each tokenizer source
+                for tokenizer_source, description in tokenizer_sources:
+                    try:
+                        logger.debug(f"[Phase 2] Attempting: {description} from {tokenizer_source}")
+                        with suppress_transformers_output():
+                            processor_or_tokenizer = AutoTokenizer.from_pretrained(
+                                tokenizer_source,
+                                trust_remote_code=True,
+                            )
+                        logger.info(f"[Phase 2] ✓ Tokenizer loaded: {description}")
+                        break
+                    except Exception as e:
+                        last_error = e
+                        logger.debug(f"[Phase 2] Failed: {str(e)[:100]}")
+                        continue
+
+            # Verify tokenizer was loaded
+            if processor_or_tokenizer is None:
+                error_msg = (
+                    f"Could not load tokenizer/processor from {model_identifier}\n\n"
+                    f"Model type: {model_type_str or 'unknown'}\n"
+                    f"Is VLM: {is_vlm}\n\n"
+                    f"Last error: {str(last_error) if last_error else 'Unknown'}\n\n"
+                    f"Troubleshooting:\n"
+                    f"  • Check model identifier is correct\n"
+                    f"  • Ensure HuggingFace model has tokenizer files\n"
+                    f"  • Check internet connection for downloading tokenizers\n"
+                    f"  • Try with a different model type"
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+            # PHASE 3: NOW load the full model (tokenizer already loaded)
+            task.substage = "Loading model from disk"
+            if progress_callback:
+                progress_callback(15.0, None)
+            task.progress = 15.0
+
+            logger.info(f"[Phase 3] Loading model from {model_identifier}")
 
             # CRITICAL: Validate quantization type is supported on this platform
             if task.quant_type in [QuantizationType.INT8, QuantizationType.INT4]:
@@ -879,7 +977,7 @@ class GenericQuantizer(BaseQuantizer):
             from ...utils.output_suppressor import suppress_transformers_output
 
             # Load model with fallback strategies (suppress library output)
-            logger.info(f"Loading model in {task.quant_type.display_name} format")
+            logger.info(f"[Phase 3] Loading model in {task.quant_type.display_name} format")
             with suppress_transformers_output():
                 model = self._load_model_with_fallbacks(
                     model_identifier,
@@ -949,125 +1047,9 @@ class GenericQuantizer(BaseQuantizer):
                 progress_callback(60.0, None)
             task.progress = 60.0
 
-            # Load tokenizer/processor (suppress library output)
-            # For VLMs, we need processor (tokenizer + image_processor)
-            # For LLMs, we just need tokenizer
-            task.substage = "Loading tokenizer/processor"
-            logger.info("Detecting model type and loading appropriate tokenizer/processor...")
-            
-            # Check if model is a VLM by inspecting architecture
-            is_vlm = False
-            processor_or_tokenizer = None
-            last_error = None
-            
-            # Try to detect VLM from model's config
-            try:
-                config = model.config
-                arch = config.architectures[0] if hasattr(config, 'architectures') and config.architectures else ""
-                
-                # VLM patterns
-                vlm_patterns = [
-                    "ForConditionalGeneration", "VisionTextDual", "Llava", "Blip",
-                    "Qwen2VL", "Qwen3VL", "QwenVL", "InstructBlip", "Idefics"
-                ]
-                is_vlm = any(pattern in arch for pattern in vlm_patterns)
-                
-                # Also check for vision config
-                if not is_vlm:
-                    config_dict = config.to_dict()
-                    is_vlm = any(key in config_dict for key in ["vision_config", "visual_config", "image_encoder"])
-                
-                logger.info(f"Model architecture: {arch}, VLM: {is_vlm}")
-            except Exception as e:
-                logger.debug(f"Could not detect VLM from config: {e}")
-            
-            # Load processor for VLMs, tokenizer for LLMs
-            if is_vlm:
-                # Try loading processor for VLM
-                try:
-                    logger.info("Loading processor for VLM...")
-                    from transformers import AutoProcessor
-                    
-                    with suppress_transformers_output():
-                        processor_or_tokenizer = AutoProcessor.from_pretrained(
-                            model_identifier,
-                            trust_remote_code=True
-                        )
-                    logger.info("✓ Processor loaded successfully (VLM)")
-                except Exception as e:
-                    last_error = e
-                    logger.warning(f"Failed to load processor for VLM, trying tokenizer: {e}")
-                    is_vlm = False  # Fall back to tokenizer
-            
-            if not is_vlm:
-                # Load tokenizer for LLM (or VLM fallback)
-                logger.info("Loading tokenizer...")
-
-                # For converted Ollama models (from GGUF→HF), the tokenizer won't be in the directory
-                # So we try multiple strategies:
-                tokenizer_sources = []
-
-                # Strategy 1: Direct path (HF model with tokenizer files)
-                tokenizer_sources.append((model_identifier, "Local model directory"))
-
-                # Strategy 2: Dynamic discovery - use the new universal tokenizer finder
-                # This works for ANY model type (gemma, llama, qwen, etc.)
-                try:
-                    if Path(model_identifier).is_dir():
-                        # This is a local directory - check if it has tokenizer files
-                        dir_path = Path(model_identifier)
-                        has_tokenizer_files = any(
-                            (dir_path / f).exists()
-                            for f in ['tokenizer.json', 'tokenizer.model', 'vocab.json', 'tokenizer_config.json']
-                        )
-
-                        if not has_tokenizer_files:
-                            # Use dynamic tokenizer discovery
-                            try:
-                                config = model.config
-                                model_type = config.model_type if hasattr(config, 'model_type') else None
-
-                                if model_type:
-                                    logger.debug(f"No tokenizer files found, using dynamic discovery for model_type: {model_type}")
-                                    canonical_model = _find_canonical_tokenizer_model(model_type)
-
-                                    if canonical_model:
-                                        tokenizer_sources.append((canonical_model, f"Dynamically discovered tokenizer for {model_type}"))
-                                        logger.debug(f"Will try discovered tokenizer: {canonical_model}")
-                            except Exception as e:
-                                logger.debug(f"Could not detect architecture for tokenizer discovery: {e}")
-                except Exception as e:
-                    logger.debug(f"Error checking for tokenizer files: {e}")
-
-                # Try each tokenizer source
-                for tokenizer_source, description in tokenizer_sources:
-                    try:
-                        logger.debug(f"Attempting to load tokenizer from: {description} ({tokenizer_source})")
-                        with suppress_transformers_output():
-                            processor_or_tokenizer = AutoTokenizer.from_pretrained(
-                                tokenizer_source,
-                                trust_remote_code=True
-                            )
-                        logger.info(f"✓ Tokenizer loaded successfully from: {description}")
-                        break
-                    except Exception as e:
-                        last_error = e
-                        logger.debug(f"Failed to load from {tokenizer_source}: {e}")
-                        continue
-
-                # If all attempts failed
-                if processor_or_tokenizer is None:
-                    logger.error(f"Could not load tokenizer from any source")
-
-            if processor_or_tokenizer is None:
-                # All attempts failed - provide detailed error
-                error_msg = (
-                    f"Could not load tokenizer/processor from {model_identifier}\n\n"
-                    f"Last error: {str(last_error)}\n\n"
-                    f"Try checking the model identifier is correct."
-                )
-
-                raise RuntimeError(error_msg)
+            # NOTE: Tokenizer/processor is ALREADY LOADED in Phase 2
+            # We now have: is_vlm, model_type_str, model, and processor_or_tokenizer
+            # This is the optimal sequence: metadata → tokenizer → model → quantize
 
             # Update progress: Saving
             task.stage = "Saving"
