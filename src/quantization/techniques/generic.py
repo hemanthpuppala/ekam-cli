@@ -800,6 +800,7 @@ class GenericQuantizer(BaseQuantizer):
         try:
             import torch
             from transformers import AutoTokenizer
+            from ...utils.output_suppressor import suppress_transformers_output
 
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting {task.quant_type.display_name} quantization")
@@ -972,9 +973,6 @@ class GenericQuantizer(BaseQuantizer):
                     )
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
-
-            # Import output suppressor for clean TUI
-            from ...utils.output_suppressor import suppress_transformers_output
 
             # Load model with fallback strategies (suppress library output)
             logger.info(f"[Phase 3] Loading model in {task.quant_type.display_name} format")
