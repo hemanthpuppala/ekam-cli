@@ -505,9 +505,9 @@ class GGUFReader:
             n_elements = int(np.prod(shape))
 
             # Read raw tensor data
-            # Calculate bytes needed (estimate based on quant type)
-            bytes_per_element = self._estimate_bytes_per_element(quant_type, n_elements)
-            raw_data = f.read(bytes_per_element)
+            # Use estimated bytes, but allow reading less if we reach next tensor
+            bytes_estimated = self._estimate_bytes_per_element(quant_type, n_elements)
+            raw_data = f.read(bytes_estimated)
 
             try:
                 # Dequantize using universal dequantizer
@@ -531,6 +531,18 @@ class GGUFReader:
                         logger.warning(f"Skipping tensor {name}")
                         continue
 
+                # Verify we have all elements
+                if len(data) != n_elements:
+                    logger.warning(
+                        f"Tensor {name}: expected {n_elements} elements, got {len(data)}"
+                    )
+                    if len(data) < n_elements:
+                        # Pad with zeros
+                        data = np.pad(data, (0, n_elements - len(data)), mode='constant')
+                    else:
+                        # Truncate
+                        data = data[:n_elements]
+
                 # Reshape and convert to tensor
                 tensor = torch.from_numpy(data).reshape(shape).to(torch.float32)
                 tensors[name] = tensor
@@ -538,7 +550,7 @@ class GGUFReader:
 
             except Exception as e:
                 logger.error(f"Failed to process tensor {name}: {e}")
-                logger.debug(f"Raw data size: {len(raw_data)} bytes, expected ~{bytes_per_element}")
+                logger.debug(f"Raw data: {len(raw_data)} bytes, elements: {n_elements}, est: ~{bytes_estimated}")
                 continue
 
         return tensors

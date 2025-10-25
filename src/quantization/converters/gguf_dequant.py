@@ -52,6 +52,7 @@ class QuantType(Enum):
     I64 = 27
     F64 = 28
     IQ1_M = 29
+    BF16 = 30  # Brain Float 16
 
 
 class Dequantizer:
@@ -70,9 +71,9 @@ class Dequantizer:
             Dequantized FP32 array
         """
         if quant_type == QuantType.F32:
-            return np.frombuffer(data, dtype=np.float32)
+            return np.frombuffer(data, dtype=np.float32, count=n_elements).astype(np.float32)
         elif quant_type == QuantType.F16:
-            return np.frombuffer(data, dtype=np.float16).astype(np.float32)
+            return np.frombuffer(data, dtype=np.float16, count=n_elements).astype(np.float32)
         elif quant_type == QuantType.BF16:
             return Dequantizer._dequant_bf16(data, n_elements)
         elif quant_type == QuantType.Q8_0:
