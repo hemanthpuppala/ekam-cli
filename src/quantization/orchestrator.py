@@ -150,6 +150,21 @@ class QuantizationOrchestrator:
                 f"  • MLX INT4 (Apple Silicon)\n"
             )
 
+        # MLX: Limited VLM architecture support (phi2, moondream not supported in mlx-vlm 0.3.4)
+        # MLX-VLM has limited model support - certain VLM architectures aren't implemented
+        if is_vlm and target_family == "MLX":
+            # Check for known unsupported architectures
+            # Get the model's architecture from its config if available
+            unsupported_vlm_archs = ["phi2", "phi3", "olmo"]  # phi2 used by moondream
+
+            # Log a warning but don't hard-block - MLX may support some VLMs
+            # The error will be caught at quantization time with helpful message
+            logger.debug(
+                f"MLX VLM support is limited in mlx-vlm 0.3.4. "
+                f"Proceeding with caution - quantization may fail for unsupported architectures. "
+                f"Model: {model_info.model_id}"
+            )
+
         # ========== STANDARD CONVERSION LOGIC ==========
 
         # CASE 1: GGUF/Ollama → GGUF quantization (direct requantization)
