@@ -304,34 +304,40 @@ class GGUFReader:
         self.architecture: Optional[str] = None
 
     def _estimate_bytes_per_element(self, quant_type: "GGMLQuantizationType", n_elements: int) -> int:
-        """Estimate bytes needed for tensor data based on quantization type.
+        """Estimate total bytes needed for tensor data based on quantization type.
 
         Args:
             quant_type: GGML quantization type
             n_elements: Number of elements in tensor
 
         Returns:
-            Estimated number of bytes
+            Estimated total number of bytes needed to read
         """
-        # Bytes per element for each type (approximate)
+        # Total bytes for each type (not per-element)
+        # Fixed-size types: multiply by element count
+        # Quantized types: use block-based calculations
         bytes_map = {
-            GGMLQuantizationType.F32: 4,      # 32-bit float
-            GGMLQuantizationType.F16: 2,      # 16-bit float
-            GGMLQuantizationType.Q8_0: (34 * n_elements) // 32,  # 2 scale + 32 values per block
-            GGMLQuantizationType.Q8_1: (36 * n_elements) // 32,  # 2 scale + 2 offset + 32 values
-            GGMLQuantizationType.Q4_0: (18 * n_elements) // 32,  # 2 scale + 16 packed 4-bit values
-            GGMLQuantizationType.Q4_1: (20 * n_elements) // 32,  # 2 scale + 2 min + 16 packed 4-bit values
-            GGMLQuantizationType.Q4_K: (n_elements + 127) // 128,  # ~1 byte per element (blocks of 256)
+            # Full precision floating point
+            GGMLQuantizationType.F32: n_elements * 4,       # 32-bit float
+            GGMLQuantizationType.F16: n_elements * 2,       # 16-bit float (half precision)
+            # Note: F64 and BF16 not in GGMLQuantizationType enum but handled by default
+            # Quantized types (block-based)
+            GGMLQuantizationType.Q8_0: (34 * n_elements) // 32,   # 2 scale + 32 values per block
+            GGMLQuantizationType.Q8_1: (36 * n_elements) // 32,   # 2 scale + 2 offset + 32 values
+            GGMLQuantizationType.Q4_0: (18 * n_elements) // 32,   # 2 scale + 16 packed 4-bit values
+            GGMLQuantizationType.Q4_1: (20 * n_elements) // 32,   # 2 scale + 2 min + 16 packed 4-bit values
+            GGMLQuantizationType.Q4_K: (n_elements + 127) // 128, # K-quant: ~1 byte per element
             GGMLQuantizationType.Q5_0: (22 * n_elements) // 32,
             GGMLQuantizationType.Q5_1: (24 * n_elements) // 32,
             GGMLQuantizationType.Q5_K: (n_elements + 127) // 128,
             GGMLQuantizationType.Q6_K: ((n_elements * 3) + 127) // 128,
             GGMLQuantizationType.Q2_K: (n_elements + 255) // 256,
             GGMLQuantizationType.Q3_K: ((n_elements + 32) // 33) * 16,
-            GGMLQuantizationType.I8: 1,
-            GGMLQuantizationType.I16: 2,
-            GGMLQuantizationType.I32: 4,
-            GGMLQuantizationType.I64: 8,
+            # Integer types
+            GGMLQuantizationType.I8: n_elements * 1,
+            GGMLQuantizationType.I16: n_elements * 2,
+            GGMLQuantizationType.I32: n_elements * 4,
+            GGMLQuantizationType.I64: n_elements * 8,
         }
 
         return bytes_map.get(quant_type, (n_elements * 4))  # Default to 4 bytes per element
