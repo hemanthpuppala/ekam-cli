@@ -577,12 +577,36 @@ class MLXQuantizer(BaseQuantizer):
         Args:
             error_msg: Error message from MLX subprocess
             model_info: Model information
-            is_vlm: Whether this is a VLM
-
-        Returns:
-            Helpful error message with suggestions
         """
         import re
+
+        # Check for TextConfig or other Config initialization errors
+        # This happens when MLX can't parse the model's config structure
+        config_error_match = re.search(
+            r"(\w+Config).__init__\(\) missing \d+ required positional argument",
+            error_msg,
+            re.IGNORECASE
+        )
+
+        if config_error_match:
+            config_class = config_error_match.group(1)
+            return (
+                f"❌ MLX conversion failed: Model config incompatibility\n\n"
+                f"Model: {model_info.model_id}\n"
+                f"Type: {'VLM' if is_vlm else 'LLM'}\n"
+                f"Issue: {config_class} configuration not fully supported by MLX\n\n"
+                f"MLX may need an update to support this model architecture.\n\n"
+                f"🔧 Solutions:\n\n"
+                f"1. **UPDATE MLX** (Recommended):\n"
+                f"   pip install --upgrade mlx mlx-lm mlx-vlm\n\n"
+                f"2. **Use alternative quantization methods** (works with ALL models):\n"
+                f"   • Generic FP16 - Platform-universal, best quality\n"
+                f"   • OpenVINO INT4/INT8 - For Intel CPUs\n"
+                f"   • GGUF - For pure LLMs (llama.cpp compatible)\n\n"
+                f"3. **Check model compatibility**:\n"
+                f"   Visit: https://github.com/Blaizzy/mlx-vlm/releases\n\n"
+                f"💡 Tip: Generic FP16 works with ALL models on Mac and is production-ready."
+            )
 
         # Check for "Model type X not supported" error
         unsupported_match = re.search(r"Model type (\w+) not supported", error_msg, re.IGNORECASE)

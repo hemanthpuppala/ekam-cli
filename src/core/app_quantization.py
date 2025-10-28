@@ -12,10 +12,10 @@ from ..services.session import SessionManager
 
 
 def show_quantization_or_inference_menu() -> str:
-    """Show menu to choose between Quantization or Inference.
+    """Show menu to choose between Quantization, Finetuning, or Inference.
 
     Returns:
-        "quantization", "inference", "diagnostics", or "quit"
+        "quantization", "finetuning", "inference", "diagnostics", or "quit"
     """
     tui.clear_screen()
 
@@ -32,7 +32,11 @@ def show_quantization_or_inference_menu() -> str:
     Reduce model size through quantization
     Create optimized models for faster inference
 
-[3] [blue]System Diagnostics[/blue]
+[3] [magenta]Finetuning[/magenta]
+    Adapt models to your domain using LoRA, QLoRA, or Full finetuning
+    Improve performance on custom tasks with your data
+
+[4] [blue]System Diagnostics[/blue]
     View hardware capabilities and quantization support
     Check installed dependencies and recommendations
 
@@ -46,7 +50,7 @@ Full transparency and hardware capability detection[/dim]""",
     )
 
     while True:
-        choice = tui.prompt("Choose [1/2/3/q]:", style="cyan").strip().lower()
+        choice = tui.prompt("Choose [1/2/3/4/q]:", style="cyan").strip().lower()
 
         if choice in ["q", "quit", "exit"]:
             return "quit"
@@ -55,9 +59,11 @@ Full transparency and hardware capability detection[/dim]""",
         elif choice == "2":
             return "quantization"
         elif choice == "3":
+            return "finetuning"
+        elif choice == "4":
             return "diagnostics"
         else:
-            tui.show_error("Invalid choice. Enter 1, 2, 3, or 'q'")
+            tui.show_error("Invalid choice. Enter 1, 2, 3, 4, or 'q'")
 
 
 def initialize_quantization_manager(session_manager: SessionManager) -> QuantizationManager:
@@ -154,4 +160,52 @@ def run_quantization_mode(session_manager: SessionManager) -> str:
             return "switch_inference"
         else:
             tui.show_error("Invalid choice. Enter 1, 2, 3, 'b', 'm', or 'q'")
+            tui.prompt("Press Enter to continue...", style="dim")
+
+
+def run_finetuning_mode(session_manager: SessionManager) -> str:
+    """Run finetuning mode.
+
+    Args:
+        session_manager: Session manager
+
+    Returns:
+        "quit" to quit app
+        "main_menu" to return to main menu
+        "switch_inference" to switch to inference mode
+        "switch_quantization" to switch to quantization mode
+    """
+    from .app_finetuning import (
+        show_finetuning_home_menu,
+        start_finetuning_workflow,
+        execute_finetuning,
+    )
+
+    while True:
+        # Show finetuning home menu
+        try:
+            action = show_finetuning_home_menu()
+
+            if action == "quit":
+                return "quit"
+            elif action == "main_menu":
+                return "main_menu"
+            elif action == "inference":
+                return "switch_inference"
+            elif action == "quantization":
+                return "switch_quantization"
+            elif action == "start_finetuning":
+                # Start new finetuning workflow
+                pipeline = start_finetuning_workflow(session_manager)
+                if pipeline:
+                    execute_finetuning(pipeline)
+            elif action == "load_finetuning_config":
+                tui.show_info("Loading previous configuration not yet implemented.\nUse 'Start New' instead.")
+
+        except KeyboardInterrupt:
+            logger.info("User interrupted finetuning mode")
+            return "main_menu"
+        except Exception as e:
+            logger.error(f"Error in finetuning mode: {e}", exc_info=True)
+            tui.show_error(f"Error: {e}")
             tui.prompt("Press Enter to continue...", style="dim")

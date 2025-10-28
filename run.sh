@@ -38,7 +38,7 @@ echo -e "${BLUE}=== VLM/LLM CLI Launcher ===${NC}"
 echo
 
 # Check Python version (require 3.8+)
-echo -e "${BLUE}[1/5]${NC} Checking Python version..."
+echo -e "${BLUE}[1/6]${NC} Checking Python version..."
 if [ -z "$PYTHON_CMD" ]; then
     echo -e "${RED}Error: Python not found${NC}"
     echo "Please install Python 3.8 or higher"
@@ -61,7 +61,7 @@ fi
 echo -e "${GREEN}✓${NC} Python ${PYTHON_VERSION} found"
 
 # Create virtual environment if it doesn't exist
-echo -e "${BLUE}[2/5]${NC} Checking virtual environment..."
+echo -e "${BLUE}[2/6]${NC} Checking virtual environment..."
 if [ ! -d "venv" ]; then
     echo "Creating virtual environment..."
     $PYTHON_CMD -m venv venv
@@ -71,7 +71,7 @@ else
 fi
 
 # Activate virtual environment
-echo -e "${BLUE}[3/5]${NC} Activating virtual environment..."
+echo -e "${BLUE}[3/6]${NC} Activating virtual environment..."
 if [ -f "$VENV_ACTIVATE" ]; then
     source "$VENV_ACTIVATE"
     echo -e "${GREEN}✓${NC} Virtual environment activated"
@@ -82,7 +82,7 @@ else
 fi
 
 # Install/update dependencies
-echo -e "${BLUE}[4/5]${NC} Checking dependencies..."
+echo -e "${BLUE}[4/6]${NC} Checking dependencies..."
 if [ ! -f "venv/.dependencies_installed" ] || [ "requirements.txt" -nt "venv/.dependencies_installed" ]; then
     echo "Installing dependencies (this may take a few minutes)..."
     pip install --upgrade pip > /dev/null 2>&1
@@ -94,7 +94,7 @@ else
 fi
 
 # Create config.yaml if it doesn't exist
-echo -e "${BLUE}[5/5]${NC} Preparing configuration..."
+echo -e "${BLUE}[5/6]${NC} Preparing configuration..."
 if [ ! -f "config.yaml" ]; then
     echo -e "${YELLOW}⚠${NC}  config.yaml not found"
     if [ -f "config.yaml.example" ]; then
@@ -106,6 +106,54 @@ if [ ! -f "config.yaml" ]; then
     fi
 else
     echo -e "${GREEN}✓${NC} Configuration file found"
+fi
+
+echo
+
+# System specs check
+echo -e "${BLUE}[6/6]${NC} Detecting system specifications..."
+SYS_SPECS=$($PYTHON_CMD -c "
+try:
+    import psutil
+    import platform
+    mem = psutil.virtual_memory()
+    print(f'{platform.system()}|{platform.machine()}|{psutil.cpu_count(logical=False)}|{psutil.cpu_count(logical=True)}|{mem.total/(1024**3):.1f}')
+except:
+    print('Unknown|Unknown|0|0|0')
+" 2>/dev/null)
+
+IFS='|' read -r SYS_PLATFORM SYS_ARCH SYS_CORES_PHYS SYS_CORES_LOG SYS_RAM <<< "$SYS_SPECS"
+
+echo -e "${GREEN}✓${NC} Platform: $SYS_PLATFORM ($SYS_ARCH)"
+echo -e "${GREEN}✓${NC} CPU: $SYS_CORES_PHYS cores ($SYS_CORES_LOG logical)"
+echo -e "${GREEN}✓${NC} RAM: ${SYS_RAM} GB"
+
+# Check temperature if available
+TEMP_CHECK=$($PYTHON_CMD -c "
+try:
+    import psutil
+    temps = psutil.sensors_temperatures()
+    if temps:
+        for name, entries in temps.items():
+            for entry in entries:
+                if hasattr(entry, 'current'):
+                    print(f'{entry.current:.1f}')
+                    break
+            break
+    else:
+        print('N/A')
+except:
+    print('N/A')
+" 2>/dev/null)
+
+if [ "$TEMP_CHECK" != "N/A" ]; then
+    if (( $(echo "$TEMP_CHECK >= 85" | bc -l 2>/dev/null || echo 0) )); then
+        echo -e "${RED}⚠${NC}  CPU Temp: ${TEMP_CHECK}°C (High!)"
+    elif (( $(echo "$TEMP_CHECK >= 70" | bc -l 2>/dev/null || echo 0) )); then
+        echo -e "${YELLOW}⚠${NC}  CPU Temp: ${TEMP_CHECK}°C"
+    else
+        echo -e "${GREEN}✓${NC} CPU Temp: ${TEMP_CHECK}°C"
+    fi
 fi
 
 echo

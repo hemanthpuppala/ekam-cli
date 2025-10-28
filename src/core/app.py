@@ -518,7 +518,7 @@ def run_point_endpoint(session_manager: SessionManager, model_info: "ModelInfo")
 from .app_chat import run_chat_endpoint
 
 # Import quantization integration
-from .app_quantization import show_quantization_or_inference_menu, run_quantization_mode
+from .app_quantization import show_quantization_or_inference_menu, run_quantization_mode, run_finetuning_mode
 
 
 def run_install_workflow(
@@ -1047,6 +1047,38 @@ def main() -> None:
                 continue
             elif result == "switch_quantization":
                 logger.info("Switching from inference to quantization mode")
+                operation_mode = "quantization"
+                continue
+            elif result == "switch_finetuning":
+                logger.info("Switching from inference to finetuning mode")
+                operation_mode = "finetuning"
+                continue
+
+        elif operation_mode == "finetuning":
+            # Run finetuning mode
+            logger.info("Running Finetuning mode")
+            result = run_finetuning_mode(session_manager)
+
+            if result == "quit":
+                logger.info("User quit from finetuning mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from finetuning")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_inference":
+                logger.info("Switching from finetuning to inference mode")
+                operation_mode = "inference"
+                continue
+            elif result == "switch_quantization":
+                logger.info("Switching from finetuning to quantization mode")
                 operation_mode = "quantization"
                 continue
 

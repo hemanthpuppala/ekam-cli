@@ -87,7 +87,7 @@ class TUIManager:
             self.live = None
 
     def prompt(self, message: str, style: str = "cyan") -> str:
-        """Show a prompt and get user input.
+        """Show a prompt and get user input using professional text input handler.
 
         Args:
             message: Prompt message
@@ -96,8 +96,9 @@ class TUIManager:
         Returns:
             User input string
         """
-        self.console.print(f"[{style}]{message}[/{style}]", end="")
-        return input(" ")
+        # Use professional prompt handler for proper escape sequence handling
+        from .text_input import professional_prompt
+        return professional_prompt.get_input(message, style=style, show_instructions=False)
 
     def prompt_in_box(self, message: str, title: str = "Input", style: str = "cyan") -> str:
         """Show a prompt in a box and get user input.
@@ -123,8 +124,10 @@ class TUIManager:
         self.console.print()
         self.console.print(panel)
         self.console.print()
-        self.console.print(f"[{style}]→[/{style}] ", end="")
-        return input()
+
+        # Use professional prompt handler for consistent input handling
+        from .text_input import professional_prompt
+        return professional_prompt.get_input(f"[{style}]→[/{style}]", style=style, show_instructions=False)
 
     def show_error(self, message: str) -> None:
         """Display error message in a red panel.

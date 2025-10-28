@@ -10,7 +10,7 @@ providers:
     - cuda
     - mps
     - cpu
-    hf_token: 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
+    hf_token: ${HF_TOKEN}  # Set via environment variable
   lm_studio:
     enabled: false
     host: http://localhost:1234

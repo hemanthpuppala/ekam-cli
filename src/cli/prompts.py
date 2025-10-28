@@ -40,19 +40,10 @@ def prompt_numeric(prompt: str, min_val: int, max_val: int) -> int:
     Raises:
         UserExitException: If user wants to exit (type 'back', 'quit', 'q', 'b')
     """
-    tui.console.print("[dim]Type 'back' or 'q' to go back[/dim]")
-    while True:
-        user_input = tui.prompt(prompt, style="cyan").strip()
-        _check_exit_keywords(user_input)
+    from .text_input import professional_prompt
 
-        try:
-            value = int(user_input)
-            if min_val <= value <= max_val:
-                return value
-            else:
-                tui.show_error(f"Please enter a number between {min_val} and {max_val}")
-        except ValueError:
-            tui.show_error("Please enter a valid number")
+    tui.console.print("[dim]Type 'back' or 'q' to go back[/dim]")
+    return professional_prompt.get_numeric(prompt, min_val, max_val, style="cyan")
 
 
 def prompt_yes_no(prompt: str, default: bool = False) -> bool:
@@ -65,13 +56,9 @@ def prompt_yes_no(prompt: str, default: bool = False) -> bool:
     Returns:
         True for yes, False for no
     """
-    default_str = "Y/n" if default else "y/N"
-    response = tui.prompt(f"{prompt} [{default_str}]:", style="cyan").lower().strip()
+    from .text_input import professional_prompt
 
-    if not response:
-        return default
-
-    return response in ["y", "yes"]
+    return professional_prompt.get_confirmation(prompt, default=default, style="cyan")
 
 
 def prompt_file_path(prompt: str, must_exist: bool = True) -> Path:
@@ -87,9 +74,11 @@ def prompt_file_path(prompt: str, must_exist: bool = True) -> Path:
     Raises:
         UserExitException: If user wants to exit (type 'back', 'quit', 'q', 'b')
     """
+    from .text_input import professional_prompt
+
     tui.console.print("[dim]Type 'back' or 'q' to go back[/dim]")
     while True:
-        path_str = tui.prompt(prompt, style="cyan").strip()
+        path_str = professional_prompt.get_file_path(prompt, style="cyan")
         _check_exit_keywords(path_str)
 
         if not path_str:
@@ -140,9 +129,11 @@ def prompt_question() -> str:
     Raises:
         UserExitException: If user wants to exit (type 'back', 'quit', 'q', 'b')
     """
-    tui.console.print("[dim]Type 'back' or 'q' to go back[/dim]")
+    from .text_input import professional_prompt
+
+    tui.console.print("[dim]Type 'back' or 'q' to go back. Multi-line input supported (Ctrl+J for newline)[/dim]")
     while True:
-        question = tui.prompt("Enter your question:", style="cyan").strip()
+        question = professional_prompt.get_question(style="cyan")
         _check_exit_keywords(question)
 
         if question:
@@ -164,9 +155,11 @@ def prompt_text_input(prompt: str = "Enter text:", allow_blank: bool = False) ->
     Raises:
         UserExitException: If user wants to exit (type 'back', 'quit', 'q', 'b')
     """
-    tui.console.print("[dim]Type 'back' or 'q' to go back[/dim]")
+    from .text_input import professional_prompt
+
+    tui.console.print("[dim]Type 'back' or 'q' to go back. Multi-line supported (Ctrl+J for newline)[/dim]")
     while True:
-        text = tui.prompt(prompt, style="cyan").strip()
+        text = professional_prompt.get_text(prompt, style="cyan", allow_blank=allow_blank)
         _check_exit_keywords(text)
 
         if text or allow_blank:
@@ -185,17 +178,9 @@ def prompt_choice(prompt: str, choices: list[str]) -> str:
     Returns:
         Selected choice
     """
-    choices_lower = [c.lower() for c in choices]
+    from .text_input import professional_prompt
 
-    while True:
-        choice = tui.prompt(
-            f"{prompt} [{'/'.join(choices)}]:", style="cyan"
-        ).lower().strip()
-
-        if choice in choices_lower:
-            return choices[choices_lower.index(choice)]
-
-        tui.show_error(f"Please choose from: {', '.join(choices)}")
+    return professional_prompt.get_choice(prompt, choices, style="cyan")
 
 
 def prompt_model_name(provider: str = "ollama") -> str:
@@ -237,8 +222,11 @@ def prompt_model_name(provider: str = "ollama") -> str:
         tui.console.print("[dim]See https://huggingface.co/models for all models[/dim]\n")
 
     tui.console.print("[dim]Type 'back' or 'q' to cancel[/dim]")
+
+    from .text_input import professional_prompt
+
     while True:
-        model_name = tui.prompt("Enter model name to install:", style="cyan").strip()
+        model_name = professional_prompt.get_input("Enter model name to install:", style="cyan", show_instructions=False).strip()
         _check_exit_keywords(model_name)
 
         if model_name:
@@ -286,10 +274,13 @@ Proceeding may cause:
 """
         tui.show_panel(message, title="Installation Warning", border_style="yellow")
 
+        from .text_input import professional_prompt
+
         # Require explicit "yes, proceed anyway"
-        response = tui.prompt(
+        response = professional_prompt.get_input(
             "Type 'yes, proceed anyway' to continue or press Enter to cancel:",
-            style="yellow"
+            style="yellow",
+            show_instructions=False
         ).lower().strip()
 
         return response == "yes, proceed anyway"
@@ -346,10 +337,13 @@ This action cannot be undone.
 """
     tui.show_panel(message, title="Confirm Deletion", border_style="yellow")
 
+    from .text_input import professional_prompt
+
     # Require explicit confirmation
-    response = tui.prompt(
+    response = professional_prompt.get_input(
         "Type 'delete' to confirm or press Enter to cancel:",
-        style="yellow"
+        style="yellow",
+        show_instructions=False
     ).lower().strip()
 
     return response == "delete"
@@ -378,8 +372,10 @@ def prompt_enable_history(endpoint_name: str) -> bool:
     tui.show_panel(message, title="Choose Mode", border_style="cyan")
     tui.console.print("[dim]Type 'back' or 'q' to go back[/dim]")
 
+    from .text_input import professional_prompt
+
     while True:
-        choice = tui.prompt("Choose [1/2]:", style="cyan").strip()
+        choice = professional_prompt.get_input("Choose [1/2]:", style="cyan", show_instructions=False).strip()
         _check_exit_keywords(choice)
 
         if choice == "1" or choice.lower() in ["y", "yes", "with"]:
@@ -442,11 +438,14 @@ def select_or_create_session(
     tui.console.print("\n[dim]Type 'back' or 'q' to go back[/dim]")
     tui.console.print()
 
+    from .text_input import professional_prompt
+
     # Get user choice with clearer prompt
     while True:
-        choice = tui.prompt(
+        choice = professional_prompt.get_input(
             f"Your choice [1-{len(existing_sessions)}/n]:",
-            style="cyan bold"
+            style="cyan",
+            show_instructions=False
         ).lower().strip()
         _check_exit_keywords(choice)
 

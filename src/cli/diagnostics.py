@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 from rich.console import Console
 from rich.table import Table
@@ -11,6 +11,7 @@ from rich.text import Text
 from loguru import logger
 
 from ..quantization.techniques.platform_detector import PlatformDetector, DeviceCapabilities
+from ..system_specs import SystemSpecsDetector, MetricsExporter
 
 
 class SystemDiagnostics:
@@ -19,19 +20,24 @@ class SystemDiagnostics:
     def __init__(self):
         self.console = Console()
         self.capabilities: Optional[DeviceCapabilities] = None
+        self.system_specs: Optional[Dict] = None
 
-    def run_full_diagnostics(self, output_format: str = "rich") -> DeviceCapabilities:
+    def run_full_diagnostics(self, output_format: str = "rich") -> Dict:
         """Run complete system diagnostics.
 
         Args:
             output_format: Output format - "rich", "json", or "text"
 
         Returns:
-            DeviceCapabilities with all detected information
+            System specifications dictionary with all detected information
         """
-        logger.info("Running system diagnostics...")
-        
-        # Detect all capabilities
+        logger.info("Running comprehensive system diagnostics...")
+
+        # Detect all capabilities using new comprehensive module
+        detector = SystemSpecsDetector()
+        self.system_specs = detector.detect_all()
+
+        # Also detect quantization capabilities (legacy support)
         self.capabilities = PlatformDetector.detect_all()
 
         # Display based on format
@@ -42,11 +48,11 @@ class SystemDiagnostics:
         else:
             self._display_rich()
 
-        return self.capabilities
+        return self.system_specs
 
     def _display_rich(self):
         """Display diagnostics with rich formatting."""
-        if not self.capabilities:
+        if not self.system_specs:
             return
 
         caps = self.capabilities
@@ -155,6 +161,58 @@ class SystemDiagnostics:
                            "Requires CUDA + Optimum" if not caps.can_quantize_gptq else "Available")
 
         self.console.print(quant_table)
+
+        # Temperature Information (from new system_specs)
+        if 'temperature' in self.system_specs and self.system_specs['temperature']:
+            temp_table = Table(title="System Temperatures", show_header=True, header_style="bold red")
+            temp_table.add_column("Component", style="cyan")
+            temp_table.add_column("Temperature", style="white")
+            temp_table.add_column("Status", style="white")
+
+            temp_data = self.system_specs['temperature']
+
+            if 'cpu_celsius' in temp_data:
+                cpu_temp = temp_data['cpu_celsius']
+                status = "[green]Normal[/green]" if cpu_temp < 70 else "[yellow]Warm[/yellow]" if cpu_temp < 85 else "[red]Hot[/red]"
+                temp_table.add_row("CPU", f"{cpu_temp:.1f}°C", status)
+
+            if 'cpu_package_celsius' in temp_data:
+                pkg_temp = temp_data['cpu_package_celsius']
+                temp_table.add_row("CPU Package", f"{pkg_temp:.1f}°C", "")
+
+            if 'gpu_celsius' in temp_data:
+                for gpu_id, gpu_temp in temp_data['gpu_celsius'].items():
+                    status = "[green]Normal[/green]" if gpu_temp < 75 else "[yellow]Warm[/yellow]" if gpu_temp < 85 else "[red]Hot[/red]"
+                    temp_table.add_row(f"GPU {gpu_id}", f"{gpu_temp:.1f}°C", status)
+
+            if temp_data.get('throttling'):
+                temp_table.add_row("", "", "[red]⚠️ THROTTLING DETECTED[/red]")
+
+            self.console.print(temp_table)
+
+        # Storage Information (from new system_specs)
+        if 'storage' in self.system_specs and self.system_specs['storage']:
+            storage = self.system_specs['storage']
+            if storage.get('devices'):
+                storage_table = Table(title="Storage Devices", show_header=True, header_style="bold cyan")
+                storage_table.add_column("Mount Point", style="cyan")
+                storage_table.add_column("Total", style="white")
+                storage_table.add_column("Used", style="white")
+                storage_table.add_column("Free", style="white")
+                storage_table.add_column("Usage %", style="white")
+
+                for dev in storage['devices']:
+                    usage_pct = dev['percent_used']
+                    usage_style = "[green]" if usage_pct < 70 else "[yellow]" if usage_pct < 90 else "[red]"
+                    storage_table.add_row(
+                        dev['mount_point'],
+                        f"{dev['total_gb']:.1f} GB",
+                        f"{dev['used_gb']:.1f} GB",
+                        f"{dev['free_gb']:.1f} GB",
+                        f"{usage_style}{usage_pct:.1f}%[/]"
+                    )
+
+                self.console.print(storage_table)
 
         # Performance Recommendations
         perf_table = Table(title="Recommended Settings", show_header=True, header_style="bold green")

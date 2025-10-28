@@ -8,6 +8,8 @@ import torch
 from loguru import logger
 from PIL import Image
 
+from importlib import import_module
+
 from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
@@ -47,6 +49,102 @@ class HuggingFaceProvider(BaseProvider):
         # Determine best available device
         self.device = self._get_best_device()
         logger.info(f"HuggingFace provider initialized on device: {self.device}")
+
+        # Store current model reference for cleanup
+        self.current_model = None
+        self.current_processor = None
+
+    def _setup_mps_memory_management(self) -> None:
+        """Configure MPS memory management to avoid OOM errors.
+
+        Sets environment variables for better MPS memory handling and clears
+        any cached memory before loading a new model.
+        """
+        if self.device == "mps":
+            # Set a reasonable watermark ratio to prevent OOM while allowing growth
+            # This is safer than 0.0 which can cause system failure
+            os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.5"
+            logger.debug("Set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.5 for MPS memory management")
+
+            # Clear MPS cache to free up memory before loading new model
+            if hasattr(torch.mps, 'empty_cache'):
+                torch.mps.empty_cache()
+                logger.debug("Cleared MPS cache before model loading")
+
+    def _cleanup_current_model(self) -> None:
+        """Clean up the currently loaded model to free memory.
+
+        This is called before loading a new model to ensure maximum
+        available memory for the new model.
+        """
+        try:
+            if self.current_model is not None:
+                del self.current_model
+                self.current_model = None
+                logger.debug("Cleaned up previous model from memory")
+
+            if self.current_processor is not None:
+                del self.current_processor
+                self.current_processor = None
+                logger.debug("Cleaned up previous processor from memory")
+
+            # Clear GPU/MPS cache
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+                logger.debug("Cleared CUDA cache")
+            elif self.device == "mps":
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+                    logger.debug("Cleared MPS cache")
+        except Exception as e:
+            logger.debug(f"Error during model cleanup: {e}")
+
+    def _move_model_to_device(self, model: Any, target_device: str) -> str:
+        """Move model to target device with fallback to CPU on OOM.
+
+        Args:
+            model: The model to move
+            target_device: The target device (cuda, mps, or cpu)
+
+        Returns:
+            The actual device the model was moved to
+        """
+        try:
+            model.to(target_device)
+            logger.debug(f"Successfully moved model to {target_device}")
+            return target_device
+        except RuntimeError as e:
+            error_msg = str(e)
+
+            # Check for MPS out of memory
+            if "MPS backend out of memory" in error_msg and target_device == "mps":
+                logger.warning(
+                    f"MPS out of memory. Falling back to CPU. "
+                    f"Error: {error_msg[:100]}..."
+                )
+                try:
+                    model.to("cpu")
+                    return "cpu"
+                except Exception as cpu_error:
+                    logger.error(f"Failed to move model to CPU: {cpu_error}")
+                    raise RuntimeError(f"Failed to load model on any device: {e}")
+
+            # Check for CUDA out of memory
+            elif "CUDA out of memory" in error_msg and target_device == "cuda":
+                logger.warning(
+                    f"CUDA out of memory. Falling back to CPU. "
+                    f"Error: {error_msg[:100]}..."
+                )
+                try:
+                    torch.cuda.empty_cache()
+                    model.to("cpu")
+                    return "cpu"
+                except Exception as cpu_error:
+                    logger.error(f"Failed to move model to CPU: {cpu_error}")
+                    raise RuntimeError(f"Failed to load model on any device: {e}")
+
+            # Other runtime errors
+            raise
 
     def _prompt_and_save_token(self) -> bool:
         """Interactively prompt user for HF token and save to config.yaml.
@@ -479,6 +577,12 @@ class HuggingFaceProvider(BaseProvider):
         """
         logger.info(f"Loading HuggingFace model: {model_id}")
 
+        # Clean up previous model to free memory before loading new one
+        self._cleanup_current_model()
+
+        # Setup MPS memory management if needed
+        self._setup_mps_memory_management()
+
         # Retry loop for iterative dependency installation
         max_retries = 5  # Prevent infinite loops
         all_installed_deps = []
@@ -487,7 +591,11 @@ class HuggingFaceProvider(BaseProvider):
 
         for attempt in range(max_retries):
             try:
-                return self._load_model_internal(model_id)
+                model, processor = self._load_model_internal(model_id)
+                # Store references for cleanup
+                self.current_model = model
+                self.current_processor = processor
+                return (model, processor)
             except Exception as e:
                 error_msg = str(e)
                 all_errors.append(f"Attempt {attempt + 1}: {error_msg}")
@@ -697,7 +805,7 @@ class HuggingFaceProvider(BaseProvider):
                 # Try to load as VLM with processor (only import if needed)
                 try:
                     # Import VLM-specific classes (may not be available in all versions)
-                    from transformers import AutoProcessor
+                    from transformers import AutoConfig, AutoProcessor
 
                     # Suppress output during loading
                     with suppress_transformers_output():
@@ -730,61 +838,31 @@ class HuggingFaceProvider(BaseProvider):
                                 vlm_load_kwargs["attn_implementation"] = "sdpa"
                                 logger.info("✓ Using PyTorch SDPA for optimized attention")
 
-                        # Load VLM with appropriate model class
-                        # Try multiple classes in order of compatibility for custom/standard architectures
-                        model = None
-                        last_error = None
-                        
-                        # PRODUCTION FIX: Try AutoModelForCausalLM FIRST
-                        # This works with most VLMs including custom architectures (moondream2, etc.)
-                        # when trust_remote_code=True is enabled
-                        model_classes_to_try = [
-                            ('AutoModelForCausalLM', 'VLMs with custom configs (moondream, LLaVA, etc.)'),
-                            ('AutoModelForVision2Seq', 'Modern VLMs (Qwen2-VL, Idefics, etc.)'),
-                        ]
-                        
-                        for model_class_name, desc in model_classes_to_try:
-                            try:
-                                logger.debug(f"Trying {model_class_name} for VLM: {desc}")
-                                
-                                if model_class_name == 'AutoModelForCausalLM':
-                                    from transformers import AutoModelForCausalLM
-                                    
-                                    # Try with full kwargs first
-                                    try:
-                                        model = AutoModelForCausalLM.from_pretrained(model_id, **vlm_load_kwargs)
-                                    except (TypeError, ValueError) as param_error:
-                                        # Some models don't support all parameters (e.g., attn_implementation)
-                                        # Retry with minimal kwargs
-                                        logger.debug(f"Full kwargs failed, retrying with minimal kwargs: {param_error}")
-                                        minimal_kwargs = {
-                                            "cache_dir": str(self.cache_dir),
-                                            "trust_remote_code": True,
-                                            "torch_dtype": vlm_load_kwargs.get("torch_dtype", torch.float32),
-                                        }
-                                        model = AutoModelForCausalLM.from_pretrained(model_id, **minimal_kwargs)
-                                        
-                                elif model_class_name == 'AutoModelForVision2Seq':
-                                    from transformers import AutoModelForVision2Seq
-                                    model = AutoModelForVision2Seq.from_pretrained(model_id, **vlm_load_kwargs)
-                                
-                                # Verify model has .generate() method
-                                if not hasattr(model, 'generate'):
-                                    logger.debug(f"{model_class_name} loaded but has no .generate() method, trying next...")
-                                    model = None
-                                    continue
-                                
-                                logger.info(f"✓ Loaded VLM with {model_class_name}")
-                                break
-                                
-                            except Exception as e:
-                                last_error = e
-                                logger.debug(f"{model_class_name} failed: {str(e)[:200]}")
-                                continue
-                        
+                        # Inspect config to derive best-fit auto classes dynamically
+                        try:
+                            config = AutoConfig.from_pretrained(
+                                model_id,
+                                cache_dir=str(self.cache_dir),
+                                trust_remote_code=True,
+                                **token_kwarg,
+                            )
+                        except Exception as config_error:
+                            logger.debug(f"Failed to load config for VLM auto-class resolution: {config_error}")
+                            config = None
+
+                        model, attempted_classes, last_error = self._resolve_and_load_model(
+                            model_id=model_id,
+                            base_kwargs=vlm_load_kwargs,
+                            processor=processor,
+                            config=config,
+                            is_vlm=True,
+                        )
+
                         if model is None:
-                            error_msg = f"Could not load VLM {model_id} with any compatible model class.\n"
-                            error_msg += f"Tried: {', '.join([c[0] for c in model_classes_to_try])}\n"
+                            error_msg = (
+                                f"Could not load VLM {model_id} with any compatible model class.\n"
+                                f"Tried: {', '.join(attempted_classes)}\n"
+                            )
                             if last_error:
                                 error_msg += f"Last error: {str(last_error)[:300]}"
                             raise RuntimeError(error_msg)
@@ -798,8 +876,9 @@ class HuggingFaceProvider(BaseProvider):
                             f"This may be slower but will work correctly."
                         )
 
-                    model.to(target_device)
-                    logger.info(f"Loaded VLM model {model_id} on {target_device}")
+                    # Move model to device with OOM fallback
+                    actual_device = self._move_model_to_device(model, target_device)
+                    logger.info(f"Loaded VLM model {model_id} on {actual_device}")
                     return (model, processor)
                 except Exception as e:
                     logger.warning(f"Failed to load as VLM: {e}, trying as LLM...")
@@ -894,22 +973,36 @@ class HuggingFaceProvider(BaseProvider):
                         load_kwargs["attn_implementation"] = "sdpa"
                         logger.info("✓ Using PyTorch SDPA for optimized attention")
 
-                # PRODUCTION FIX: Use AutoModelForCausalLM for LLMs
-                # This works with both standard and custom architectures when trust_remote_code=True
-                # AutoModel doesn't support custom config classes, so we avoid it completely
-                from transformers import AutoModelForCausalLM
-                
+                # Dynamically resolve best auto-class for text models
+                from transformers import AutoConfig
+
                 try:
-                    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
-                except (TypeError, ValueError) as param_error:
-                    # Some models don't support all parameters
-                    logger.debug(f"Full kwargs failed, retrying with minimal kwargs: {param_error}")
-                    minimal_kwargs = {
-                        "cache_dir": str(self.cache_dir),
-                        "trust_remote_code": True,
-                        "torch_dtype": load_kwargs.get("torch_dtype", torch.float32),
-                    }
-                    model = AutoModelForCausalLM.from_pretrained(model_id, **minimal_kwargs)
+                    config = AutoConfig.from_pretrained(
+                        model_id,
+                        cache_dir=str(self.cache_dir),
+                        trust_remote_code=True,
+                        **token_kwarg,
+                    )
+                except Exception as config_error:
+                    logger.debug(f"Failed to load config for LLM auto-class resolution: {config_error}")
+                    config = None
+
+                model, attempted_classes, last_error = self._resolve_and_load_model(
+                    model_id=model_id,
+                    base_kwargs=load_kwargs,
+                    processor=tokenizer,
+                    config=config,
+                    is_vlm=False,
+                )
+
+                if model is None:
+                    error_msg = (
+                        f"Could not load model {model_id} with any compatible model class.\n"
+                        f"Tried: {', '.join(attempted_classes)}\n"
+                    )
+                    if last_error:
+                        error_msg += f"Last error: {str(last_error)[:300]}"
+                    raise RuntimeError(error_msg)
 
             # Determine target device - some models have MPS compatibility issues
             target_device = self.device
@@ -923,13 +1016,185 @@ class HuggingFaceProvider(BaseProvider):
                     f"This may be slower but will work correctly."
                 )
 
-            model.to(target_device)
-            logger.info(f"Loaded LLM model {model_id} on {target_device}")
+            # Move model to device with OOM fallback
+            actual_device = self._move_model_to_device(model, target_device)
+            logger.info(f"Loaded LLM model {model_id} on {actual_device}")
             return (model, tokenizer)
 
         except Exception as e:
             # Let the parent load_model method handle errors and retries
             raise
+
+    def _resolve_and_load_model(
+        self,
+        model_id: str,
+        base_kwargs: dict[str, Any],
+        processor: Any,
+        config: Optional[Any],
+        is_vlm: bool,
+    ) -> tuple[Optional[Any], list[str], Optional[Exception]]:
+        """Attempt to load a model by dynamically resolving the appropriate Auto* class.
+
+        Args:
+            model_id: Hugging Face model identifier.
+            base_kwargs: Keyword arguments to pass to `.from_pretrained()`.
+            processor: Loaded tokenizer or processor used to infer additional candidates.
+            config: Optional `AutoConfig` instance for the model.
+            is_vlm: Whether we are loading a vision-language model.
+
+        Returns:
+            Tuple of `(model, attempted_classes, last_error)`.
+        """
+
+        candidate_classes: list[tuple[str, str]] = []
+        attempted_classes: list[str] = []
+        last_error: Optional[Exception] = None
+
+        # Helper to append candidate if not already present
+        def add_candidate(class_path: str, reason: str) -> None:
+            if class_path not in [c[0] for c in candidate_classes]:
+                candidate_classes.append((class_path, reason))
+
+        # Baseline candidates depending on model type
+        if is_vlm:
+            add_candidate(
+                "transformers.AutoModelForVision2Seq",
+                "Vision-to-text architectures (e.g., Qwen-VL, LFM2-VL)",
+            )
+            add_candidate(
+                "transformers.AutoModelForCausalLM",
+                "VLMs with causal decoder heads (e.g., LLaVA, Moondream)",
+            )
+            add_candidate(
+                "transformers.AutoModelForUniversalSeg",
+                "Multimodal segmenters with text decoders",
+            )
+            add_candidate(
+                "transformers.AutoModel",
+                "Generic fallback for custom VLM architectures",
+            )
+        else:
+            add_candidate(
+                "transformers.AutoModelForCausalLM",
+                "Causal language models (default)",
+            )
+            add_candidate(
+                "transformers.AutoModelForSeq2SeqLM",
+                "Seq2seq text models",
+            )
+            add_candidate(
+                "transformers.AutoModel",
+                "Generic fallback",
+            )
+
+        # Enrich candidates from config information
+        if config is not None:
+            architectures = getattr(config, "architectures", None) or []
+            model_type = getattr(config, "model_type", None)
+            text_config = getattr(config, "text_config", None)
+            language_model = getattr(config, "language_model", None)
+
+            derived_types = []
+
+            for arch in architectures:
+                if arch:
+                    derived_types.append(arch)
+            if model_type:
+                derived_types.append(model_type)
+            if text_config and hasattr(text_config, "arch_type"):
+                derived_types.append(text_config.arch_type)
+            if isinstance(language_model, str):
+                derived_types.append(language_model)
+
+            for derived in derived_types:
+                if not derived:
+                    continue
+                derived_lower = derived.lower()
+                if "vision" in derived_lower or "vl" in derived_lower or "multimodal" in derived_lower:
+                    add_candidate(
+                        "transformers.AutoModelForVision2Seq",
+                        f"Detected vision language architecture '{derived}'",
+                    )
+                if "causal" in derived_lower or derived_lower.endswith("forcausallm"):
+                    add_candidate(
+                        "transformers.AutoModelForCausalLM",
+                        f"Detected causal LM architecture '{derived}'",
+                    )
+                if "seq2seq" in derived_lower or derived_lower.endswith("forconditionalgeneration"):
+                    add_candidate(
+                        "transformers.AutoModelForSeq2SeqLM",
+                        f"Detected seq2seq architecture '{derived}'",
+                    )
+
+                # Specialized handling for LiquidAI LFM2-VL family
+                if "lfm2" in derived_lower or derived_lower == "lfm2_vlforconditionalgeneration":
+                    add_candidate(
+                        "transformers.AutoModelForImageTextToText",
+                        "LFM2-VL requires AutoModelForImageTextToText (transformers>=4.57)",
+                    )
+                    add_candidate(
+                        "transformers.models.lfm2_vl.modeling_lfm2_vl.Lfm2VlForConditionalGeneration",
+                        "Direct LFM2-VL implementation fallback",
+                    )
+
+            if model_type and model_type.lower() == "lfm2_vl":
+                add_candidate(
+                    "transformers.AutoModelForImageTextToText",
+                    "Model type 'lfm2_vl' detected",
+                )
+                add_candidate(
+                    "transformers.models.lfm2_vl.modeling_lfm2_vl.Lfm2VlForConditionalGeneration",
+                    "Direct LFM2-VL implementation fallback",
+                )
+
+        # Add fallback derived from tokenizer/processor type
+        if processor is not None:
+            proc_class = processor.__class__.__name__.lower()
+            if "processor" in proc_class and is_vlm:
+                add_candidate(
+                    "transformers.AutoModelForVision2Seq",
+                    f"Processor {processor.__class__.__name__} suggests VLM",
+                )
+
+        model: Optional[Any] = None
+
+        for class_path, reason in candidate_classes:
+            attempted_classes.append(class_path.split(".")[-1])
+            try:
+                module_name, class_name = class_path.rsplit(".", 1)
+                module = import_module(module_name)
+                auto_class = getattr(module, class_name)
+
+                logger.debug(f"Trying {class_name} for {model_id}: {reason}")
+
+                try:
+                    model = auto_class.from_pretrained(model_id, **base_kwargs)
+                except (TypeError, ValueError) as param_error:
+                    logger.debug(
+                        f"{class_name} full kwargs failed, retrying minimal set: {param_error}"
+                    )
+                    minimal_kwargs = {
+                        "cache_dir": base_kwargs.get("cache_dir"),
+                        "trust_remote_code": True,
+                    }
+                    if "torch_dtype" in base_kwargs:
+                        minimal_kwargs["torch_dtype"] = base_kwargs["torch_dtype"]
+                    model = auto_class.from_pretrained(model_id, **minimal_kwargs)
+
+                if not hasattr(model, "generate"):
+                    logger.debug(f"{class_name} loaded but missing .generate(); skipping")
+                    model = None
+                    continue
+
+                logger.info(f"✓ Loaded {model_id} with {class_name}")
+                return model, attempted_classes, None
+
+            except Exception as load_error:
+                last_error = load_error
+                logger.debug(f"{class_path} failed for {model_id}: {load_error}")
+                continue
+
+        return None, attempted_classes, last_error
 
     def unload_model(self, handle: Any) -> None:
         """Unload model and free GPU memory universally across all platforms.
@@ -967,197 +1232,77 @@ class HuggingFaceProvider(BaseProvider):
         question: str,
         conversation_history: Optional[list[tuple[str, str]]] = None
     ) -> str:
-        """Run question answering with VLM using unified history formatter.
+        """Run question answering with universal inference handler.
+
+        Supports both VLM (with images) and LLM (text only) models transparently.
+        Handles processor/tokenizer differences automatically.
 
         Args:
             handle: Tuple of (model, processor)
-            image: PIL Image
+            image: PIL Image (VLM only, can be None for LLM)
             question: Question text
             conversation_history: Optional list of (user_msg, bot_response) tuples
 
         Returns:
             Answer text
         """
+        from ..core.inference_handler import UniversalInferenceHandler
+        from ..models.endpoints import ModelType
+
         model, processor = handle
 
         try:
-            # UNIVERSAL DEVICE DETECTION - get actual device model is on
-            # Works on all platforms: CUDA, MPS, CPU, ROCm, Jetson, etc.
-            model_device = next(model.parameters()).device
-            logger.debug(f"Model is on device: {model_device}")
+            # Determine model type: check BOTH model class AND processor type
+            # A model might be a VLM but with wrong processor, so we check both
+            model_class_name = type(model).__name__.lower()
 
-            # Use unified Q&A history formatter (shared across all providers)
-            full_question = format_qa_history(
+            # VLM indicators in model class
+            is_vlm_model = any(
+                keyword in model_class_name
+                for keyword in [
+                    "vision", "vlm", "multimodal", "llava", "blip",
+                    "qwen2vl", "qwen3vl", "internvl", "minicpm-v",
+                    "moondream", "idefics", "clip"
+                ]
+            )
+
+            # VLM indicators in processor
+            is_vlm_processor = (
+                hasattr(processor, "apply_chat_template")
+                or "processor" in type(processor).__name__.lower()
+            )
+
+            # Trust the model class first - it's more reliable
+            is_vlm = is_vlm_model or is_vlm_processor
+            model_type = ModelType.VLM if is_vlm else ModelType.LLM
+
+            logger.debug(
+                f"Model type detection: "
+                f"model_class={model_class_name}, is_vlm_model={is_vlm_model}, "
+                f"processor={type(processor).__name__}, is_vlm_processor={is_vlm_processor}, "
+                f"final={model_type.value}"
+            )
+
+            # Use universal handler that works with all model types
+            handler = UniversalInferenceHandler(
+                model=model,
+                processor=processor,
+                model_type=model_type
+            )
+
+            # Run inference with universal handler
+            answer = handler.run_qa(
+                image=image if is_vlm else None,
+                question=question,
                 conversation_history=conversation_history,
-                current_question=question,
-                max_turns=5
+                max_new_tokens=1024
             )
 
-            # SPECIAL HANDLING: Moondream2 has a custom inference API
-            # It uses model.encode_image() + model.answer_question() instead of standard processor
-            if hasattr(model, 'encode_image') and hasattr(model, 'answer_question'):
-                logger.debug("Detected moondream2 custom API - using encode_image + answer_question")
-                try:
-                    # Encode the image using moondream's custom encoder
-                    image_embeds = model.encode_image(image)
-                    
-                    # Generate answer using moondream's custom method
-                    answer = model.answer_question(
-                        image_embeds=image_embeds,
-                        question=full_question,
-                        tokenizer=processor  # moondream uses tokenizer, not processor
-                    )
-                    
-                    logger.info("✓ Response generated with moondream2 API")
-                    return answer.strip()
-                    
-                except Exception as e:
-                    logger.error(f"Moondream2 custom API failed: {e}")
-                    # Fall through to try standard approach
-                    pass
-
-            # Prepare inputs with automatic format detection for all VLMs
-            # Try messages format first (modern VLMs: Qwen2-VL, Qwen3-VL, Idefics, etc.)
-            # Fall back to standard format (LLaVA, BLIP, etc.)
-            inputs = None
-            
-            # Strategy 1: Try messages format with chat template (if available)
-            if hasattr(processor, 'apply_chat_template'):
-                try:
-                    messages = [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image", "image": image},
-                                {"type": "text", "text": full_question}
-                            ]
-                        }
-                    ]
-                    
-                    # Apply chat template to get properly formatted text with image tokens
-                    text_prompt = processor.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True
-                    )
-                    
-                    # Process with the formatted text
-                    inputs = processor(
-                        text=[text_prompt],
-                        images=[image],
-                        padding=True,
-                        return_tensors="pt"
-                    )
-                    
-                    logger.debug("✓ Using messages format with chat template")
-                    
-                except Exception as e:
-                    logger.debug(f"Messages format failed: {e}, trying standard format")
-                    inputs = None
-            
-            # Strategy 2: Standard text + images format (fallback)
-            if inputs is None:
-                try:
-                    # Try with images as list first (some processors require this)
-                    inputs = processor(
-                        text=full_question,
-                        images=[image] if not isinstance(image, list) else image,
-                        return_tensors="pt"
-                    )
-                    logger.debug("✓ Using standard text + images format")
-                except Exception as e:
-                    logger.error(f"Standard format with list failed: {e}, trying without list")
-                    try:
-                        # Try without wrapping in list
-                        inputs = processor(
-                            text=full_question,
-                            images=image,
-                            return_tensors="pt"
-                        )
-                        logger.debug("✓ Using standard text + images format (no list)")
-                    except Exception as e2:
-                        logger.error(f"Both input formats failed: Strategy1={e}, Strategy2={e2}")
-                        raise RuntimeError(
-                            f"Failed to prepare inputs for VLM inference.\n"
-                            f"Processor: {type(processor).__name__}\n"
-                            f"Error: {e2}"
-                        )
-            
-            # Move inputs to model device (handle each tensor individually for MPS compatibility)
-            inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-
-            # Debug: Log what inputs were prepared
-            logger.debug(f"Prepared inputs keys: {list(inputs.keys())}")
-            for key, value in inputs.items():
-                if hasattr(value, 'shape'):
-                    logger.debug(f"  {key}: shape={value.shape}, dtype={value.dtype}")
-                else:
-                    logger.debug(f"  {key}: {type(value)}")
-
-            # Validate that images are included (pixel_values, image_embeds, etc.)
-            has_image_data = any(
-                key in inputs for key in ['pixel_values', 'image_embeds', 'pixel_values_videos', 'images']
-            )
-            if not has_image_data:
-                logger.error("Processor did not include image data in inputs!")
-                logger.error(f"Processor type: {type(processor).__name__}")
-                logger.error(f"Image type: {type(image)}, Image value: {image if isinstance(image, (str, type(None))) else f'<{type(image).__name__}>'}")
-                raise RuntimeError(
-                    "Processor failed to include image data in inputs. "
-                    f"Got keys: {list(inputs.keys())}, expected pixel_values or similar. "
-                    "This model may require a specific processor version or image format."
-                )
-
-            # Warn if on CPU (very slow)
-            if str(model_device) == 'cpu':
-                logger.warning("⏳ Running inference on CPU - this will be SLOW (30s-2min)")
-                logger.warning("   Consider using a smaller model or CUDA/MPS-compatible device")
-            
-            # Generate response (reduced tokens for faster response on CPU)
-            logger.info("Generating response...")
-            max_tokens = 512 if str(model_device) == 'cpu' else 1024
-
-            # 2025 OPTIMIZATION: KV cache configuration for faster generation
-            generation_config = {
-                "max_new_tokens": max_tokens,
-                "use_cache": True,  # Enable KV cache (default but explicit)
-                "do_sample": False,  # Greedy decoding for consistency
-            }
-
-            try:
-                with torch.no_grad():
-                    output = model.generate(**inputs, **generation_config)
-
-                logger.info("✓ Response generated")
-            except AssertionError as ae:
-                # InternVL and similar VLMs may require images even for QA
-                # Try to provide helpful error message
-                error_msg = str(ae)
-                if "img_context_token_id" in error_msg or not error_msg:
-                    logger.error("Model requires image context tokens but none were provided")
-                    raise RuntimeError(
-                        "This VLM model requires images to be properly formatted. "
-                        "This may indicate the model needs special image preprocessing that isn't being applied. "
-                        "Try using a different VLM or ensure images are being passed correctly."
-                    )
-                else:
-                    raise
-
-            # Decode response
-            response = processor.batch_decode(output, skip_special_tokens=True)[0]
-
-            # If we used history format, try to extract just the answer
-            if conversation_history and "A:" in response:
-                # Try to extract the last answer after "A:"
-                parts = response.split("A:")
-                if len(parts) > 1:
-                    response = parts[-1].strip()
-
-            return response.strip()
+            return answer
 
         except Exception as e:
             logger.error(f"QA inference failed: {e}", exc_info=True)
-            raise NotImplementedError(f"QA not supported for this model: {e}")
+            raise
 
     def run_caption(
         self,
