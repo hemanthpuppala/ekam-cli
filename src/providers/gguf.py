@@ -486,9 +486,17 @@ class GGUFProvider(BaseProvider):
         from ..utils.vlm_response_parser import parse_detection_response
 
         prompt = (
-            f"Detect all instances of '{object_name}' in this image. "
-            f"Provide bounding box coordinates in JSON format as: "
-            f'[{{"bbox": [x1, y1, x2, y2], "label": "{object_name}"}}]'
+            f"Detect all instances of '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+            f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON\n"
+            f"- Number each instance sequentially (_1, _2, _3, etc.)"
         )
         response = self.run_qa(handle, image, prompt)
 
@@ -515,9 +523,15 @@ class GGUFProvider(BaseProvider):
         from ..utils.vlm_response_parser import parse_point_response
 
         prompt = (
-            f"Where is the '{object_name}' in this image? "
-            f"Provide the center coordinates in JSON format as: "
-            f'{{"x": <number>, "y": <number>}}'
+            f"Locate the '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}\": [x, y]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON"
         )
         response = self.run_qa(handle, image, prompt)
 

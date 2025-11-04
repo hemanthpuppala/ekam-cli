@@ -82,7 +82,7 @@ def _get_default_config() -> dict[ProviderType, ProviderConfig]:
             name=ProviderType.OLLAMA,
             enabled=True,
             host="http://localhost:11434",
-            timeout_seconds=120,
+            timeout_seconds=300,  # 5 minutes for VLM inference on slower devices (increased from 120s)
         )
     }
 

@@ -328,6 +328,7 @@ def _create_workflow_steps(
         if s.run_background:
             # Background mode - show confirmation
             tui.clear_screen()
+
             tui.show_message(
                 f"""[bold green]✓ Quantization Started in Background[/bold green]
 

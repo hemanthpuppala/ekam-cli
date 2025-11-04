@@ -350,7 +350,19 @@ class OpenVINOProvider(BaseProvider):
         conversation_history: Optional[list[tuple[str, str]]] = None,
     ) -> str:
         """Run object detection."""
-        prompt = f"Detect '{object_name}' in this image and provide bounding boxes."
+        prompt = (
+            f"Detect all instances of '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+            f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON\n"
+            f"- Number each instance sequentially (_1, _2, _3, etc.)"
+        )
         return self.run_qa(handle, image, prompt, conversation_history)
 
     def run_point(
@@ -361,7 +373,17 @@ class OpenVINOProvider(BaseProvider):
         conversation_history: Optional[list[tuple[str, str]]] = None,
     ) -> str:
         """Run object pointing."""
-        prompt = f"Point to '{object_name}' in this image with coordinates [x, y]."
+        prompt = (
+            f"Locate the '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}\": [x, y]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON"
+        )
         return self.run_qa(handle, image, prompt, conversation_history)
 
     def run_text(

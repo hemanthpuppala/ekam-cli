@@ -26,7 +26,8 @@ class ProviderConfig(BaseModel):
     )
 
     # Connection settings (API providers)
-    timeout_seconds: int = Field(default=120, gt=0, le=600)
+    # Increased default for VLM inference (can be slow on large models)
+    timeout_seconds: int = Field(default=300, gt=0, le=1200)  # 5 min default, 20 min max
     max_retries: int = Field(default=3, ge=0, le=10)
 
     class Config:

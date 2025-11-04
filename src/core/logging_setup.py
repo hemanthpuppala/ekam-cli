@@ -97,7 +97,7 @@ def setup_logging(log_dir: Path = Path("logs"), console_level: str = "ERROR") ->
 
     # File handler (DEBUG+) with rotation - everything goes to log file
     logger.add(
-        log_dir / "vlm_cli_{time:YYYY-MM-DD}.log",
+        log_dir / "ekam_cli_{time:YYYY-MM-DD}.log",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
         level="DEBUG",
         rotation="100 MB",

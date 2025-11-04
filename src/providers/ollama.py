@@ -605,9 +605,16 @@ class OllamaProvider(BaseProvider):
         image_b64 = self._encode_image(image)
 
         prompt = (
-            f"Detect all instances of '{object_name}' in this image. "
-            f"Provide bounding box coordinates in JSON format as: "
-            f'[{{"bbox": [x1, y1, x2, y2], "label": "{object_name}"}}]'
+            f"Detect all instances of '{object_name}' in this image.\n\n"
+            f"Process:\n"
+            f"1. Examine the image carefully to identify each '{object_name}'\n"
+            f"2. For each instance, determine the bounding box coordinates\n"
+            f"3. Number instances sequentially (_1, _2, _3...)\n\n"
+            f"Return ONLY this JSON format (no explanations):\n"
+            f"{{\n"
+            f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+            f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+            f"}}"
         )
 
         payload = {
@@ -648,9 +655,15 @@ class OllamaProvider(BaseProvider):
         image_b64 = self._encode_image(image)
 
         prompt = (
-            f"Where is the '{object_name}' in this image? "
-            f"Provide the center coordinates in JSON format as: "
-            f'{{"x": <number>, "y": <number>}}'
+            f"Locate the '{object_name}' in this image.\n\n"
+            f"Process:\n"
+            f"1. Identify the '{object_name}' in the image\n"
+            f"2. Determine its center point\n"
+            f"3. Convert to normalized coordinates (0.0 = left/top, 1.0 = right/bottom)\n\n"
+            f"Return ONLY this JSON format (no explanations):\n"
+            f"{{\n"
+            f"  \"{object_name}\": [x, y]\n"
+            f"}}"
         )
 
         payload = {

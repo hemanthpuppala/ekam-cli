@@ -368,9 +368,17 @@ class MLXProvider(BaseProvider):
             Detection response
         """
         prompt = (
-            f"Detect all instances of '{object_name}' in this image. "
-            f"For each instance, provide bounding box coordinates in the format: "
-            f"[x_min, y_min, x_max, y_max]"
+            f"Detect all instances of '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+            f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON\n"
+            f"- Number each instance sequentially (_1, _2, _3, etc.)"
         )
         return self.run_qa(handle, image, prompt, conversation_history)
 
@@ -393,8 +401,15 @@ class MLXProvider(BaseProvider):
             Pointing response
         """
         prompt = (
-            f"Point to the '{object_name}' in this image. "
-            f"Provide the center coordinates as [x, y] where x and y are between 0 and 1."
+            f"Locate the '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}\": [x, y]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON"
         )
         return self.run_qa(handle, image, prompt, conversation_history)
 

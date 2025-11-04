@@ -11,6 +11,8 @@ from loguru import logger
 def clean_model_response(response_text: str, aggressive: bool = True) -> str:
     """Clean model response by removing artifacts, reasoning, and meta-commentary.
 
+    DISABLED FOR BENCHMARKING: Returns raw response without any cleaning.
+
     This function handles various output issues that can occur with different models:
     - Template leakage (role markers like "User:", "Assistant:")
     - Internal reasoning artifacts ("Okay,", "Let me think", etc.)
@@ -36,8 +38,16 @@ def clean_model_response(response_text: str, aggressive: bool = True) -> str:
         >>> clean_model_response("Okay...\\nAnswer: This is the real answer.")
         "This is the real answer."
     """
+    # DISABLED: Return raw response for benchmarking
     if not response_text or len(response_text.strip()) == 0:
         return response_text
+
+    logger.debug(f"Response cleaning disabled - returning raw response ({len(response_text)} chars)")
+    return response_text.strip()
+
+    # === CLEANING CODE DISABLED BELOW ===
+    if False:  # Disabled - keeping for future reference
+        pass
 
     # OPTIMIZATION: O(1) amortized time - early termination with pattern matching
     # Process only what's needed, skip full line-by-line scan when possible

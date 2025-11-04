@@ -61,8 +61,42 @@ def prompt_yes_no(prompt: str, default: bool = False) -> bool:
     return professional_prompt.get_confirmation(prompt, default=default, style="cyan")
 
 
+def _normalize_path_string(path_str: str) -> str:
+    """Normalize path string by removing quotes and extra whitespace.
+
+    Handles common input variations:
+    - '/path/to/file' or "/path/to/file" -> /path/to/file
+    - "  /path/to/file  " -> /path/to/file
+    - ~/Documents/file -> /Users/username/Documents/file
+
+    Args:
+        path_str: Raw path string from user input
+
+    Returns:
+        Cleaned path string
+    """
+    # Strip leading/trailing whitespace
+    path_str = path_str.strip()
+
+    # Strip surrounding quotes (single or double)
+    if (path_str.startswith("'") and path_str.endswith("'")) or \
+       (path_str.startswith('"') and path_str.endswith('"')):
+        path_str = path_str[1:-1]
+
+    # Strip whitespace again after removing quotes
+    path_str = path_str.strip()
+
+    return path_str
+
+
 def prompt_file_path(prompt: str, must_exist: bool = True) -> Path:
     """Prompt for file path with validation.
+
+    Robustly handles various input formats:
+    - With or without quotes: '/path/file.jpg' or /path/file.jpg
+    - With spaces in path
+    - Home directory expansion: ~/Documents/file.jpg
+    - Relative paths: ./images/file.jpg
 
     Args:
         prompt: Prompt message
@@ -85,7 +119,15 @@ def prompt_file_path(prompt: str, must_exist: bool = True) -> Path:
             tui.show_error("Please enter a file path")
             continue
 
-        path = Path(path_str).expanduser()
+        # Normalize the path string (remove quotes, whitespace)
+        path_str = _normalize_path_string(path_str)
+
+        # Expand user path (~) and convert to absolute path
+        try:
+            path = Path(path_str).expanduser().resolve()
+        except (OSError, RuntimeError) as e:
+            tui.show_error(f"Invalid path format: {path_str}\nError: {str(e)}")
+            continue
 
         if must_exist and not path.exists():
             tui.show_error(f"File not found: {path}")

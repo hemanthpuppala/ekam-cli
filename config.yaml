@@ -2,7 +2,7 @@ providers:
   ollama:
     enabled: true
     host: http://localhost:11434
-    timeout_seconds: 120
+    timeout_seconds: 600  # Increased from 120 to 600 for VLM inference
   huggingface:
     enabled: true
     cache_dir: ~/.cache/huggingface/hub/
@@ -29,12 +29,12 @@ providers:
     - mps
     - cpu
   mlx:
-    enabled: true
+    enabled: false
     models_dir: ~/.cache/mlx/models
   openvino:
-    enabled: true
+    enabled: false
     models_dir: ~/.cache/openvino/models
 system:
   max_image_dimension: 1920
   memory_safety_margin_gb: 1.0
-  default_timeout_seconds: 120
+  default_timeout_seconds: 600  # Increased from 120 to 600 for VLM inference

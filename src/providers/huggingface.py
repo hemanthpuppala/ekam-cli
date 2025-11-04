@@ -16,6 +16,7 @@ from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..utils.architecture_registry import get_architecture_registry
 from ..utils.history_formatter import format_conversation_history, format_qa_history
+from ..utils.model_method_adapter import ModelMethodAdapter
 from .base import BaseProvider
 
 
@@ -53,6 +54,7 @@ class HuggingFaceProvider(BaseProvider):
         # Store current model reference for cleanup
         self.current_model = None
         self.current_processor = None
+        self.current_adapter = None  # Model-specific method adapter
 
     def _setup_mps_memory_management(self) -> None:
         """Configure MPS memory management to avoid OOM errors.
@@ -562,6 +564,57 @@ class HuggingFaceProvider(BaseProvider):
         # Default to LLM
         return (ModelType.LLM, [EndpointType.TEXT])
 
+    def _detect_model_architecture(self, model: Any, model_id: str) -> Optional[str]:
+        """Detect model architecture for method routing.
+
+        Args:
+            model: Loaded model instance
+            model_id: Model identifier
+
+        Returns:
+            Architecture name (e.g., 'moondream', 'qwen2_vl') or None
+        """
+        # Try to get from model config
+        if hasattr(model, 'config') and hasattr(model.config, 'architectures'):
+            arch_list = model.config.architectures
+            if arch_list and len(arch_list) > 0:
+                arch_name = arch_list[0].lower()
+
+                # Map to registry names
+                if 'moondream' in arch_name:
+                    return 'moondream'
+                elif 'qwen2_5vl' in arch_name or 'qwen2.5vl' in arch_name:
+                    return 'qwen2_5_vl'
+                elif 'qwen2vl' in arch_name:
+                    return 'qwen2_vl'
+                elif 'llava' in arch_name:
+                    if 'next' in arch_name:
+                        return 'llava_next'
+                    return 'llava'
+                elif 'lfm2vl' in arch_name:
+                    return 'lfm2_vl'
+                elif 'internvl' in arch_name:
+                    return 'internvl'
+                elif 'minicpm' in arch_name:
+                    return 'minicpm_v'
+                elif 'paligemma' in arch_name:
+                    return 'paligemma'
+
+        # Fallback: check model ID
+        model_id_lower = model_id.lower()
+        if 'moondream' in model_id_lower:
+            return 'moondream'
+        elif 'qwen2.5-vl' in model_id_lower or 'qwen2_5-vl' in model_id_lower:
+            return 'qwen2_5_vl'
+        elif 'qwen2-vl' in model_id_lower:
+            return 'qwen2_vl'
+        elif 'llava' in model_id_lower:
+            return 'llava' if 'next' not in model_id_lower else 'llava_next'
+        elif 'lfm2-vl' in model_id_lower:
+            return 'lfm2_vl'
+
+        return None
+
     def load_model(self, model_id: str, device: str) -> Any:
         """Load HuggingFace model with transformers and automatic dependency management.
 
@@ -595,6 +648,12 @@ class HuggingFaceProvider(BaseProvider):
                 # Store references for cleanup
                 self.current_model = model
                 self.current_processor = processor
+
+                # Initialize model-specific method adapter for future-proof endpoint support
+                architecture = self._detect_model_architecture(model, model_id)
+                self.current_adapter = ModelMethodAdapter(model, model_id, architecture)
+                logger.debug(f"Initialized method adapter for {model_id} (architecture: {architecture or 'unknown'})")
+
                 return (model, processor)
             except Exception as e:
                 error_msg = str(e)
@@ -742,7 +801,7 @@ class HuggingFaceProvider(BaseProvider):
             if all_installed_deps:
                 error_panel += f"[green]Successfully installed:[/green] {', '.join(all_installed_deps)}\n"
 
-            error_panel += f"\n[dim]Full error details logged to: logs/vlm_cli_*.log[/dim]"
+            error_panel += f"\n[dim]Full error details logged to: logs/ekam_cli_*.log[/dim]"
 
             tui.show_panel(error_panel, title="Model Loading Failed", border_style="red")
             tui.prompt("\nPress Enter to return to model selection...", style="dim")
@@ -1232,10 +1291,10 @@ class HuggingFaceProvider(BaseProvider):
         question: str,
         conversation_history: Optional[list[tuple[str, str]]] = None
     ) -> str:
-        """Run question answering with universal inference handler.
+        """Run question answering with model-specific methods or universal fallback.
 
-        Supports both VLM (with images) and LLM (text only) models transparently.
-        Handles processor/tokenizer differences automatically.
+        Tries model-specific methods first (e.g., moondream.query()), then falls back
+        to generic prompting for models without native QA methods.
 
         Args:
             handle: Tuple of (model, processor)
@@ -1251,12 +1310,56 @@ class HuggingFaceProvider(BaseProvider):
 
         model, processor = handle
 
-        try:
-            # Determine model type: check BOTH model class AND processor type
-            # A model might be a VLM but with wrong processor, so we check both
-            model_class_name = type(model).__name__.lower()
+        # Try model-specific adapter first (e.g., moondream.query())
+        if self.current_adapter and self.current_adapter.has_native_method_for("qa"):
+            def generic_fallback(**kwargs):
+                return self._generic_qa_inference(model, processor, **kwargs)
 
-            # VLM indicators in model class
+            try:
+                return self.current_adapter.qa(
+                    image=image,
+                    question=question,
+                    conversation_history=conversation_history,
+                    fallback_callback=generic_fallback
+                )
+            except Exception as e:
+                logger.debug(f"Adapter QA failed, using generic fallback: {e}")
+                # Continue to generic implementation below
+
+        # Generic implementation (fallback)
+        return self._generic_qa_inference(
+            model, processor,
+            image=image,
+            question=question,
+            conversation_history=conversation_history
+        )
+
+    def _generic_qa_inference(
+        self,
+        model: Any,
+        processor: Any,
+        image: Optional[Image.Image] = None,
+        question: str = "",
+        conversation_history: Optional[list[tuple[str, str]]] = None
+    ) -> str:
+        """Generic QA inference using UniversalInferenceHandler.
+
+        Args:
+            model: Model instance
+            processor: Processor/tokenizer
+            image: Optional image
+            question: Question text
+            conversation_history: Optional conversation history
+
+        Returns:
+            Answer text
+        """
+        from ..core.inference_handler import UniversalInferenceHandler
+        from ..models.endpoints import ModelType
+
+        try:
+            # Determine model type
+            model_class_name = type(model).__name__.lower()
             is_vlm_model = any(
                 keyword in model_class_name
                 for keyword in [
@@ -1266,42 +1369,30 @@ class HuggingFaceProvider(BaseProvider):
                 ]
             )
 
-            # VLM indicators in processor
             is_vlm_processor = (
                 hasattr(processor, "apply_chat_template")
                 or "processor" in type(processor).__name__.lower()
             )
 
-            # Trust the model class first - it's more reliable
             is_vlm = is_vlm_model or is_vlm_processor
             model_type = ModelType.VLM if is_vlm else ModelType.LLM
 
-            logger.debug(
-                f"Model type detection: "
-                f"model_class={model_class_name}, is_vlm_model={is_vlm_model}, "
-                f"processor={type(processor).__name__}, is_vlm_processor={is_vlm_processor}, "
-                f"final={model_type.value}"
-            )
-
-            # Use universal handler that works with all model types
+            # Use universal handler
             handler = UniversalInferenceHandler(
                 model=model,
                 processor=processor,
                 model_type=model_type
             )
 
-            # Run inference with universal handler
-            answer = handler.run_qa(
+            return handler.run_qa(
                 image=image if is_vlm else None,
                 question=question,
                 conversation_history=conversation_history,
                 max_new_tokens=1024
             )
 
-            return answer
-
         except Exception as e:
-            logger.error(f"QA inference failed: {e}", exc_info=True)
+            logger.error(f"Generic QA inference failed: {e}", exc_info=True)
             raise
 
     def run_caption(
@@ -1311,7 +1402,10 @@ class HuggingFaceProvider(BaseProvider):
         conversation_history: Optional[list[tuple[str, str]]] = None,
         detail_level: str = "detailed"
     ) -> str:
-        """Generate image caption.
+        """Generate image caption using model-specific method or fallback.
+
+        Tries model-specific methods first (e.g., moondream.caption(length='short')),
+        then falls back to generic prompting.
 
         Args:
             handle: Tuple of (model, processor)
@@ -1322,15 +1416,52 @@ class HuggingFaceProvider(BaseProvider):
         Returns:
             Caption text
         """
+        model, processor = handle
+
+        # Try model-specific adapter first (e.g., moondream.caption())
+        if self.current_adapter and self.current_adapter.has_native_method_for("caption"):
+            def generic_fallback(**kwargs):
+                prompt = (
+                    "Describe this image in detail."
+                    if detail_level == "detailed"
+                    else "Describe this image briefly."
+                )
+                return self._generic_qa_inference(
+                    model, processor,
+                    image=kwargs.get('image'),
+                    question=prompt,
+                    conversation_history=conversation_history
+                )
+
+            try:
+                # Map detail_level to moondream's 'length' parameter
+                length = "normal" if detail_level == "detailed" else "short"
+                return self.current_adapter.caption(
+                    image=image,
+                    length=length,
+                    fallback_callback=generic_fallback
+                )
+            except Exception as e:
+                logger.debug(f"Adapter caption failed, using generic fallback: {e}")
+
+        # Generic fallback
         prompt = (
             "Describe this image in detail."
             if detail_level == "detailed"
             else "Describe this image briefly."
         )
-        return self.run_qa(handle, image, prompt, conversation_history)
+        return self._generic_qa_inference(
+            model, processor,
+            image=image,
+            question=prompt,
+            conversation_history=conversation_history
+        )
 
     def run_detect(self, handle: Any, image: Image.Image, object_name: str) -> list[dict]:
-        """Detect objects with VLM and parse bounding boxes.
+        """Detect objects using model-specific method or fallback.
+
+        Tries model-specific methods first (e.g., moondream.detect()),
+        then falls back to generic prompting with parsing.
 
         Args:
             handle: Tuple of (model, processor)
@@ -1342,24 +1473,68 @@ class HuggingFaceProvider(BaseProvider):
         """
         from ..utils.vlm_response_parser import parse_detection_response
 
+        model, processor = handle
+
+        # Try model-specific adapter first (e.g., moondream.detect())
+        if self.current_adapter and self.current_adapter.has_native_method_for("detect"):
+            def generic_fallback(**kwargs):
+                prompt = (
+                    f"Detect all instances of '{object_name}' in this image.\n\n"
+                    f"Return ONLY valid JSON in this exact structure:\n"
+                    f"{{\n"
+                    f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+                    f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+                    f"}}\n\n"
+                    f"Rules:\n"
+                    f"- Coordinates must be normalized (0.0 to 1.0)\n"
+                    f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+                    f"- Do not include any text before or after the JSON\n"
+                    f"- Number each instance sequentially (_1, _2, _3, etc.)"
+                )
+                response = self._generic_qa_inference(
+                    model, processor,
+                    image=kwargs.get('image'),
+                    question=prompt
+                )
+                detections = parse_detection_response(response, object_name)
+                for detection in detections:
+                    detection["raw"] = response
+                return detections
+
+            try:
+                return self.current_adapter.detect(
+                    image=image,
+                    object_name=object_name,
+                    fallback_callback=generic_fallback
+                )
+            except Exception as e:
+                logger.debug(f"Adapter detect failed, using generic fallback: {e}")
+
+        # Generic fallback
         prompt = (
-            f"Detect all instances of '{object_name}' in this image. "
-            f"Provide bounding box coordinates in JSON format as: "
-            f'[{{"bbox": [x1, y1, x2, y2], "label": "{object_name}"}}]'
+            f"Detect all instances of '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+            f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON\n"
+            f"- Number each instance sequentially (_1, _2, _3, etc.)"
         )
-        response = self.run_qa(handle, image, prompt)
-
-        # Parse response to extract actual bounding boxes
+        response = self._generic_qa_inference(model, processor, image=image, question=prompt)
         detections = parse_detection_response(response, object_name)
-
-        # Add raw response to each detection for debugging
         for detection in detections:
             detection["raw"] = response
-
         return detections
 
     def run_point(self, handle: Any, image: Image.Image, object_name: str) -> dict:
-        """Point to object location with VLM and parse coordinates.
+        """Point to object location using model-specific method or fallback.
+
+        Tries model-specific methods first (e.g., moondream.point()),
+        then falls back to generic prompting with parsing.
 
         Args:
             handle: Tuple of (model, processor)
@@ -1371,19 +1546,55 @@ class HuggingFaceProvider(BaseProvider):
         """
         from ..utils.vlm_response_parser import parse_point_response
 
+        model, processor = handle
+
+        # Try model-specific adapter first (e.g., moondream.point())
+        if self.current_adapter and self.current_adapter.has_native_method_for("point"):
+            def generic_fallback(**kwargs):
+                prompt = (
+                    f"Locate the '{object_name}' in this image.\n\n"
+                    f"Return ONLY valid JSON in this exact structure:\n"
+                    f"{{\n"
+                    f"  \"{object_name}\": [x, y]\n"
+                    f"}}\n\n"
+                    f"Rules:\n"
+                    f"- Coordinates must be normalized (0.0 to 1.0)\n"
+                    f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+                    f"- Do not include any text before or after the JSON"
+                )
+                response = self._generic_qa_inference(
+                    model, processor,
+                    image=kwargs.get('image'),
+                    question=prompt
+                )
+                coordinates = parse_point_response(response, object_name)
+                coordinates["raw"] = response
+                return coordinates
+
+            try:
+                return self.current_adapter.point(
+                    image=image,
+                    object_name=object_name,
+                    fallback_callback=generic_fallback
+                )
+            except Exception as e:
+                logger.debug(f"Adapter point failed, using generic fallback: {e}")
+
+        # Generic fallback
         prompt = (
-            f"Where is the '{object_name}' in this image? "
-            f"Provide the center coordinates in JSON format as: "
-            f'{{"x": <number>, "y": <number>}}'
+            f"Locate the '{object_name}' in this image.\n\n"
+            f"Return ONLY valid JSON in this exact structure:\n"
+            f"{{\n"
+            f"  \"{object_name}\": [x, y]\n"
+            f"}}\n\n"
+            f"Rules:\n"
+            f"- Coordinates must be normalized (0.0 to 1.0)\n"
+            f"- 0.0 is left/top edge, 1.0 is right/bottom edge\n"
+            f"- Do not include any text before or after the JSON"
         )
-        response = self.run_qa(handle, image, prompt)
-
-        # Parse response to extract actual coordinates
+        response = self._generic_qa_inference(model, processor, image=image, question=prompt)
         coordinates = parse_point_response(response, object_name)
-
-        # Add raw response for debugging
         coordinates["raw"] = response
-
         return coordinates
 
     def run_text(

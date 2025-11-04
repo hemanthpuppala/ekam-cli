@@ -201,7 +201,7 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
         model_info: Information about the loaded model
 
     Returns:
-        "QUIT" to quit app, "BACK2" to go back 2 levels, "HOME" to return to main menu, None for normal back
+        "QUIT" to quit app, "HOME" to return to main menu, None for normal back
     """
     from ..models.model import ModelInfo
 
@@ -213,11 +213,6 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
             # User quit - propagate signal
             logger.info("User initiated quit from endpoint menu")
             return "QUIT"
-
-        if endpoint == "BACK2":
-            # Go back 2 levels - propagate signal
-            logger.info("User pressed bb from endpoint menu - going back 2 levels")
-            return "BACK2"
 
         if endpoint == "BACK":
             # Go back to model selection
@@ -1082,6 +1077,31 @@ def main() -> None:
                 operation_mode = "quantization"
                 continue
 
+        elif operation_mode == "benchmarking":
+            # Run benchmarking mode
+            logger.info("Running Benchmarking mode")
+            from .app_quantization import run_benchmarking_mode
+            result = run_benchmarking_mode(session_manager)
+
+            if result == "quit":
+                logger.info("User quit from benchmarking mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from benchmarking")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_inference":
+                logger.info("Switching from benchmarking to inference mode")
+                operation_mode = "inference"
+                continue
+
 
 def register_all_providers(session_manager: SessionManager, config: dict, system_specs: SystemSpecs) -> list[ProviderType]:
     """Register all enabled providers with the session manager.
@@ -1255,11 +1275,6 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
                 logger.info("User chose to return to main menu from model selection")
                 return "main_menu"
 
-            if selected_model == "BACK2":
-                # Go back 2 levels - exit to provider selection by returning
-                logger.info("User pressed bb - going back 2 levels (to provider selection)")
-                break
-
             if selected_model == "BACK":
                 # Go back to provider selection
                 logger.info("User pressed b - going back to provider selection")
@@ -1309,6 +1324,44 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
                     except Exception as e:
                         logger.error(f"Failed to refresh models: {e}")
                         tui.show_error(f"Failed to refresh model list: {e}")
+
+                # Continue to show model menu again
+                continue
+
+            if selected_model == "REFRESH":
+                # User wants to refresh the model registry
+                logger.info(f"User initiated model registry refresh for {selected_provider}")
+
+                # Clear metadata cache to force re-inspection
+                from ..models.model_cache import ModelMetadataCache
+                cache = ModelMetadataCache()
+                cache.clear_cache()
+                logger.info("Cleared model metadata cache")
+
+                # Show loading screen while refreshing
+                LoadingScreen.show(f"Refreshing model registry for {selected_provider.upper()}...\n\n[dim]Clearing cache and re-discovering models...[/dim]")
+
+                try:
+                    # Re-discover models from provider
+                    models = session_manager.discover_models(provider=provider_type)
+                    logger.info(f"Refreshed models: {len(models)} found")
+
+                    tui.show_message(
+                        f"Model registry refreshed successfully!\n\n"
+                        f"Found {len(models)} models for {selected_provider.upper()}",
+                        title="Refresh Complete",
+                        style="green"
+                    )
+                    tui.prompt("Press Enter to continue...", style="dim")
+
+                except Exception as e:
+                    logger.error(f"Failed to refresh model registry: {e}")
+                    tui.show_error(
+                        f"Failed to refresh model registry:\n\n{e}\n\n"
+                        f"Make sure {selected_provider.upper()} is running and accessible.",
+                        title="Refresh Failed"
+                    )
+                    tui.prompt("Press Enter to continue...", style="dim")
 
                 # Continue to show model menu again
                 continue
@@ -1378,12 +1431,6 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
                     # Propagate quit signal up
                     logger.info("Propagating QUIT signal from endpoint workflow")
                     return "quit"
-
-                if workflow_result == "BACK2":
-                    # Go back 2 levels from endpoint menu = back to provider selection
-                    # Break from model selection loop to get to provider selection
-                    logger.info("Propagating BACK2 signal - returning to provider selection")
-                    break
 
                 if workflow_result == "HOME":
                     # User wants to return to main menu

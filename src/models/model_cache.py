@@ -476,22 +476,14 @@ class ModelMetadataCache:
             arch = config["architectures"][0].lower()
 
             # Vision-language model class names
-            if any(
-                keyword in arch
-                for keyword in [
-                    "vision",
-                    "vlm",
-                    "multimodal",
-                    "forconditionalgeneration",
-                    "llava",
-                    "blip",
-                    "clip",
-                    "moondream",  # Moondream VLM
-                    "qwen2vl",  # Qwen2-VL
-                    "qwen3vl",  # Qwen3-VL
-                    "qwenvl",   # Generic Qwen VL
-                ]
-            ):
+            vlm_keywords = [
+                "vision", "vlm", "multimodal", "forconditionalgeneration",
+                "llava", "blip", "clip", "moondream",
+                "qwen2vl", "qwen3vl", "qwenvl",  # All Qwen VL variants
+                "internvl", "minicpm", "cogvlm", "bakllava",
+                "paligemma", "idefics", "instructblip"
+            ]
+            if any(keyword in arch for keyword in vlm_keywords):
                 logger.debug(f"Detected VLM: architecture class contains vision keyword: {arch}")
                 return "vlm"
 
@@ -1001,7 +993,10 @@ class ModelMetadataCache:
         Returns:
             Model type (llm, vlm, etc.)
         """
-        vlm_archs = ["llava", "bakllava", "obsidian", "moondream", "cogvlm"]
+        vlm_archs = [
+            "llava", "bakllava", "obsidian", "moondream", "cogvlm",
+            "qwen2vl", "qwen3vl", "internvl", "minicpm", "paligemma"
+        ]
 
         if any(arch in architecture.lower() for arch in vlm_archs):
             return "vlm"
@@ -1085,11 +1080,25 @@ class ModelMetadataCache:
                 logger.debug(f"Detected VLM from Ollama output (has vision/image): {model_name}")
                 model_type = "vlm"
             # Check architecture family for vision models
-            elif any(vlm_arch in architecture.lower() for vlm_arch in ["llava", "bakllava", "moondream", "vision"]):
+            vlm_architectures = [
+                "llava", "bakllava", "moondream", "vision",
+                "qwen2vl", "qwen3vl", "cogvlm", "internvl",
+                "minicpm", "paligemma", "idefics"
+            ]
+            if any(vlm_arch in architecture.lower() for vlm_arch in vlm_architectures):
                 logger.debug(f"Detected VLM from architecture family: {architecture}")
                 model_type = "vlm"
-            # FALLBACK: Check model name for vision keywords
-            elif any(keyword in model_name.lower() for keyword in ["vision", "llava", "moondream", "vl", "vlm"]):
+            # FALLBACK: Check model name for vision keywords (comprehensive list)
+            vlm_keywords = [
+                "vision", "llava", "moondream", "bakllava",
+                "qwen3-vl", "qwen3vl", "qwen2.5-vl", "qwen2.5vl",
+                "qwen-vl", "qwenvl", "minicpm-v", "cogvlm",
+                "internvl", "fuyu", "kosmos", "paligemma",
+                "idefics", "instructblip", "llava-next",
+                "phi-3-vision", "llama3.2-vision",
+                "vl", "vlm"  # Generic patterns (must be last to avoid false matches)
+            ]
+            if any(keyword in model_name.lower() for keyword in vlm_keywords):
                 logger.debug(f"Detected VLM from model name (fallback): {model_name}")
                 model_type = "vlm"
 

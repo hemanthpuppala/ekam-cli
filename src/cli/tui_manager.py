@@ -22,9 +22,42 @@ class TUIManager:
         self.current_layout: Optional[Layout] = None
         self.live: Optional[Live] = None
 
-    def clear_screen(self) -> None:
-        """Clear terminal screen."""
-        os.system('clear' if os.name != 'nt' else 'cls')
+    def clear_screen(self, show_header: bool = True) -> None:
+        """Clear terminal screen completely (including scrollback) and optionally show permanent Ekam-CLI header.
+
+        This method clears both the visible screen AND the scrollback buffer to ensure
+        users cannot scroll up to see previous screens. Only the current screen content
+        and the Ekam-CLI header should be visible.
+
+        Args:
+            show_header: If True, automatically displays Ekam-CLI header at top (default: True)
+        """
+        # Clear screen AND scrollback buffer to prevent users from scrolling back to previous screens
+        # Use os.system for reliable clearing across all terminals
+        if os.name != 'nt':
+            # Unix/Linux/macOS: Use printf to clear screen and scrollback
+            # \033c is a full terminal reset (clears screen + scrollback)
+            os.system('printf "\\033c"')
+        else:
+            # Windows: cls clears both screen and scrollback
+            os.system('cls')
+
+        # Automatically show permanent Ekam-CLI header after clearing
+        if show_header:
+            terminal_width = self.console.width
+
+            # Top separator
+            self.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
+
+            # Main header - Ekam-CLI centered
+            self.console.print("[bold cyan]" + "Ekam-CLI".center(terminal_width) + "[/bold cyan]")
+
+            # Tagline - Multi-Provider AI Interface
+            self.console.print("[dim cyan]" + "Multi-Provider AI Interface".center(terminal_width) + "[/dim cyan]")
+
+            # Bottom separator
+            self.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
+            self.console.print()
 
     def get_terminal_size(self) -> tuple[int, int]:
         """Get current terminal dimensions.
@@ -34,6 +67,29 @@ class TUIManager:
         """
         size = shutil.get_terminal_size()
         return size.columns, size.lines
+
+    def show_step_heading(self, heading: str, style: str = "bold cyan") -> None:
+        """Show a step/pipeline heading with underline.
+
+        The heading text is displayed with an underline of '═' characters
+        matching the text length (not full terminal width).
+
+        Args:
+            heading: The heading text to display
+            style: Rich style for the heading (default: "bold cyan")
+        """
+        # Display heading text
+        self.console.print(f"[{style}]{heading}[/{style}]")
+
+        # Calculate text length (strip ANSI/Rich formatting)
+        # Use Rich's Text to measure the actual displayed width
+        from rich.text import Text
+        text_obj = Text.from_markup(f"[{style}]{heading}[/{style}]")
+        text_length = len(text_obj.plain)
+
+        # Display underline matching text length
+        self.console.print(f"[{style}]" + "═" * text_length + f"[/{style}]")
+        self.console.print()
 
     def show_panel(self, content, title: str = "", border_style: str = "blue") -> None:
         """Display content in a panel that fills the screen.
@@ -85,6 +141,31 @@ class TUIManager:
         if self.live:
             self.live.stop()
             self.live = None
+
+    def show_ekam_header(self, subtitle: Optional[str] = None) -> None:
+        """Show persistent Ekam-CLI banner at the top of the screen.
+
+        Args:
+            subtitle: Optional subtitle text below the main header
+        """
+        terminal_width = self.console.width
+
+        # Top separator
+        self.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
+
+        # Main header - Ekam-CLI centered
+        self.console.print("[bold cyan]" + "Ekam-CLI".center(terminal_width) + "[/bold cyan]")
+
+        # Tagline - Multi-Provider AI Interface
+        self.console.print("[dim cyan]" + "Multi-Provider AI Interface".center(terminal_width) + "[/dim cyan]")
+
+        # Optional subtitle
+        if subtitle:
+            self.console.print("[dim]" + subtitle.center(terminal_width) + "[/dim]")
+
+        # Bottom separator
+        self.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
+        self.console.print()
 
     def prompt(self, message: str, style: str = "cyan") -> str:
         """Show a prompt and get user input using professional text input handler.

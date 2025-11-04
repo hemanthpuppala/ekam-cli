@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# VLM/LLM CLI Launcher Script
+# VLM/LLM CLI Launcher Script (Denali Version)
 # Handles prerequisites, environment setup, and application launch
 # Cross-platform: Linux, macOS, Windows (Git Bash)
 
@@ -9,17 +9,19 @@ set -e  # Exit on error
 # Detect OS
 if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
     OS="windows"
-    VENV_ACTIVATE="venv/Scripts/activate"
+    VENV_ACTIVATE="denali-venv/Scripts/activate"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="mac"
-    VENV_ACTIVATE="venv/bin/activate"
+    VENV_ACTIVATE="denali-venv/bin/activate"
 else
     OS="linux"
-    VENV_ACTIVATE="venv/bin/activate"
+    VENV_ACTIVATE="denali-venv/bin/activate"
 fi
 
-# Detect Python command (try python3 first, fall back to python)
-if command -v python3 &> /dev/null; then
+# Detect Python command (prefer python3.12, then python3, then python)
+if command -v python3.12 &> /dev/null; then
+    PYTHON_CMD="python3.12"
+elif command -v python3 &> /dev/null; then
     PYTHON_CMD="python3"
 elif command -v python &> /dev/null; then
     PYTHON_CMD="python"
@@ -34,7 +36,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}=== VLM/LLM CLI Launcher ===${NC}"
+echo -e "${BLUE}=== VLM/LLM CLI Launcher (Denali) ===${NC}"
 echo
 
 # Check Python version (require 3.8+)
@@ -62,9 +64,13 @@ echo -e "${GREEN}✓${NC} Python ${PYTHON_VERSION} found"
 
 # Create virtual environment if it doesn't exist
 echo -e "${BLUE}[2/6]${NC} Checking virtual environment..."
-if [ ! -d "venv" ]; then
+if [ ! -d "denali-venv" ]; then
     echo "Creating virtual environment..."
-    $PYTHON_CMD -m venv venv
+    $PYTHON_CMD -m venv denali-venv
+    # Remove any AppleDouble files that might cause issues
+    if [ "$OS" = "mac" ]; then
+        find denali-venv -name "._*" -delete 2>/dev/null || true
+    fi
     echo -e "${GREEN}✓${NC} Virtual environment created"
 else
     echo -e "${GREEN}✓${NC} Virtual environment exists"
@@ -83,11 +89,11 @@ fi
 
 # Install/update dependencies
 echo -e "${BLUE}[4/6]${NC} Checking dependencies..."
-if [ ! -f "venv/.dependencies_installed" ] || [ "requirements.txt" -nt "venv/.dependencies_installed" ]; then
+if [ ! -f "denali-venv/.dependencies_installed" ] || [ "requirements.txt" -nt "denali-venv/.dependencies_installed" ]; then
     echo "Installing dependencies (this may take a few minutes)..."
     pip install --upgrade pip > /dev/null 2>&1
     pip install -r requirements.txt > /dev/null 2>&1
-    touch venv/.dependencies_installed
+    touch denali-venv/.dependencies_installed
     echo -e "${GREEN}✓${NC} Dependencies installed"
 else
     echo -e "${GREEN}✓${NC} Dependencies up to date"

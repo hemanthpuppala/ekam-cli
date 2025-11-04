@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.___pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -29,6 +30,8 @@ venv/
 ENV/
 env/
 .venv/
+denali-venv/
+*-venv/
 
 # IDE
 .vscode/
@@ -55,6 +58,7 @@ CLAUDE.md
 PRODUCTION_CHAT_TEMPLATES.md
 .specify/
 test_images/
+*_IMPLEMENTATION_PLAN.md
 
 # External Dependencies
 llama.cpp/
@@ -80,6 +84,7 @@ llama.cpp/
 htmlcov/
 .tox/
 .hypothesis/
+tests/
 
 # OS
 Thumbs.db
