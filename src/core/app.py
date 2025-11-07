@@ -1,6 +1,7 @@
 """Main CLI application entry point with dynamic TUI."""
 
 import atexit
+import os
 import signal
 import sys
 import time
@@ -8,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from loguru import logger
 
 from ..cli.display import display_conversation_history, display_statistics
@@ -19,6 +21,7 @@ from ..cli.menus import (
     SystemSpecsScreen,
     WelcomeScreen,
 )
+from ..cli.diagnostics import SystemDiagnostics
 from ..cli.prompts import (
     UserExitException,
     confirm_deletion,
@@ -38,6 +41,7 @@ from ..models.system import SystemSpecs
 from ..providers.gguf import GGUFProvider
 from ..providers.huggingface import HuggingFaceProvider
 from ..providers.ollama import OllamaProvider
+from ..providers.quantized import QuantizedProvider
 from ..services.session import SessionManager
 from ..utils.ollama_manager import ensure_ollama_running
 from .config_loader import load_config
@@ -45,6 +49,68 @@ from .logging_setup import setup_logging
 
 # Global session manager for cleanup on exit/signals
 _global_session_manager: Optional[SessionManager] = None
+
+# Global quantization manager for /background command and notifications
+_global_quantization_manager = None
+
+# Global notification tracker for completed jobs
+_completed_task_notifications = set()  # Set of task_ids that have been notified
+
+
+def check_and_show_completion_notifications() -> None:
+    """Check for completed quantization jobs and show notifications."""
+    global _global_quantization_manager, _completed_task_notifications
+
+    if not _global_quantization_manager:
+        return
+
+    all_tasks = _global_quantization_manager.get_all_tasks()
+
+    for task in all_tasks:
+        # Only notify for tasks that just completed and haven't been notified yet
+        if task.is_finished and task.task_id not in _completed_task_notifications:
+            _completed_task_notifications.add(task.task_id)
+
+            # Show notification
+            if task.status.value == "completed":
+                tui.console.print(
+                    f"\n[bold green]🎉 NOTIFICATION: Quantization Complete![/bold green]",
+                )
+                tui.console.print(
+                    f"[green]✓ {task.model_info.name} → {task.quant_type.display_name}[/green]"
+                )
+                tui.console.print(f"[dim]Output: {task.output_path.name}[/dim]\n")
+            elif task.status.value == "failed":
+                tui.console.print(
+                    f"\n[bold red]❌ NOTIFICATION: Quantization Failed[/bold red]",
+                )
+                tui.console.print(f"[red]✗ {task.model_info.name}[/red]")
+                tui.console.print(f"[dim]Error: {task.error}[/dim]\n")
+
+
+def handle_background_command() -> bool:
+    """Handle /background command if background jobs exist.
+
+    Returns:
+        True if command was handled, False if no background jobs
+    """
+    global _global_quantization_manager
+
+    if not _global_quantization_manager:
+        return False
+
+    if not _global_quantization_manager.has_active_jobs():
+        tui.show_error(
+            "No background quantization jobs are currently running.\n\n"
+            "Start a quantization in background mode to use this command."
+        )
+        tui.prompt("Press Enter to continue...", style="dim")
+        return True
+
+    # Show background jobs monitor
+    from ..quantization.ui.workflow import show_background_jobs_monitor
+    show_background_jobs_monitor(_global_quantization_manager)
+    return True
 
 
 def cleanup_on_exit() -> None:
@@ -100,6 +166,7 @@ def signal_handler(signum: int, frame) -> None:
             title="Interrupted",
             style="yellow"
         )
+        tui.clear_screen()
     elif signum == signal.SIGTSTP:
         tui.clear_screen()
         tui.show_message(
@@ -137,7 +204,7 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
         model_info: Information about the loaded model
 
     Returns:
-        "QUIT" to quit app, "BACK2" to go back 2 levels, None for normal back
+        "QUIT" to quit app, "HOME" to return to main menu, None for normal back
     """
     from ..models.model import ModelInfo
 
@@ -149,11 +216,6 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
             # User quit - propagate signal
             logger.info("User initiated quit from endpoint menu")
             return "QUIT"
-
-        if endpoint == "BACK2":
-            # Go back 2 levels - propagate signal
-            logger.info("User pressed bb from endpoint menu - going back 2 levels")
-            return "BACK2"
 
         if endpoint == "BACK":
             # Go back to model selection
@@ -171,6 +233,11 @@ def run_endpoint_workflow(session_manager: SessionManager, model_info: "ModelInf
             # Switch to different model (same as BACK)
             logger.info("User chose to switch model")
             return None
+
+        if endpoint == "HOME":
+            # Return to main menu
+            logger.info("User chose to return to main menu (home)")
+            return "HOME"
 
         # Handle different endpoints
         if endpoint == "qa":
@@ -255,54 +322,51 @@ def run_detect_endpoint(session_manager: SessionManager, model_info: "ModelInfo"
         end_time = time.perf_counter()
         elapsed_ms = (end_time - start_time) * 1000
 
-        # Save annotated image with bounding boxes
-        from pathlib import Path as PathLib
-        from ..utils.image import save_annotated_image
+        # Format text response for display - simplified output
+        detected = len(detections) > 0
+        saved_image_path = None
 
-        results_dir = PathLib("results/detections")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        annotated_filename = f"detect_{timestamp}.png"
-        annotated_path = results_dir / annotated_filename
+        if detected:
+            # Save annotated image only if detections found
+            from pathlib import Path as PathLib
+            from ..utils.image import save_annotated_image
 
-        # Include original image dimensions for proper scaling
-        saved_image_path = save_annotated_image(
-            image,
-            detections,
-            annotated_path,
-            original_size=(original_width, original_height)
-        )
-        logger.info(f"Saved annotated image to: {saved_image_path}")
+            results_dir = PathLib("results/detections")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            annotated_filename = f"detect_{timestamp}.png"
+            annotated_path = results_dir / annotated_filename
 
-        # Format text response for display
-        if detections:
-            text_response = f"Detected {len(detections)} instance(s):\n\n"
-            for i, det in enumerate(detections, 1):
-                text_response += f"{i}. {det.get('label', 'unknown')}\n"
-                if 'bbox' in det:
-                    bbox = det['bbox']
-                    text_response += f"   BBox: [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]\n"
-                if 'confidence' in det:
-                    text_response += f"   Confidence: {det['confidence']:.2f}\n"
-                if 'raw' in det:
-                    text_response += f"   Raw: {det.get('raw', 'N/A')}\n"
+            # Include original image dimensions for proper scaling
+            saved_image_path = save_annotated_image(
+                image,
+                detections,
+                annotated_path,
+                original_size=(original_width, original_height)
+            )
+            logger.info(f"Saved annotated image to: {saved_image_path}")
+
+            # Build compact detection list with class names and bboxes
+            detections_str = ""
+            for det in detections:
+                label = det.get('label', 'unknown')
+                bbox = det.get('bbox', [])
+                detections_str += f"{label}: {list(bbox)}\n"
+
+            text_response = f"Detected: True\n\n{detections_str}\nOutput Image: {saved_image_path}"
         else:
-            text_response = "No objects detected."
+            text_response = f"Detected: False"
 
         # Display results
         tui.clear_screen()
         tui.show_panel(
-            f"[bold green]✓ Objects Detected[/bold green]\n\n"
-            f"[bold]Target:[/bold] {object_name if object_name else 'All objects'}\n\n"
-            f"[bold]Results:[/bold]\n{text_response}\n\n"
-            f"[bold]Annotated Image:[/bold] {saved_image_path}\n\n"
-            f"[dim]Time: {elapsed_ms/1000:.2f}s | Model: {model_info.name}[/dim]",
+            text_response,
             title="Detection Results",
             border_style="green"
         )
 
         logger.info(f"Detection inference completed in {elapsed_ms:.2f}ms")
 
-        # Record statistics with annotated image path
+        # Record statistics with annotated image path (only if detections found)
         inference_result = InferenceResult(
             model_id=model_info.model_id,
             provider=model_info.provider,
@@ -311,7 +375,7 @@ def run_detect_endpoint(session_manager: SessionManager, model_info: "ModelInfo"
             output=InferenceOutput(
                 text_response=text_response,
                 detections=detections,
-                annotated_image_path=str(saved_image_path)
+                annotated_image_path=str(saved_image_path) if saved_image_path else None
             ),
             inference_time_ms=elapsed_ms,
         )
@@ -448,6 +512,9 @@ def run_point_endpoint(session_manager: SessionManager, model_info: "ModelInfo")
 # Import chat endpoint from modular implementation
 from .app_chat import run_chat_endpoint
 
+# Import quantization integration
+from .app_quantization import show_quantization_or_inference_menu, run_quantization_mode, run_finetuning_mode
+
 
 def run_install_workflow(
     session_manager: SessionManager,
@@ -469,12 +536,47 @@ def run_install_workflow(
     tui.clear_screen()
 
     # Get provider instance
-    provider = session_manager.model_discovery.get_provider(provider_type)
+    # Special handling: GGUF, MLX, OpenVINO, and Quantized providers don't support direct installation
+    # They rely on HuggingFace to download models first
+    install_provider_type = provider_type
+    needs_hf_installation = provider_type in [
+        ProviderType.GGUF,
+        ProviderType.MLX,
+        ProviderType.OPENVINO,
+        ProviderType.QUANTIZED
+    ]
+
+    if needs_hf_installation:
+        # Explain to user what will happen
+        provider_name = provider_type.value.upper()
+        tui.console.print()
+        tui.console.print(f"[yellow]ℹ Note:[/yellow] {provider_name} models must be installed via HuggingFace Hub first.")
+        tui.console.print(f"[dim]After installation, the model will appear in the HuggingFace provider list.[/dim]")
+        tui.console.print()
+
+        # Ask for confirmation
+        from ..cli.prompts import prompt_yes_no
+        if not prompt_yes_no(
+            "Install this model using HuggingFace Hub?",
+            default=True
+        ):
+            logger.info(f"User cancelled HuggingFace installation for {provider_name}")
+            tui.show_message("Installation cancelled.", title="Cancelled", style="yellow")
+            tui.prompt("Press Enter to continue...", style="dim")
+            return False
+
+        # Use HuggingFace provider for installation
+        install_provider_type = ProviderType.HUGGINGFACE
+        logger.info(f"Using HuggingFace provider to install model for {provider_name}")
+
+    logger.info(f"Getting provider for installation: {install_provider_type.value}")
+    provider = session_manager.model_discovery.get_provider(install_provider_type)
+    logger.info(f"Got provider: {type(provider).__name__}")
     if provider is None:
-        tui.show_error(f"Provider {provider_type.value} not registered")
+        tui.show_error(f"Provider {install_provider_type.value} not registered")
         return False
 
-    # Prompt for model name with examples
+    # Prompt for model name with examples (use original provider for examples)
     try:
         model_name = prompt_model_name(provider_type.value)
     except UserExitException:
@@ -548,6 +650,29 @@ def run_install_workflow(
                 style="green"
             )
             logger.info(f"Successfully installed {model_name}")
+
+            # If installed via HuggingFace for another provider, inform user
+            if needs_hf_installation:
+                tui.console.print()
+                tui.console.print(f"[yellow]ℹ Important:[/yellow] This model is now available in the [bold cyan]HuggingFace[/bold cyan] provider.")
+                tui.console.print(f"[dim]To use it with {provider_name}, you can:[/dim]")
+
+                if provider_type == ProviderType.GGUF:
+                    tui.console.print(f"[dim]  • Convert it to GGUF format using the quantization feature[/dim]")
+                elif provider_type == ProviderType.MLX:
+                    tui.console.print(f"[dim]  • Quantize it to MLX format using the quantization feature[/dim]")
+                elif provider_type == ProviderType.OPENVINO:
+                    tui.console.print(f"[dim]  • Quantize it to OpenVINO format using the quantization feature[/dim]")
+                elif provider_type == ProviderType.QUANTIZED:
+                    tui.console.print(f"[dim]  • Quantize it using the quantization feature[/dim]")
+
+                tui.console.print()
+
+                # Ask for confirmation that user understands
+                prompt_yes_no(
+                    "Do you understand where to find this model?",
+                    default=True
+                )
         else:
             tui.show_error(f"Failed to install {model_name}")
             logger.error(f"Installation failed for {model_name}")
@@ -562,12 +687,79 @@ def run_install_workflow(
     return install_success
 
 
+def parse_selection_input(input_str: str, max_value: int) -> list[int]:
+    """Parse user selection input supporting multiple formats.
+
+    Supports:
+    - Single: "5" → [5]
+    - Multiple: "1 2 3" or "1,2,3" → [1, 2, 3]
+    - Range: "1-5" → [1, 2, 3, 4, 5]
+    - Mixed: "1 3-5 7" → [1, 3, 4, 5, 7]
+
+    Args:
+        input_str: User input string
+        max_value: Maximum valid value
+
+    Returns:
+        List of selected indices (1-based)
+
+    Raises:
+        ValueError: If input is invalid
+    """
+    if not input_str or input_str.strip().lower() == 'c':
+        return []
+
+    indices = set()
+
+    # Replace commas with spaces for uniform parsing
+    input_str = input_str.replace(',', ' ')
+
+    # Split by whitespace
+    parts = input_str.split()
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Check for range (e.g., "1-5")
+        if '-' in part:
+            try:
+                start, end = part.split('-', 1)
+                start_idx = int(start.strip())
+                end_idx = int(end.strip())
+
+                if start_idx < 1 or end_idx > max_value or start_idx > end_idx:
+                    raise ValueError(f"Invalid range: {part}")
+
+                indices.update(range(start_idx, end_idx + 1))
+            except (ValueError, AttributeError) as e:
+                raise ValueError(f"Invalid range format: {part}") from e
+        else:
+            # Single number
+            try:
+                idx = int(part)
+                if idx < 1 or idx > max_value:
+                    raise ValueError(f"Index {idx} out of range [1-{max_value}]")
+                indices.add(idx)
+            except ValueError as e:
+                raise ValueError(f"Invalid number: {part}") from e
+
+    return sorted(list(indices))
+
+
 def run_delete_workflow(
     session_manager: SessionManager,
     provider_type: ProviderType,
     models: list
 ) -> bool:
-    """Run model deletion workflow.
+    """Run model deletion workflow with multi-selection support.
+
+    Supports multiple selection formats:
+    - Single: "5"
+    - Multiple: "1 2 3" or "1,2,3"
+    - Range: "1-5"
+    - Mixed: "1 3-5 7"
 
     Args:
         session_manager: Session manager instance
@@ -575,7 +767,7 @@ def run_delete_workflow(
         models: List of available models
 
     Returns:
-        True if model was successfully deleted
+        True if at least one model was successfully deleted
     """
     from ..models.model import ModelInfo
 
@@ -598,8 +790,9 @@ def run_delete_workflow(
 
     # Show model list for selection
     tui.show_panel(
-        "[bold cyan]Select Model to Delete[/bold cyan]\n\n"
-        "Choose a model from the list to delete it permanently.",
+        "[bold cyan]Select Model(s) to Delete[/bold cyan]\n\n"
+        "Choose one or more models to delete permanently.\n"
+        "[dim]Examples: '5' (single), '1 2 3' (multiple), '1-5' (range), '1 3-5 7' (mixed)[/dim]",
         title="Model Deletion",
         border_style="cyan"
     )
@@ -610,83 +803,157 @@ def run_delete_workflow(
         tui.console.print(f"  [{idx}] {model.name} - {model.size_gb:.1f} GB")
     tui.console.print()
 
-    # Get model selection
+    # Get model selection(s)
     try:
         choice = tui.prompt(
-            f"Select model [1-{len(models)}] or 'c' to cancel:",
+            f"Select model(s) [1-{len(models)}] or 'c' to cancel:",
             style="cyan"
-        ).strip().lower()
+        ).strip()
 
-        if choice == 'c':
+        if choice.lower() == 'c':
             logger.info("User cancelled model deletion")
             return False
 
-        idx = int(choice)
-        if not (1 <= idx <= len(models)):
-            tui.show_error("Invalid selection")
-            tui.prompt("Press Enter to continue...", style="dim")
+        # Parse selection input
+        selected_indices = parse_selection_input(choice, len(models))
+
+        if not selected_indices:
+            logger.info("User cancelled model deletion (empty selection)")
             return False
 
-        selected_model = models[idx - 1]
+        # Get selected models
+        selected_models = [models[idx - 1] for idx in selected_indices]
 
-    except ValueError:
-        tui.show_error("Invalid input")
+    except ValueError as e:
+        tui.show_error(f"Invalid input: {e}")
         tui.prompt("Press Enter to continue...", style="dim")
         return False
 
+    # Calculate total size
+    total_size = sum(model.size_gb for model in selected_models)
+
     # Confirm deletion
-    if not confirm_deletion(selected_model.name, selected_model.size_gb):
-        logger.info(f"User cancelled deletion of {selected_model.name}")
+    model_names = "\n".join([f"  • {model.name} ({model.size_gb:.1f} GB)" for model in selected_models])
+    confirm_msg = (
+        f"[bold red]Delete {len(selected_models)} model(s)?[/bold red]\n\n"
+        f"{model_names}\n\n"
+        f"[bold]Total space to free: {total_size:.1f} GB[/bold]\n\n"
+        f"[yellow]This action cannot be undone![/yellow]"
+    )
+
+    tui.show_panel(confirm_msg, title="Confirm Deletion", border_style="red")
+    confirm = tui.prompt("Type 'yes' to confirm deletion:", style="yellow").strip().lower()
+
+    if confirm != 'yes':
+        logger.info(f"User cancelled deletion of {len(selected_models)} models")
         tui.show_message("Deletion cancelled.", title="Cancelled", style="yellow")
         tui.prompt("Press Enter to continue...", style="dim")
         return False
 
-    # Check if model is currently loaded - unload it first
-    if (session_manager.state.loaded_model and
-        session_manager.state.loaded_model.model_info.model_id == selected_model.model_id):
-        logger.info(f"Unloading currently loaded model before deletion: {selected_model.model_id}")
+    # Check if any selected model is currently loaded - unload it first
+    if session_manager.state.loaded_model:
+        loaded_model_id = session_manager.state.loaded_model.model_info.model_id
+        if any(model.model_id == loaded_model_id for model in selected_models):
+            logger.info("Unloading currently loaded model before deletion")
+            tui.show_message(
+                "One of the selected models is currently loaded.\nUnloading before deletion...",
+                title="Unloading Model",
+                style="yellow"
+            )
+            session_manager.unload_current_model()
+
+    # Delete the models
+    tui.clear_screen()
+    tui.console.print(f"\n[bold yellow]Deleting {len(selected_models)} model(s)...[/bold yellow]\n")
+
+    successful_deletions = []
+    failed_deletions = []
+
+    for i, model in enumerate(selected_models, 1):
+        tui.console.print(f"[{i}/{len(selected_models)}] Deleting {model.name}...", style="cyan")
+
+        try:
+            delete_success = provider.delete_model(model.model_id)
+
+            if delete_success:
+                successful_deletions.append(model)
+                tui.console.print(f"  ✓ Deleted {model.name} ({model.size_gb:.1f} GB)", style="green")
+                logger.info(f"Successfully deleted {model.name}")
+            else:
+                failed_deletions.append(model)
+                tui.console.print(f"  ✗ Failed to delete {model.name}", style="red")
+                logger.error(f"Deletion failed for {model.name}")
+
+        except Exception as e:
+            failed_deletions.append(model)
+            logger.error(f"Deletion error for {model.name}: {e}")
+            tui.console.print(f"  ✗ Error deleting {model.name}: {e}", style="red")
+
+    # Show summary
+    tui.console.print()
+    freed_space = sum(model.size_gb for model in successful_deletions)
+
+    if successful_deletions and not failed_deletions:
         tui.show_message(
-            f"Model {selected_model.name} is currently loaded.\nUnloading before deletion...",
-            title="Unloading Model",
+            f"✓ Successfully deleted {len(successful_deletions)} model(s)!\n\n"
+            f"Freed {freed_space:.1f} GB of disk space.",
+            title="Deletion Complete",
+            style="green"
+        )
+    elif successful_deletions and failed_deletions:
+        tui.show_message(
+            f"⚠ Partial success:\n\n"
+            f"✓ Deleted: {len(successful_deletions)} model(s) ({freed_space:.1f} GB freed)\n"
+            f"✗ Failed: {len(failed_deletions)} model(s)\n\n"
+            f"Check logs for details.",
+            title="Deletion Partially Complete",
             style="yellow"
         )
-        session_manager.unload_current_model()
-
-    # Delete the model
-    tui.clear_screen()
-    tui.console.print(f"\n[bold yellow]Deleting {selected_model.name}...[/bold yellow]\n")
-
-    try:
-        delete_success = provider.delete_model(selected_model.model_id)
-
-        if delete_success:
-            tui.show_message(
-                f"✓ Successfully deleted {selected_model.name}!\n\n"
-                f"Freed {selected_model.size_gb:.1f} GB of disk space.",
-                title="Deletion Complete",
-                style="green"
-            )
-            logger.info(f"Successfully deleted {selected_model.name}")
-        else:
-            tui.show_error(f"Failed to delete {selected_model.name}")
-            logger.error(f"Deletion failed for {selected_model.name}")
-
-    except Exception as e:
-        logger.error(f"Deletion error for {selected_model.name}: {e}")
-        tui.show_error(f"Deletion failed: {e}")
-        delete_success = False
+    else:
+        tui.show_error(
+            f"Failed to delete all {len(selected_models)} model(s).\n\n"
+            "Check logs for details."
+        )
 
     tui.prompt("Press Enter to continue...", style="dim")
-    return delete_success
+    return len(successful_deletions) > 0
+
+
+def _initialize_nltk_data() -> None:
+    """
+    Initialize NLTK data required for benchmarking quality metrics.
+
+    This wraps the benchmarking initialization to ensure it runs at startup.
+    """
+    try:
+        from ..benchmarking.init import initialize_benchmarking
+        initialize_benchmarking()
+    except Exception as e:
+        # Non-fatal - benchmarking will work with reduced functionality
+        logger.warning(f"Benchmarking initialization failed: {e}")
 
 
 def main() -> None:
     """Main application entry point with clean TUI."""
     global _global_session_manager
 
+    # Load environment variables from .env file
+    env_file = Path(".env")
+    if env_file.exists():
+        load_dotenv(env_file)
+        logger.info("✓ Loaded .env file")
+        if os.environ.get("HF_TOKEN"):
+            masked_token = os.environ.get("HF_TOKEN", "")[:10] + "..." if len(os.environ.get("HF_TOKEN", "")) > 10 else "***"
+            logger.info(f"✓ HuggingFace token loaded: {masked_token}")
+    else:
+        logger.debug(f".env file not found at {env_file.absolute()}")
+
     # Setup logging (only errors to console, everything to file)
     setup_logging()
     logger.info("Starting VLM/LLM CLI application")
+
+    # Initialize NLTK data (required for BLEU scores in benchmarking)
+    _initialize_nltk_data()
 
     # Setup signal handlers for cleanup
     setup_signal_handlers()
@@ -708,39 +975,187 @@ def main() -> None:
     # Show system specs screen
     SystemSpecsScreen.show(system_specs)
 
-    # Load configuration
-    LoadingScreen.show("Loading configuration...")
-    try:
-        config = load_config()
-        enabled_providers = [p for p, c in config.items() if c.enabled]
-        logger.info(f"Configuration loaded: {len(enabled_providers)} providers enabled")
-    except Exception as e:
-        logger.error(f"Config loading failed: {e}")
-        tui.show_error(f"Failed to load configuration: {e}")
-        return
+    # Main application loop - allows switching between modes
+    operation_mode = None
+    session_manager = None
+    config = None
 
-    # Initialize session manager
-    LoadingScreen.show("Initializing session...")
-    session_manager = SessionManager(config, system_specs)
+    while True:
+        # Show mode selection if not set
+        if operation_mode is None:
+            operation_mode = show_quantization_or_inference_menu()
+            if operation_mode == "quit":
+                logger.info("User quit from operation mode selection")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                tui.clear_screen()
+                return
+            elif operation_mode == "diagnostics":
+                # Run diagnostics
+                logger.info("Running system diagnostics")
+                from ..cli.diagnostics import SystemDiagnostics
+                diag = SystemDiagnostics()
+                diag.run_full_diagnostics(output_format="rich")
+                tui.prompt("\nPress Enter to return to main menu...", style="dim")
+                operation_mode = None  # Return to main menu
+                continue
 
-    # Register global session manager for cleanup on exit/signals
-    _global_session_manager = session_manager
+        # Initialize config and session manager if needed
+        if session_manager is None:
+            LoadingScreen.show("Loading configuration...")
+            try:
+                config = load_config()
+                logger.info("Configuration loaded")
+            except Exception as e:
+                logger.error(f"Config loading failed: {e}")
+                tui.show_error(f"Failed to load configuration: {e}")
+                return
 
-    # Check if Ollama is enabled and ensure it's running (silently in background)
+            LoadingScreen.show("Initializing session...")
+            session_manager = SessionManager(config, system_specs)
+            _global_session_manager = session_manager
+
+            # Register all providers ONCE (used by both quantization and inference modes)
+            LoadingScreen.show("Registering model providers...")
+            registered_providers = register_all_providers(session_manager, config, system_specs)
+            if not registered_providers:
+                logger.warning("No providers were registered successfully")
+
+        # Run selected mode
+        if operation_mode == "quantization":
+            logger.info("Running Quantization mode")
+            result = run_quantization_mode(session_manager)
+
+            if result == "quit":
+                logger.info("User quit from quantization mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from quantization")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_inference":
+                logger.info("Switching from quantization to inference mode")
+                operation_mode = "inference"
+                continue
+
+        elif operation_mode == "inference":
+            # Run inference mode
+            logger.info("Running Inference mode")
+            result = run_inference_mode(session_manager, config, system_specs)
+
+            if result == "quit":
+                logger.info("User quit from inference mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from inference")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_quantization":
+                logger.info("Switching from inference to quantization mode")
+                operation_mode = "quantization"
+                continue
+            elif result == "switch_finetuning":
+                logger.info("Switching from inference to finetuning mode")
+                operation_mode = "finetuning"
+                continue
+
+        elif operation_mode == "finetuning":
+            # Run finetuning mode
+            logger.info("Running Finetuning mode")
+            result = run_finetuning_mode(session_manager)
+
+            if result == "quit":
+                logger.info("User quit from finetuning mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from finetuning")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_inference":
+                logger.info("Switching from finetuning to inference mode")
+                operation_mode = "inference"
+                continue
+            elif result == "switch_quantization":
+                logger.info("Switching from finetuning to quantization mode")
+                operation_mode = "quantization"
+                continue
+
+        elif operation_mode == "benchmarking":
+            # Run benchmarking mode
+            logger.info("Running Benchmarking mode")
+            from .app_quantization import run_benchmarking_mode
+            result = run_benchmarking_mode(session_manager)
+
+            if result == "quit":
+                logger.info("User quit from benchmarking mode")
+                cleanup_on_exit()
+                tui.clear_screen()
+                tui.show_message(
+                    "Thank you for using VLM/LLM CLI!",
+                    title="Goodbye",
+                    style="cyan"
+                )
+                return
+            elif result == "main_menu":
+                logger.info("Returning to main menu from benchmarking")
+                operation_mode = None  # Reset to show menu again
+                continue
+            elif result == "switch_inference":
+                logger.info("Switching from benchmarking to inference mode")
+                operation_mode = "inference"
+                continue
+
+
+def register_all_providers(session_manager: SessionManager, config: dict, system_specs: SystemSpecs) -> list[ProviderType]:
+    """Register all enabled providers with the session manager.
+
+    Args:
+        session_manager: Session manager
+        config: Configuration dict
+        system_specs: System specifications
+
+    Returns:
+        List of successfully registered provider types
+    """
+    enabled_providers = [p for p, c in config.items() if c.enabled]
+    registered_providers = []
+
+    # Check if Ollama is enabled and ensure it's running
     ollama_config = config.get(ProviderType.OLLAMA)
     if ollama_config and ollama_config.enabled:
         logger.info("Checking Ollama server...")
         if not ensure_ollama_running(str(ollama_config.host)):
-            logger.error("Could not start Ollama server")
-            tui.show_error(
-                "Could not start Ollama server.\n\n"
-                "Please install Ollama from: https://ollama.ai\n"
-                "Or start it manually with: ollama serve"
-            )
-            return
-        logger.info("Ollama server is running")
+            logger.warning("Could not start Ollama server - skipping Ollama provider")
+        else:
+            logger.info("Ollama server is running")
 
-    # Register enabled providers (silently)
+    # Register enabled providers
     for provider_type, provider_config in config.items():
         if not provider_config.enabled:
             continue
@@ -750,20 +1165,55 @@ def main() -> None:
                 provider = OllamaProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered Ollama provider at {provider_config.host}")
+                registered_providers.append(provider_type)
 
             elif provider_type == ProviderType.HUGGINGFACE:
                 provider = HuggingFaceProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered HuggingFace provider at {provider_config.cache_dir}")
+                registered_providers.append(provider_type)
 
             elif provider_type == ProviderType.GGUF:
                 provider = GGUFProvider(provider_config)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered GGUF provider at {provider_config.models_dir}")
+                registered_providers.append(provider_type)
+
+            elif provider_type == ProviderType.QUANTIZED:
+                provider = QuantizedProvider(provider_config, system_specs)
+                session_manager.register_provider(provider_type, provider_config, provider)
+                logger.info(f"Registered Quantized provider at {provider_config.models_dir}")
+                registered_providers.append(provider_type)
 
             # LM Studio not yet implemented
             elif provider_type == ProviderType.LM_STUDIO:
                 logger.info("LM Studio provider not yet implemented")
+
+            # 2025 NEW: MLX provider for Apple Silicon
+            elif provider_type == ProviderType.MLX:
+                try:
+                    from ..providers.mlx import MLXProvider
+                    provider = MLXProvider(provider_config)
+                    session_manager.register_provider(provider_type, provider_config, provider)
+                    logger.info(f"Registered MLX provider at {provider_config.models_dir}")
+                    registered_providers.append(provider_type)
+                except ImportError:
+                    logger.warning("MLX provider not available (requires macOS with Apple Silicon)")
+                except Exception as e:
+                    logger.error(f"Failed to initialize MLX provider: {e}")
+
+            # 2025 NEW: OpenVINO provider for Intel optimization
+            elif provider_type == ProviderType.OPENVINO:
+                try:
+                    from ..providers.openvino import OpenVINOProvider
+                    provider = OpenVINOProvider(provider_config)
+                    session_manager.register_provider(provider_type, provider_config, provider)
+                    logger.info(f"Registered OpenVINO provider at {provider_config.models_dir}")
+                    registered_providers.append(provider_type)
+                except ImportError:
+                    logger.warning("OpenVINO provider not available (install: pip install openvino optimum[openvino])")
+                except Exception as e:
+                    logger.error(f"Failed to initialize OpenVINO provider: {e}")
 
             else:
                 logger.warning(f"Unknown provider type: {provider_type.value}")
@@ -771,26 +1221,52 @@ def main() -> None:
         except Exception as e:
             logger.error(f"Failed to register {provider_type.value} provider: {e}")
 
+    logger.info(f"Registered {len(registered_providers)} providers successfully")
+    return registered_providers
+
+
+def run_inference_mode(session_manager: SessionManager, config: dict, system_specs: SystemSpecs) -> str:
+    """Run inference mode.
+
+    Args:
+        session_manager: Session manager
+        config: Configuration dict
+        system_specs: System specifications
+
+    Returns:
+        "quit", "main_menu", or "switch_quantization"
+    """
+    global _global_session_manager
+    _global_session_manager = session_manager
+
+    enabled_providers = [p for p, c in config.items() if c.enabled]
+    logger.info(f"Running inference mode with {len(enabled_providers)} providers enabled")
+
     # Main application loop
     while True:
+        # Check for completed quantization notifications
+        check_and_show_completion_notifications()
+
         # Show provider selection menu
         provider_names = [p.value for p in enabled_providers]
         selected_provider = ProviderSelectionMenu.show(provider_names)
 
-        if selected_provider == "QUIT":
+        if selected_provider is None or selected_provider == "QUIT":
             # User quit - cleanup and exit
             logger.info("User initiated quit from provider selection")
-            cleanup_on_exit()
-            tui.clear_screen()
-            tui.show_message(
-                "Thank you for using VLM/LLM CLI!\nAll models unloaded.",
-                title="Goodbye",
-                style="cyan"
-            )
-            break
+            return "quit"
+
+        if selected_provider == "HOME":
+            # User wants to return to main menu
+            logger.info("User chose to return to main menu from provider selection")
+            return "main_menu"
 
         # Convert provider name to ProviderType
-        provider_type = ProviderType(selected_provider)
+        try:
+            provider_type = ProviderType(selected_provider)
+        except ValueError:
+            logger.warning(f"Invalid provider selection: {selected_provider}")
+            continue
 
         # Discover models for selected provider
         LoadingScreen.show(f"Discovering models from {selected_provider.upper()}...")
@@ -817,24 +1293,20 @@ def main() -> None:
 
         # Show model selection menu
         while True:
+            # Check for completed quantization notifications
+            check_and_show_completion_notifications()
+
             selected_model = ModelSelectionMenu.show(models, selected_provider)
 
             if selected_model == "QUIT":
                 # User quit - cleanup and exit
                 logger.info("User initiated quit from model selection")
-                cleanup_on_exit()
-                tui.clear_screen()
-                tui.show_message(
-                    "Thank you for using VLM/LLM CLI!\nAll models unloaded.",
-                    title="Goodbye",
-                    style="cyan"
-                )
-                return
+                return "quit"
 
-            if selected_model == "BACK2":
-                # Go back 2 levels - exit to provider selection by returning
-                logger.info("User pressed bb - going back 2 levels (to provider selection)")
-                return
+            if selected_model == "HOME":
+                # User wants to return to main menu
+                logger.info("User chose to return to main menu from model selection")
+                return "main_menu"
 
             if selected_model == "BACK":
                 # Go back to provider selection
@@ -843,7 +1315,7 @@ def main() -> None:
 
             if selected_model == "INSTALL":
                 # User wants to install a new model
-                logger.info("User initiated model installation")
+                logger.info(f"User initiated model installation for provider: {provider_type.value}")
                 install_success = run_install_workflow(session_manager, provider_type, system_specs)
 
                 if install_success:
@@ -889,20 +1361,60 @@ def main() -> None:
                 # Continue to show model menu again
                 continue
 
+            if selected_model == "REFRESH":
+                # User wants to refresh the model registry
+                logger.info(f"User initiated model registry refresh for {selected_provider}")
+
+                # Clear metadata cache to force re-inspection
+                from ..models.model_cache import ModelMetadataCache
+                cache = ModelMetadataCache()
+                cache.clear_cache()
+                logger.info("Cleared model metadata cache")
+
+                # Show loading screen while refreshing
+                LoadingScreen.show(f"Refreshing model registry for {selected_provider.upper()}...\n\n[dim]Clearing cache and re-discovering models...[/dim]")
+
+                try:
+                    # Re-discover models from provider
+                    models = session_manager.discover_models(provider=provider_type)
+                    logger.info(f"Refreshed models: {len(models)} found")
+
+                    tui.show_message(
+                        f"Model registry refreshed successfully!\n\n"
+                        f"Found {len(models)} models for {selected_provider.upper()}",
+                        title="Refresh Complete",
+                        style="green"
+                    )
+                    tui.prompt("Press Enter to continue...", style="dim")
+
+                except Exception as e:
+                    logger.error(f"Failed to refresh model registry: {e}")
+                    tui.show_error(
+                        f"Failed to refresh model registry:\n\n{e}\n\n"
+                        f"Make sure {selected_provider.upper()} is running and accessible.",
+                        title="Refresh Failed"
+                    )
+                    tui.prompt("Press Enter to continue...", style="dim")
+
+                # Continue to show model menu again
+                continue
+
             # Model selected - check compatibility and confirm if needed
             logger.info(f"User selected model: {selected_model.model_id}")
 
             # Handle TOO_LARGE models with user override
             if selected_model.compatibility == "too_large":
                 tui.show_message(
-                    f"⚠️  WARNING: Model May Not Fit in Memory\n\n"
+                    f"⚠️  WARNING: Model Size Exceeds Recommended Limit\n\n"
                     f"Model: {selected_model.name}\n"
                     f"Size: {selected_model.size_gb:.1f} GB\n"
-                    f"Recommended: {system_specs.recommended_model_size_gb:.1f} GB\n"
+                    f"Recommended max: {system_specs.recommended_model_size_gb:.1f} GB\n"
                     f"Available RAM: {system_specs.available_ram_gb:.1f} GB\n\n"
-                    f"Loading this model may cause:\n"
-                    f"  • System slowdown or crashes\n"
-                    f"  • Out of memory errors\n"
+                    f"{selected_model.compatibility_message}\n\n"
+                    f"This may cause:\n"
+                    f"  • Out-of-memory (OOM) errors\n"
+                    f"  • System slowdown or freezing\n"
+                    f"  • Application crashes\n"
                     f"  • Excessive swap usage",
                     title="Memory Warning",
                     style="yellow"
@@ -940,6 +1452,9 @@ def main() -> None:
                 )
                 tui.prompt("Press Enter to continue...", style="dim")
 
+                # Clear screen before showing inference interface
+                tui.clear_screen()
+
                 # Run endpoint workflow loop
                 workflow_result = run_endpoint_workflow(session_manager, selected_model)
 
@@ -951,20 +1466,12 @@ def main() -> None:
                 if workflow_result == "QUIT":
                     # Propagate quit signal up
                     logger.info("Propagating QUIT signal from endpoint workflow")
-                    cleanup_on_exit()
-                    tui.clear_screen()
-                    tui.show_message(
-                        "Thank you for using VLM/LLM CLI!\nAll models unloaded.",
-                        title="Goodbye",
-                        style="cyan"
-                    )
-                    return
+                    return "quit"
 
-                if workflow_result == "BACK2":
-                    # Go back 2 levels from endpoint menu = back to provider selection
-                    # Break from model selection loop to get to provider selection
-                    logger.info("Propagating BACK2 signal - returning to provider selection")
-                    break
+                if workflow_result == "HOME":
+                    # User wants to return to main menu
+                    logger.info("Propagating HOME signal - returning to main menu")
+                    return "main_menu"
 
             except Exception as e:
                 logger.error(f"Failed to load model {selected_model.model_id}: {e}")

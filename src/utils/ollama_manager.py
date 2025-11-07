@@ -3,6 +3,7 @@
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from loguru import logger
@@ -82,7 +83,7 @@ def ensure_ollama_running(host: str = "http://localhost:11434") -> bool:
     return start_ollama_background()
 
 
-def get_ollama_version() -> str | None:
+def get_ollama_version() -> Optional[str]:
     """Get Ollama version if available.
 
     Returns:

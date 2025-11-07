@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.___pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -23,12 +24,15 @@ share/python-wheels/
 *.egg
 MANIFEST
 Reference files/
-
+test1/
 # Virtual Environment
 venv/
 ENV/
 env/
 .venv/
+denali-venv/
+ekam-venv/
+*-venv/
 
 # IDE
 .vscode/
@@ -55,6 +59,10 @@ CLAUDE.md
 PRODUCTION_CHAT_TEMPLATES.md
 .specify/
 test_images/
+*_IMPLEMENTATION_PLAN.md
+
+# External Dependencies
+llama.cpp/
 
 # Model Caches (large files)
 *.gguf
@@ -77,7 +85,12 @@ test_images/
 htmlcov/
 .tox/
 .hypothesis/
+tests/
 
 # OS
 Thumbs.db
 .DS_Store
+.claude/
+
+# Ignore macOS AppleDouble files
+._*

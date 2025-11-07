@@ -29,6 +29,7 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
     from ..models.model import ModelInfo
 
     tui.clear_screen()
+    tui.show_step_heading("Question Answering Endpoint")
 
     # Show endpoint information
     tui.show_panel(
@@ -118,10 +119,17 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
             display_conversation_history(active_session)
 
         # Show instructions
-        tui.console.print("[dim]Commands: /info | /config | /status | /newimage | /exit[/dim]\n")
+        tui.console.print("[dim]Commands: /info | /config | /status | /newimage | /exit[/dim]")
+        tui.console.print("[dim]✓ Arrow Keys: Navigate | Up/Down: History | Enter: Submit | Ctrl+J: New line[/dim]\n")
 
-        # Get user question
-        question = tui.prompt("Your question:", style="green")
+        # Get user question using professional prompt handler
+        from ..cli.text_input import professional_prompt
+        question = professional_prompt.get_input(
+            "Your question:",
+            style="green",
+            allow_multiline=True,
+            show_instructions=False
+        )
 
         # Handle special commands
         question_stripped = question.strip()
@@ -341,6 +349,9 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
 
             end_time = time.perf_counter()
             elapsed_ms = (end_time - start_time) * 1000
+
+            # Log raw VLM response (before any cleaning/processing) - FULL response without truncation
+            logger.debug(f"Raw VLM QA response ({len(response)} chars): {response}")
 
             # Store exchange in session if using history
             if use_history and active_session:

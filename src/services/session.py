@@ -90,12 +90,8 @@ class SessionManager:
             logger.error(f"Model {model_id} not found")
             return False
 
-        # Check compatibility
-        if model.compatibility == CompatibilityStatus.TOO_LARGE:
-            # Prompt user override
-            if not self.resource_manager.prompt_user_override(model):
-                logger.info("User declined to load TOO_LARGE model")
-                return False
+        # Compatibility check already done in app.py with user confirmation
+        # Skip duplicate confirmation here (user already confirmed in the UI layer)
 
         # Unload current model if any
         if self.state.loaded_model:

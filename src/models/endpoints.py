@@ -10,6 +10,10 @@ class ProviderType(str, Enum):
     HUGGINGFACE = "huggingface"
     LM_STUDIO = "lm_studio"
     GGUF = "gguf"
+    QUANTIZED = "quantized"  # Quantized models from results/quantizations/
+    # 2025 NEW PROVIDERS
+    MLX = "mlx"  # Apple Silicon optimized (macOS only)
+    OPENVINO = "openvino"  # Intel CPU/iGPU optimized
 
 
 class EndpointType(str, Enum):

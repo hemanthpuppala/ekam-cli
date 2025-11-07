@@ -9,10 +9,12 @@ import httpx
 from loguru import logger
 from PIL import Image
 
-from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
+from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType, ProviderType
 from ..models.model import ModelInfo
+from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..utils.history_formatter import format_qa_history
+from ..utils.ollama_file_locator import OllamaFileLocator
 from .base import BaseProvider
 
 
@@ -29,6 +31,14 @@ class OllamaProvider(BaseProvider):
         self.base_url = str(config.host).rstrip("/")
         self.timeout = config.timeout_seconds
         self.client = httpx.Client(timeout=self.timeout)
+
+        # Initialize metadata cache for efficient model inspection
+        self.metadata_cache = ModelMetadataCache()
+        logger.debug("Initialized model metadata cache")
+
+        # Initialize file locator for quantization support
+        self.file_locator = OllamaFileLocator()
+        logger.debug("Initialized Ollama file locator for quantization")
 
     def discover_models(self) -> list[ModelInfo]:
         """Discover available models from Ollama server.
@@ -63,7 +73,7 @@ class OllamaProvider(BaseProvider):
             raise RuntimeError(f"Failed to discover Ollama models: {e}")
 
     def _parse_model_info(self, model_data: dict) -> ModelInfo:
-        """Parse Ollama model data into ModelInfo.
+        """Parse Ollama model data into ModelInfo using metadata cache.
 
         Args:
             model_data: Raw model data from Ollama API
@@ -72,24 +82,75 @@ class OllamaProvider(BaseProvider):
             ModelInfo instance with capabilities
         """
         name = model_data.get("name", "unknown")
-        size_bytes = model_data.get("size", 0)
-        size_gb = size_bytes / (1024**3)
 
-        # Dynamically classify model type using API introspection
-        model_type, capabilities = self._classify_model_dynamic(name)
+        # Get metadata from cache (uses ollama show --json command)
+        metadata = self.metadata_cache.get_metadata(name, provider="ollama")
 
-        # Create ModelInfo (compatibility will be assessed later by ResourceManager)
-        return ModelInfo(
-            model_id=name,
-            name=name,
-            provider="ollama",
-            size_gb=size_gb,
-            model_type=model_type,
-            capabilities=capabilities,
-            compatibility=CompatibilityStatus.PERFECT_FIT,  # Placeholder
-            compatibility_message="Compatibility not yet assessed",
-            is_installed=True,
-        )
+        if metadata:
+            # Map metadata model_type to ModelType enum
+            if metadata.model_type == "vlm":
+                model_type = ModelType.VLM
+                capabilities = [
+                    EndpointType.QA,
+                    EndpointType.CAPTION,
+                    EndpointType.DETECT,
+                    EndpointType.POINT,
+                    EndpointType.TEXT,
+                ]
+            elif metadata.model_type == "embedding":
+                model_type = ModelType.EMBEDDING
+                capabilities = []
+            else:  # llm or unknown
+                model_type = ModelType.LLM
+                capabilities = [EndpointType.TEXT]
+
+            # Get source path for quantization support
+            source_path = self.file_locator.get_model_path(name)
+            if source_path:
+                logger.debug(f"Located source file for {name}: {source_path}")
+            else:
+                logger.debug(f"Could not locate source file for {name}")
+
+            # Create ModelInfo with metadata
+            return ModelInfo(
+                model_id=name,
+                name=name,
+                provider=ProviderType.OLLAMA,
+                size_gb=metadata.file_size_gb,
+                architecture=metadata.architecture,
+                quantization=metadata.quantization,
+                params_billions=metadata.params_billions,
+                ram_gb=metadata.ram_gb,
+                vram_gb=metadata.vram_gb,
+                model_type=model_type,
+                capabilities=capabilities,
+                compatibility=CompatibilityStatus.PERFECT_FIT,
+                compatibility_message="Compatibility not yet assessed",
+                is_installed=True,
+                source_path=source_path,
+            )
+        else:
+            # Fallback: metadata inspection failed, use API introspection
+            logger.warning(f"Could not get metadata for {name}, using API fallback")
+            size_bytes = model_data.get("size", 0)
+            size_gb = size_bytes / (1024**3)
+            model_type, capabilities = self._classify_model_dynamic(name)
+
+            # Get source path for quantization support (even in fallback)
+            source_path = self.file_locator.get_model_path(name)
+
+            return ModelInfo(
+                model_id=name,
+                name=name,
+                provider=ProviderType.OLLAMA,
+                size_gb=size_gb,
+                model_type=model_type,
+                capabilities=capabilities,
+                compatibility=CompatibilityStatus.PERFECT_FIT,
+                compatibility_message="Compatibility not yet assessed",
+                is_installed=True,
+                source_path=source_path,
+            )
 
     def _classify_model_dynamic(self, name: str) -> tuple[ModelType, list[EndpointType]]:
         """Dynamically classify model type by inspecting model details via API.
@@ -387,7 +448,7 @@ class OllamaProvider(BaseProvider):
                     "temperature": 0.7,
                     "top_p": 0.9,
                     "top_k": 40,
-                    "max_tokens": 512,
+                    "max_tokens": 1024,  # Increased for more detailed responses
                     "repeat_penalty": 1.1,
                 }
             }
@@ -544,9 +605,16 @@ class OllamaProvider(BaseProvider):
         image_b64 = self._encode_image(image)
 
         prompt = (
-            f"Detect all instances of '{object_name}' in this image. "
-            f"Provide bounding box coordinates in JSON format as: "
-            f'[{{"bbox": [x1, y1, x2, y2], "label": "{object_name}"}}]'
+            f"Detect all instances of '{object_name}' in this image.\n\n"
+            f"Process:\n"
+            f"1. Examine the image carefully to identify each '{object_name}'\n"
+            f"2. For each instance, determine the bounding box coordinates\n"
+            f"3. Number instances sequentially (_1, _2, _3...)\n\n"
+            f"Return ONLY this JSON format (no explanations):\n"
+            f"{{\n"
+            f"  \"{object_name}_1\": [x1, y1, x2, y2],\n"
+            f"  \"{object_name}_2\": [x1, y1, x2, y2]\n"
+            f"}}"
         )
 
         payload = {
@@ -587,9 +655,15 @@ class OllamaProvider(BaseProvider):
         image_b64 = self._encode_image(image)
 
         prompt = (
-            f"Where is the '{object_name}' in this image? "
-            f"Provide the center coordinates in JSON format as: "
-            f'{{"x": <number>, "y": <number>}}'
+            f"Locate the '{object_name}' in this image.\n\n"
+            f"Process:\n"
+            f"1. Identify the '{object_name}' in the image\n"
+            f"2. Determine its center point\n"
+            f"3. Convert to normalized coordinates (0.0 = left/top, 1.0 = right/bottom)\n\n"
+            f"Return ONLY this JSON format (no explanations):\n"
+            f"{{\n"
+            f"  \"{object_name}\": [x, y]\n"
+            f"}}"
         )
 
         payload = {
@@ -713,7 +787,11 @@ class OllamaProvider(BaseProvider):
             logger.warning(f"Empty response from {model_id}")
             return "No response generated."
 
-        return message_content
+        # Apply response cleaning to remove artifacts and meta-commentary
+        from ..utils.response_cleaner import clean_model_response
+        cleaned_response = clean_model_response(message_content, aggressive=True)
+
+        return cleaned_response
 
     def install_model(
         self, model_name: str, progress_callback: Optional[Callable[[str, int, int], None]] = None
@@ -797,20 +875,107 @@ class OllamaProvider(BaseProvider):
             return False
 
     def estimate_model_size(self, model_name: str) -> float:
-        """Estimate model size from Ollama (requires model info).
+        """Estimate model size by querying Ollama API for actual model info.
+
+        Args:
+            model_name: Model name (e.g., "llama3.2:3b")
+
+        Returns:
+            Estimated size in GB
+        """
+        try:
+            # First check if model is already installed locally
+            response = requests.post(
+                f"{self.base_url}/api/show",
+                json={"name": model_name},
+                timeout=5
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+
+                # Get size from model info (in bytes)
+                size_bytes = data.get("size", 0)
+
+                if size_bytes > 0:
+                    size_gb = size_bytes / (1024**3)
+                    logger.info(f"Estimated size for {model_name}: {size_gb:.2f} GB (from Ollama API)")
+                    return size_gb
+                else:
+                    # Try to get from details/parameters
+                    details = data.get("details", {})
+                    param_size = details.get("parameter_size", "")
+
+                    # Parse parameter size (e.g., "3B" -> 3GB estimate)
+                    if param_size:
+                        return self._estimate_from_params(param_size)
+
+            # Model not installed locally, try to estimate from registry
+            logger.debug(f"Model {model_name} not found locally, checking Ollama library")
+
+            # Query Ollama library API for model info
+            library_response = requests.get(
+                f"https://registry.ollama.ai/v2/library/{model_name.split(':')[0]}/manifests/{model_name.split(':')[1] if ':' in model_name else 'latest'}",
+                timeout=5
+            )
+
+            if library_response.status_code == 200:
+                manifest = library_response.json()
+
+                # Sum layer sizes from manifest
+                total_size = 0
+                for layer in manifest.get("layers", []):
+                    total_size += layer.get("size", 0)
+
+                if total_size > 0:
+                    size_gb = total_size / (1024**3)
+                    logger.info(f"Estimated size for {model_name}: {size_gb:.2f} GB (from Ollama registry)")
+                    return size_gb
+
+        except requests.exceptions.Timeout:
+            logger.debug(f"Timeout querying Ollama API for {model_name}, using fallback")
+        except requests.exceptions.ConnectionError:
+            logger.debug(f"Could not connect to Ollama for {model_name}, using fallback")
+        except Exception as e:
+            logger.debug(f"Error estimating Ollama model size for {model_name}: {e}")
+
+        # Fallback to name-based estimation
+        return self._estimate_size_from_name(model_name)
+
+    def _estimate_from_params(self, param_size: str) -> float:
+        """Estimate size from parameter count string.
+
+        Args:
+            param_size: Parameter size string (e.g., "3B", "7B")
+
+        Returns:
+            Estimated size in GB
+        """
+        param_lower = param_size.lower().replace("b", "")
+        try:
+            params = float(param_lower)
+            # Rough estimate: 2 bytes per parameter (fp16) with overhead
+            return params * 2.0
+        except:
+            return 4.0
+
+    def _estimate_size_from_name(self, model_name: str) -> float:
+        """Fallback: Estimate size based on model name patterns.
 
         Args:
             model_name: Model name
 
         Returns:
-            Estimated size in GB (rough estimate from name)
+            Estimated size in GB
         """
-        # Extract size from model name (e.g., "llama3.2:3b" -> 3GB estimate)
         name_lower = model_name.lower()
 
         size_patterns = {
+            "0.5b": 1.0,
+            "1b": 2.0,
             "3b": 2.0,
             "7b": 4.0,
+            "8b": 4.5,
             "11b": 6.5,
             "13b": 7.5,
             "30b": 18.0,

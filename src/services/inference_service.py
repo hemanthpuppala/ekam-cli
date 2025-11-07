@@ -1,7 +1,7 @@
 """Inference service with timing and result tracking."""
 
 import time
-from typing import Any
+from typing import Any, Optional
 
 from loguru import logger
 from PIL import Image
@@ -113,7 +113,7 @@ class InferenceService:
                 raise ValueError("Text endpoint requires prompt")
 
     def _dispatch_endpoint(
-        self, inference_input: InferenceInput, image: Image.Image | None
+        self, inference_input: InferenceInput, image: Optional[Image.Image]
     ) -> InferenceOutput:
         """Dispatch to appropriate provider endpoint method.
 
