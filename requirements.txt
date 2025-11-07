@@ -1,97 +1,95 @@
+# ============================================
+# EKAM - Latest Dependencies (No Version Pinning)
+# ============================================
+# Always installs latest stable versions
+# No version constraints = always current & compatible
+
 # UI and Core utilities
-rich>=14.2.0
-prompt-toolkit>=3.0.43  # Professional text input with proper escape sequence handling
-pydantic>=2.12.3
-httpx>=0.28.1
-pillow>=12.0.0
-pyyaml>=6.0.3
-psutil>=7.1.2
-loguru>=0.7.3
-
-# Core ML packages - updated to latest stable versions
-# torch 2.9.0 has improved attention implementations and better Mac support
-torch==2.9.0
-torchvision==0.24.0  # Must match torch 2.9.0 version
-transformers>=4.57.1  # Latest stable with InternVL3 support
-
-# GGUF Quantization support (works on all platforms)
-llama-cpp-python>=0.3.16
-gguf>=0.17.1
-
-# HuggingFace model management
-huggingface-hub>=0.36.0
-safetensors>=0.6.2
-protobuf>=6.33.0
-sentencepiece>=0.2.1
-
-# Advanced quantization support (BnB, GPTQ)
-# Note: bitsandbytes has limited support on Apple Silicon (CPU-only on M-series)
-# These versions work with torch 2.9.0 and transformers 4.57.1
-accelerate>=1.11.0
-bitsandbytes>=0.42.0
-
-# Finetuning support
-# PEFT: Parameter-Efficient Fine-Tuning library (LoRA, QLoRA, Adapters, etc)
-peft>=0.14.0
+rich
+prompt-toolkit
+pydantic
+httpx
+pillow
+pyyaml
+psutil
+loguru
 
 # ============================================
-# 2025 OPTIONAL OPTIMIZATIONS
+# PyTorch - Latest for all platforms
 # ============================================
-# Install based on your hardware and needs
+# Auto-selects appropriate version for your platform
+torch
+torchvision
 
-# Flash Attention 2/3 (2-4x faster inference, 8x less memory)
-# Requires CUDA 11.6+ or ROCm 5.3+
-# Install: pip install flash-attn --no-build-isolation
-# flash-attn>=2.0.0  # Uncomment for CUDA/ROCm systems
+# ============================================
+# Transformers - Latest model architecture support
+# ============================================
+# Automatically handles Qwen 3, LLaMA 3.x, latest VLMs
+transformers
 
-# Apple Silicon (Mac M1/M2/M3/M4) - Up to 85x faster VLM inference
+# ============================================
+# GGUF Quantization (Ollama, llama.cpp compatible)
+# ============================================
+llama-cpp-python
+gguf
+
+# ============================================
+# HuggingFace - Latest model management
+# ============================================
+huggingface-hub
+safetensors
+protobuf
+sentencepiece
+
+# ============================================
+# Advanced Quantization - All methods supported
+# ============================================
+# GPTQ, QLoRA, GGUF, bfloat16, fp8, int8
+
+# Core acceleration
+accelerate
+bitsandbytes
+
+# GPTQ Quantization (high-performance inference)
+gptqmodel  # Latest GPTQ v2
+
+# QLoRA Fine-tuning support
+peft
+trl
+
+# ============================================
+# Apple Silicon (Mac M1/M2/M3/M4) Optimization
+# ============================================
 # MLX: Native Metal-accelerated ML framework
-# Install: pip install mlx mlx-lm mlx-vlm
-# Updated to 0.29.3 (mlx) and 0.3.4 (mlx-vlm) which adds InternVL3 support!
-mlx>=0.29.3  # Uncomment for macOS with Apple Silicon
-mlx-lm>=0.28.3  # Uncomment for LLM support on Mac
-mlx-vlm>=0.3.4  # Uncomment for VLM support on Mac (InternVL3 support added!)
-
-# Intel CPU/iGPU Optimization - Optimized for AVX-512, VNNI, AMX
-# OpenVINO: Intel's inference optimization toolkit
-# Install: pip install openvino openvino-dev optimum[openvino]
-# openvino>=2025.0  # Uncomment for Intel CPU optimization
-# openvino-dev>=2025.0  # Uncomment for model conversion tools
-# optimum[openvino]>=1.16.0  # Uncomment for HuggingFace + OpenVINO
-
-# Intel CPU Extensions (Alternative to OpenVINO)
-# IPEX: Intel Extension for PyTorch
-# Install: pip install intel-extension-for-pytorch
-# intel-extension-for-pytorch>=2.3.0  # Uncomment for Intel CPUs
-
-# Production Inference Engine (Optional - for high-throughput deployments)
-# vLLM: High-performance LLM/VLM serving (requires CUDA)
-# Install: pip install vllm
-# vllm>=0.5.0  # Uncomment for production deployments with CUDA
-
-# CPU Feature Detection
-py-cpuinfo>=9.0.0  # Already at latest stable
-
-# GPU Monitoring (Optional - for detailed NVIDIA GPU metrics)
-# nvidia-ml-py (pynvml) - NVIDIA Management Library Python bindings
-# Install: pip install nvidia-ml-py
-# nvidia-ml-py>=12.560.30  # Uncomment for detailed NVIDIA GPU monitoring
+mlx
+mlx-lm
+mlx-vlm
 
 # ============================================
-# BENCHMARKING DEPENDENCIES
+# CPU/System Optimization
 # ============================================
-# Statistical analysis and data processing
-numpy>=1.21.0  # Numerical computing for statistics
-scipy>=1.7.0  # Advanced statistics (percentiles, distributions)
-pandas>=1.3.0  # Data manipulation for CSV export
+py-cpuinfo
 
-# Visualization and reporting
-plotly>=5.0.0  # Interactive HTML charts
-matplotlib>=3.5.0  # Static PNG/PDF charts
-jinja2>=3.0.0  # HTML templating for reports
+# ============================================
+# Benchmarking & Analysis
+# ============================================
+numpy
+scipy
+pandas
+plotly
+matplotlib
+jinja2
 
-# Testing utilities
-pytest-asyncio>=0.20.0  # Async test support
-pytest-cov>=4.0.0  # Coverage reporting
-pytest-mock>=3.10.0  # Mocking utilities
-freezegun>=1.2.0  # Time mocking for tests
+# NLP Quality Metrics
+nltk
+rouge-score
+sentence-transformers
+
+# ============================================
+# Testing & Development
+# ============================================
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+freezegun

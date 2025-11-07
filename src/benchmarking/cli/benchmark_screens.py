@@ -30,7 +30,7 @@ console = Console()
 
 def _show_step_header(step_number: int, total_steps: int, title: str, subtitle: str = ""):
     """
-    Show step information header.
+    Show step information header with consistent formatting.
 
     Note: Ekam-CLI header is now shown automatically by tui.clear_screen()
 
@@ -40,11 +40,15 @@ def _show_step_header(step_number: int, total_steps: int, title: str, subtitle: 
         title: Step title
         subtitle: Optional subtitle text
     """
-    # Show step information (header is shown by clear_screen automatically)
-    console.print(f"[bold]Step {step_number}/{total_steps}:[/bold] [cyan]{title}[/cyan]")
+    from src.cli.tui_manager import tui
+
+    # Show step heading with consistent format
+    step_heading = f"Step {step_number}/{total_steps}: {title}"
+    tui.show_step_heading(step_heading)
+
     if subtitle:
         console.print(f"[dim]{subtitle}[/dim]")
-    console.print()
+        console.print()
 
 
 def show_model_type_selection(current_value: Optional[ModelType] = None) -> Optional[tuple]:

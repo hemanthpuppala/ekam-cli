@@ -9,13 +9,13 @@ set -e  # Exit on error
 # Detect OS
 if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
     OS="windows"
-    VENV_ACTIVATE="denali-venv/Scripts/activate"
+    VENV_ACTIVATE="ekam-venv/Scripts/activate"
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="mac"
-    VENV_ACTIVATE="denali-venv/bin/activate"
+    VENV_ACTIVATE="ekam-venv/bin/activate"
 else
     OS="linux"
-    VENV_ACTIVATE="denali-venv/bin/activate"
+    VENV_ACTIVATE="ekam-venv/bin/activate"
 fi
 
 # Detect Python command (prefer python3.12, then python3, then python)
@@ -64,12 +64,12 @@ echo -e "${GREEN}✓${NC} Python ${PYTHON_VERSION} found"
 
 # Create virtual environment if it doesn't exist
 echo -e "${BLUE}[2/6]${NC} Checking virtual environment..."
-if [ ! -d "denali-venv" ]; then
+if [ ! -d "ekam-venv" ]; then
     echo "Creating virtual environment..."
-    $PYTHON_CMD -m venv denali-venv
+    $PYTHON_CMD -m venv ekam-venv
     # Remove any AppleDouble files that might cause issues
     if [ "$OS" = "mac" ]; then
-        find denali-venv -name "._*" -delete 2>/dev/null || true
+        find ekam-venv -name "._*" -delete 2>/dev/null || true
     fi
     echo -e "${GREEN}✓${NC} Virtual environment created"
 else
@@ -89,11 +89,11 @@ fi
 
 # Install/update dependencies
 echo -e "${BLUE}[4/6]${NC} Checking dependencies..."
-if [ ! -f "denali-venv/.dependencies_installed" ] || [ "requirements.txt" -nt "denali-venv/.dependencies_installed" ]; then
+if [ ! -f "ekam-venv/.dependencies_installed" ] || [ "requirements.txt" -nt "ekam-venv/.dependencies_installed" ]; then
     echo "Installing dependencies (this may take a few minutes)..."
     pip install --upgrade pip > /dev/null 2>&1
     pip install -r requirements.txt > /dev/null 2>&1
-    touch denali-venv/.dependencies_installed
+    touch ekam-venv/.dependencies_installed
     echo -e "${GREEN}✓${NC} Dependencies installed"
 else
     echo -e "${GREEN}✓${NC} Dependencies up to date"

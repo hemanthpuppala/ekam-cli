@@ -1,6 +1,7 @@
 """Main CLI application entry point with dynamic TUI."""
 
 import atexit
+import os
 import signal
 import sys
 import time
@@ -8,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from loguru import logger
 
 from ..cli.display import display_conversation_history, display_statistics
@@ -164,6 +166,7 @@ def signal_handler(signum: int, frame) -> None:
             title="Interrupted",
             style="yellow"
         )
+        tui.clear_screen()
     elif signum == signal.SIGTSTP:
         tui.clear_screen()
         tui.show_message(
@@ -319,54 +322,51 @@ def run_detect_endpoint(session_manager: SessionManager, model_info: "ModelInfo"
         end_time = time.perf_counter()
         elapsed_ms = (end_time - start_time) * 1000
 
-        # Save annotated image with bounding boxes
-        from pathlib import Path as PathLib
-        from ..utils.image import save_annotated_image
+        # Format text response for display - simplified output
+        detected = len(detections) > 0
+        saved_image_path = None
 
-        results_dir = PathLib("results/detections")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        annotated_filename = f"detect_{timestamp}.png"
-        annotated_path = results_dir / annotated_filename
+        if detected:
+            # Save annotated image only if detections found
+            from pathlib import Path as PathLib
+            from ..utils.image import save_annotated_image
 
-        # Include original image dimensions for proper scaling
-        saved_image_path = save_annotated_image(
-            image,
-            detections,
-            annotated_path,
-            original_size=(original_width, original_height)
-        )
-        logger.info(f"Saved annotated image to: {saved_image_path}")
+            results_dir = PathLib("results/detections")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            annotated_filename = f"detect_{timestamp}.png"
+            annotated_path = results_dir / annotated_filename
 
-        # Format text response for display
-        if detections:
-            text_response = f"Detected {len(detections)} instance(s):\n\n"
-            for i, det in enumerate(detections, 1):
-                text_response += f"{i}. {det.get('label', 'unknown')}\n"
-                if 'bbox' in det:
-                    bbox = det['bbox']
-                    text_response += f"   BBox: [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]\n"
-                if 'confidence' in det:
-                    text_response += f"   Confidence: {det['confidence']:.2f}\n"
-                if 'raw' in det:
-                    text_response += f"   Raw: {det.get('raw', 'N/A')}\n"
+            # Include original image dimensions for proper scaling
+            saved_image_path = save_annotated_image(
+                image,
+                detections,
+                annotated_path,
+                original_size=(original_width, original_height)
+            )
+            logger.info(f"Saved annotated image to: {saved_image_path}")
+
+            # Build compact detection list with class names and bboxes
+            detections_str = ""
+            for det in detections:
+                label = det.get('label', 'unknown')
+                bbox = det.get('bbox', [])
+                detections_str += f"{label}: {list(bbox)}\n"
+
+            text_response = f"Detected: True\n\n{detections_str}\nOutput Image: {saved_image_path}"
         else:
-            text_response = "No objects detected."
+            text_response = f"Detected: False"
 
         # Display results
         tui.clear_screen()
         tui.show_panel(
-            f"[bold green]✓ Objects Detected[/bold green]\n\n"
-            f"[bold]Target:[/bold] {object_name if object_name else 'All objects'}\n\n"
-            f"[bold]Results:[/bold]\n{text_response}\n\n"
-            f"[bold]Annotated Image:[/bold] {saved_image_path}\n\n"
-            f"[dim]Time: {elapsed_ms/1000:.2f}s | Model: {model_info.name}[/dim]",
+            text_response,
             title="Detection Results",
             border_style="green"
         )
 
         logger.info(f"Detection inference completed in {elapsed_ms:.2f}ms")
 
-        # Record statistics with annotated image path
+        # Record statistics with annotated image path (only if detections found)
         inference_result = InferenceResult(
             model_id=model_info.model_id,
             provider=model_info.provider,
@@ -375,7 +375,7 @@ def run_detect_endpoint(session_manager: SessionManager, model_info: "ModelInfo"
             output=InferenceOutput(
                 text_response=text_response,
                 detections=detections,
-                annotated_image_path=str(saved_image_path)
+                annotated_image_path=str(saved_image_path) if saved_image_path else None
             ),
             inference_time_ms=elapsed_ms,
         )
@@ -919,13 +919,41 @@ def run_delete_workflow(
     return len(successful_deletions) > 0
 
 
+def _initialize_nltk_data() -> None:
+    """
+    Initialize NLTK data required for benchmarking quality metrics.
+
+    This wraps the benchmarking initialization to ensure it runs at startup.
+    """
+    try:
+        from ..benchmarking.init import initialize_benchmarking
+        initialize_benchmarking()
+    except Exception as e:
+        # Non-fatal - benchmarking will work with reduced functionality
+        logger.warning(f"Benchmarking initialization failed: {e}")
+
+
 def main() -> None:
     """Main application entry point with clean TUI."""
     global _global_session_manager
 
+    # Load environment variables from .env file
+    env_file = Path(".env")
+    if env_file.exists():
+        load_dotenv(env_file)
+        logger.info("✓ Loaded .env file")
+        if os.environ.get("HF_TOKEN"):
+            masked_token = os.environ.get("HF_TOKEN", "")[:10] + "..." if len(os.environ.get("HF_TOKEN", "")) > 10 else "***"
+            logger.info(f"✓ HuggingFace token loaded: {masked_token}")
+    else:
+        logger.debug(f".env file not found at {env_file.absolute()}")
+
     # Setup logging (only errors to console, everything to file)
     setup_logging()
     logger.info("Starting VLM/LLM CLI application")
+
+    # Initialize NLTK data (required for BLEU scores in benchmarking)
+    _initialize_nltk_data()
 
     # Setup signal handlers for cleanup
     setup_signal_handlers()
@@ -965,6 +993,7 @@ def main() -> None:
                     title="Goodbye",
                     style="cyan"
                 )
+                tui.clear_screen()
                 return
             elif operation_mode == "diagnostics":
                 # Run diagnostics
@@ -1222,7 +1251,7 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
         provider_names = [p.value for p in enabled_providers]
         selected_provider = ProviderSelectionMenu.show(provider_names)
 
-        if selected_provider == "QUIT":
+        if selected_provider is None or selected_provider == "QUIT":
             # User quit - cleanup and exit
             logger.info("User initiated quit from provider selection")
             return "quit"
@@ -1233,7 +1262,11 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
             return "main_menu"
 
         # Convert provider name to ProviderType
-        provider_type = ProviderType(selected_provider)
+        try:
+            provider_type = ProviderType(selected_provider)
+        except ValueError:
+            logger.warning(f"Invalid provider selection: {selected_provider}")
+            continue
 
         # Discover models for selected provider
         LoadingScreen.show(f"Discovering models from {selected_provider.upper()}...")
@@ -1418,6 +1451,9 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
                     style="green"
                 )
                 tui.prompt("Press Enter to continue...", style="dim")
+
+                # Clear screen before showing inference interface
+                tui.clear_screen()
 
                 # Run endpoint workflow loop
                 workflow_result = run_endpoint_workflow(session_manager, selected_model)

@@ -194,6 +194,121 @@ class BenchmarkSystemMonitor:
                 is_warmup=is_warmup
             )
 
+        # CPU Temperature metrics
+        if hasattr(metrics, 'cpu_temp_peak') and metrics.cpu_temp_peak is not None:
+            self.metrics_collector.record_metric(
+                name="cpu_temp_celsius_peak",
+                value=metrics.cpu_temp_peak,
+                unit=MetricUnit.CELSIUS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        if hasattr(metrics, 'cpu_temp_delta') and metrics.cpu_temp_delta is not None:
+            self.metrics_collector.record_metric(
+                name="cpu_temp_celsius_delta",
+                value=metrics.cpu_temp_delta,
+                unit=MetricUnit.CELSIUS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        # GPU Temperature metrics
+        if hasattr(metrics, 'gpu_temp_peak') and metrics.gpu_temp_peak is not None:
+            self.metrics_collector.record_metric(
+                name="gpu_temp_celsius_peak",
+                value=metrics.gpu_temp_peak,
+                unit=MetricUnit.CELSIUS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        if hasattr(metrics, 'gpu_temp_delta') and metrics.gpu_temp_delta is not None:
+            self.metrics_collector.record_metric(
+                name="gpu_temp_celsius_delta",
+                value=metrics.gpu_temp_delta,
+                unit=MetricUnit.CELSIUS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        # Throttling indicator (boolean converted to 0/1)
+        if hasattr(metrics, 'throttling_occurred'):
+            self.metrics_collector.record_metric(
+                name="throttling_occurred",
+                value=1.0 if metrics.throttling_occurred else 0.0,
+                unit=MetricUnit.BOOL,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        # Power consumption metrics
+        if hasattr(metrics, 'avg_power_draw_watts') and metrics.avg_power_draw_watts is not None:
+            self.metrics_collector.record_metric(
+                name="power_watts_avg",
+                value=metrics.avg_power_draw_watts,
+                unit=MetricUnit.WATTS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        if hasattr(metrics, 'total_energy_joules') and metrics.total_energy_joules is not None:
+            self.metrics_collector.record_metric(
+                name="energy_joules_total",
+                value=metrics.total_energy_joules,
+                unit=MetricUnit.JOULES,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        # I/O metrics
+        if hasattr(metrics, 'disk_read_mb') and metrics.disk_read_mb > 0:
+            self.metrics_collector.record_metric(
+                name="disk_read_mb",
+                value=metrics.disk_read_mb,
+                unit=MetricUnit.MEGABYTES,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        if hasattr(metrics, 'disk_write_mb') and metrics.disk_write_mb > 0:
+            self.metrics_collector.record_metric(
+                name="disk_write_mb",
+                value=metrics.disk_write_mb,
+                unit=MetricUnit.MEGABYTES,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
+        if hasattr(metrics, 'network_bytes') and metrics.network_bytes > 0:
+            self.metrics_collector.record_metric(
+                name="network_mb",
+                value=metrics.network_bytes / (1024 * 1024),  # Convert to MB
+                unit=MetricUnit.MEGABYTES,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup
+            )
+
     def get_latest_metrics(self) -> Optional[Dict[str, Any]]:
         """
         Get latest metrics from the tracker.

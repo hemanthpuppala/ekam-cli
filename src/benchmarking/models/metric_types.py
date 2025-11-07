@@ -151,6 +151,8 @@ class MetricUnit(Enum):
     MEGABYTES = "MB"
     GIGABYTES = "GB"
     CELSIUS = "°C"
+    WATTS = "W"
+    JOULES = "J"
     MB = "MB"  # Alias for MEGABYTES
     GB = "GB"  # Alias for GIGABYTES
 

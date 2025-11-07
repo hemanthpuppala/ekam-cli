@@ -8,7 +8,7 @@ Measures model stability under extended load:
 - Stability validation
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 import time
 
@@ -16,6 +16,7 @@ from src.benchmarking.suites.base_suite import BaseSuite
 from src.benchmarking.models.benchmark_config import BenchmarkConfig
 from src.benchmarking.models.suite_result import SuiteResult
 from src.benchmarking.models.metric_types import SuiteType, ResultStatus, MetricUnit, ModelType
+from src.benchmarking.models.suite_configs import StressConfig, stress_config_from_params
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
 from src.benchmarking.utils import MemoryOptimizer
@@ -68,18 +69,18 @@ class StressSuite(BaseSuite):
             # Setup
             self.setup(config)
 
-            # Read suite-specific configuration from parameters
-            if "duration_minutes" in config.parameters:
-                self.duration_minutes = config.parameters["duration_minutes"]
-                logger.info(f"Using custom duration: {self.duration_minutes} minutes")
-
-            if "checkpoint_interval_seconds" in config.parameters:
-                self.checkpoint_interval_seconds = config.parameters["checkpoint_interval_seconds"]
-                logger.info(f"Using custom checkpoint interval: {self.checkpoint_interval_seconds // 60} minutes")
-
+            # Load suite-specific configuration
+            suite_config = stress_config_from_params(config.parameters)
+            logger.info(f"Starting Stress suite for {len(config.models)} model(s)")
             logger.info(
-                f"Starting Stress suite for {len(config.models)} model(s) "
-                f"(duration: {self.duration_minutes} minutes)"
+                f"Configuration: {suite_config.duration_minutes} min duration, "
+                f"{suite_config.baseline_measurement_runs} baseline runs, "
+                f"cleanup every {suite_config.cleanup_frequency_runs} runs"
+            )
+            logger.info(
+                f"Stability thresholds: {suite_config.max_latency_degradation_percent}% latency, "
+                f"{suite_config.max_memory_growth_percent}% memory, "
+                f"{suite_config.max_error_rate_percent}% error rate"
             )
 
             # Prepare test data
@@ -102,7 +103,8 @@ class StressSuite(BaseSuite):
                             model_id=model_id,
                             endpoint=endpoint,
                             prompts=test_prompts,
-                            config=config
+                            config=config,
+                            suite_config=suite_config
                         )
 
                 finally:
@@ -141,7 +143,8 @@ class StressSuite(BaseSuite):
         model_id: str,
         endpoint: str,
         prompts: List[str],
-        config: BenchmarkConfig
+        config: BenchmarkConfig,
+        suite_config: StressConfig
     ):
         """
         Run continuous stress test for configured duration.
@@ -153,19 +156,19 @@ class StressSuite(BaseSuite):
             config: Benchmark configuration
         """
         test_start = time.time()
-        test_duration_seconds = self.duration_minutes * 60
-        next_checkpoint = test_start + self.checkpoint_interval_seconds
+        test_duration_seconds = suite_config.duration_minutes * 60
+        next_checkpoint = test_start + suite_config.checkpoint_interval_seconds
 
         run_number = 0
         prompt_idx = 0
         total_errors = 0
 
-        # Track baseline metrics (first 5 runs)
+        # Track baseline metrics (configurable number of runs)
         baseline_latencies = []
         baseline_memory = []
 
-        logger.info(f"  Running stress test for {self.duration_minutes} minutes...")
-        logger.info(f"  Checkpoint every {self.checkpoint_interval_seconds // 60} minutes")
+        logger.info(f"  Running stress test for {suite_config.duration_minutes} minutes...")
+        logger.info(f"  Checkpoint every {suite_config.get_checkpoint_interval_minutes():.1f} minutes")
 
         while (time.time() - test_start) < test_duration_seconds:
             run_number += 1
@@ -218,11 +221,11 @@ class StressSuite(BaseSuite):
                         endpoint=endpoint,
                         input_data=input_data,
                         parameters=config.parameters,
-                        timeout=600
+                        timeout=suite_config.timeout_seconds
                     )
 
-                # Post-run cleanup every 10 runs to avoid memory creep
-                if run_number % 10 == 0:
+                # Post-run cleanup at configurable frequency to avoid memory creep
+                if run_number % suite_config.cleanup_frequency_runs == 0:
                     MemoryOptimizer.aggressive_cleanup()
 
                 run_end = time.time()
@@ -272,8 +275,8 @@ class StressSuite(BaseSuite):
                         metadata=memory_metadata
                     )
 
-                    # Track baseline (first 5 runs)
-                    if run_number <= 5:
+                    # Track baseline (configurable number of runs)
+                    if run_number <= suite_config.baseline_measurement_runs:
                         baseline_latencies.append(latency_ms)
                         baseline_memory.append(memory_mb)
 
@@ -314,7 +317,7 @@ class StressSuite(BaseSuite):
                     f"  Checkpoint: {elapsed_minutes:.1f} min elapsed, "
                     f"{run_number} runs, {total_errors} errors ({error_rate:.1f}%)"
                 )
-                next_checkpoint = current_time + self.checkpoint_interval_seconds
+                next_checkpoint = current_time + suite_config.checkpoint_interval_seconds
 
         # Compute degradation metrics after stress test completes
         self._compute_degradation_metrics(
@@ -323,11 +326,12 @@ class StressSuite(BaseSuite):
             baseline_latencies=baseline_latencies,
             baseline_memory=baseline_memory,
             total_runs=run_number,
-            total_errors=total_errors
+            total_errors=total_errors,
+            suite_config=suite_config
         )
 
         logger.info(
-            f"  Stress test complete: {run_number} runs in {self.duration_minutes} minutes, "
+            f"  Stress test complete: {run_number} runs in {suite_config.duration_minutes} minutes, "
             f"{total_errors} errors"
         )
 
@@ -338,16 +342,18 @@ class StressSuite(BaseSuite):
         baseline_latencies: List[float],
         baseline_memory: List[float],
         total_runs: int,
-        total_errors: int
+        total_errors: int,
+        suite_config: StressConfig
     ):
         """
         Compute degradation and stability metrics across ALL runs.
 
         Analyzes the entire test duration to detect:
         - Overall latency changes (baseline vs overall average)
-        - Trend/slope of latency over time
-        - Memory growth patterns
-        - Error rate distribution
+        - Trend/slope of latency over time (degradation curves)
+        - Memory growth patterns and leak detection
+        - Error rate distribution and patterns
+        - CPU/GPU degradation tracking
 
         Args:
             model_id: Model ID
@@ -363,6 +369,10 @@ class StressSuite(BaseSuite):
                     if m.name == "latency_ms" and m.model_id == model_id and not m.is_warmup]
         memory_values = [m.value for m in all_metrics
                         if m.name == "memory_mb" and m.model_id == model_id and not m.is_warmup]
+        cpu_values = [m.value for m in all_metrics
+                     if m.name == "cpu_percent_avg" and m.model_id == model_id and not m.is_warmup]
+        gpu_values = [m.value for m in all_metrics
+                     if m.name == "gpu_percent_avg" and m.model_id == model_id and not m.is_warmup]
 
         if not latencies or not baseline_latencies:
             logger.warning("Insufficient data to compute degradation metrics")
@@ -468,12 +478,12 @@ class StressSuite(BaseSuite):
             metadata={"total_errors": total_errors, "total_runs": total_runs}
         )
 
-        # 4. Stability assessment (pass/fail) - based on OVERALL metrics
-        # Thresholds: <20% overall latency degradation, <50% overall memory growth, <10% error rate
+        # 4. Stability assessment (pass/fail) - based on configurable thresholds
+        thresholds = suite_config.get_stability_thresholds()
         stability_passed = (
-            overall_delta_percent < 20 and
-            (overall_mem_delta_percent < 50 if memory_values else True) and
-            error_rate_percent < 10
+            overall_delta_percent < thresholds["max_latency_degradation_percent"] and
+            (overall_mem_delta_percent < thresholds["max_memory_growth_percent"] if memory_values else True) and
+            error_rate_percent < thresholds["max_error_rate_percent"]
         )
 
         self._record_metric(
@@ -493,9 +503,106 @@ class StressSuite(BaseSuite):
             }
         )
 
+        # 5. Performance degradation curves (trend analysis via linear regression)
+        latency_slope = self._compute_trend_slope(latencies)
+        if latency_slope is not None:
+            self._record_metric(
+                name="latency_degradation_slope_ms_per_run",
+                value=latency_slope,
+                unit=MetricUnit.MS,
+                run_number=total_runs,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=False,
+                metadata={
+                    "interpretation": "Positive = degrading, Negative = improving, ~0 = stable",
+                    "total_runs_analyzed": len(latencies)
+                }
+            )
+
+        # Memory growth curve
+        if memory_values:
+            memory_slope = self._compute_trend_slope(memory_values)
+            if memory_slope is not None:
+                self._record_metric(
+                    name="memory_growth_slope_mb_per_run",
+                    value=memory_slope,
+                    unit=MetricUnit.MB,
+                    run_number=total_runs,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=False,
+                    metadata={
+                        "interpretation": "Positive = memory leak, Negative = improving, ~0 = stable",
+                        "total_measurements": len(memory_values)
+                    }
+                )
+
+        # CPU degradation curve
+        if cpu_values and len(cpu_values) >= 5:
+            baseline_cpu = sum(cpu_values[:5]) / len(cpu_values[:5])
+            final_cpu = sum(cpu_values[-5:]) / len(cpu_values[-5:])
+            cpu_delta_percent = ((final_cpu - baseline_cpu) / baseline_cpu * 100) if baseline_cpu > 0 else 0
+
+            cpu_slope = self._compute_trend_slope(cpu_values)
+            if cpu_slope is not None:
+                self._record_metric(
+                    name="cpu_degradation_slope_percent_per_run",
+                    value=cpu_slope,
+                    unit=MetricUnit.PERCENT,
+                    run_number=total_runs,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=False,
+                    metadata={
+                        "baseline_cpu_percent": baseline_cpu,
+                        "final_cpu_percent": final_cpu,
+                        "cpu_delta_percent": cpu_delta_percent
+                    }
+                )
+
+        # GPU degradation curve
+        if gpu_values and len(gpu_values) >= 5:
+            baseline_gpu = sum(gpu_values[:5]) / len(gpu_values[:5])
+            final_gpu = sum(gpu_values[-5:]) / len(gpu_values[-5:])
+            gpu_delta_percent = ((final_gpu - baseline_gpu) / baseline_gpu * 100) if baseline_gpu > 0 else 0
+
+            gpu_slope = self._compute_trend_slope(gpu_values)
+            if gpu_slope is not None:
+                self._record_metric(
+                    name="gpu_degradation_slope_percent_per_run",
+                    value=gpu_slope,
+                    unit=MetricUnit.PERCENT,
+                    run_number=total_runs,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=False,
+                    metadata={
+                        "baseline_gpu_percent": baseline_gpu,
+                        "final_gpu_percent": final_gpu,
+                        "gpu_delta_percent": gpu_delta_percent
+                    }
+                )
+
+        # 6. Error pattern analysis
+        if total_errors > 0:
+            error_patterns = self._analyze_error_patterns(all_metrics, model_id, total_runs)
+
+            self._record_metric(
+                name="error_pattern_score",
+                value=error_patterns["clustering_score"],
+                unit=MetricUnit.SCORE,
+                run_number=total_runs,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=False,
+                metadata=error_patterns
+            )
+
         logger.info(
             f"  Degradation analysis across ALL {len(latencies)} runs:\n"
-            f"    Latency: overall {overall_delta_percent:+.1f}%, final {final_delta_percent:+.1f}%, max {max_delta_percent:+.1f}%\n"
+            f"    Latency: overall {overall_delta_percent:+.1f}%, final {final_delta_percent:+.1f}%, max {max_delta_percent:+.1f}%"
+            f" (slope: {latency_slope:+.3f} ms/run)" if latency_slope is not None else "" + "\n"
             f"    Memory: overall {overall_mem_delta_percent:+.1f}%, final {final_mem_delta_percent:+.1f}%, max {max_mem_delta_percent:+.1f}%"
             if memory_values else f"    Memory: N/A\n"
             f"    Error rate: {error_rate_percent:.1f}%\n"
@@ -551,6 +658,124 @@ class StressSuite(BaseSuite):
         )
 
         return result.get("output", "")
+
+    def _compute_trend_slope(self, values: List[float]) -> Optional[float]:
+        """
+        Compute linear regression slope for degradation curve analysis.
+
+        Uses least squares method to fit a line through the data points.
+        Positive slope = degrading, negative = improving, ~0 = stable.
+
+        Args:
+            values: Time series of metric values
+
+        Returns:
+            Slope value (change per run), or None if insufficient data
+        """
+        if not values or len(values) < 3:
+            return None
+
+        try:
+            n = len(values)
+            # X values are run numbers (0, 1, 2, ...)
+            x_values = list(range(n))
+
+            # Calculate means
+            x_mean = sum(x_values) / n
+            y_mean = sum(values) / n
+
+            # Calculate slope using least squares
+            numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, values))
+            denominator = sum((x - x_mean) ** 2 for x in x_values)
+
+            if denominator == 0:
+                return 0.0
+
+            slope = numerator / denominator
+            return slope
+
+        except Exception as e:
+            logger.warning(f"Failed to compute trend slope: {e}")
+            return None
+
+    def _analyze_error_patterns(self, all_metrics: List[Any], model_id: str, total_runs: int) -> Dict[str, Any]:
+        """
+        Analyze error patterns to detect clustering and timing.
+
+        Analyzes:
+        - When errors occur (beginning/middle/end of test)
+        - Error clustering (are errors consecutive or distributed?)
+        - Error type distribution (if available)
+
+        Args:
+            all_metrics: All metrics from the test
+            model_id: Model ID
+            total_runs: Total number of runs
+
+        Returns:
+            Dictionary with error pattern analysis
+        """
+        # Get error metrics
+        error_metrics = [m for m in all_metrics
+                        if m.name == "error_occurred" and m.model_id == model_id and not m.is_warmup]
+
+        if not error_metrics:
+            return {
+                "total_errors": 0,
+                "clustering_score": 0.0,
+                "errors_in_first_third": 0,
+                "errors_in_middle_third": 0,
+                "errors_in_last_third": 0,
+                "max_consecutive_errors": 0,
+                "error_types": {}
+            }
+
+        # Extract error run numbers
+        error_run_numbers = sorted([m.run_number for m in error_metrics])
+        total_errors = len(error_run_numbers)
+
+        # Analyze temporal distribution (beginning/middle/end)
+        third = total_runs // 3
+        errors_first = sum(1 for r in error_run_numbers if r <= third)
+        errors_middle = sum(1 for r in error_run_numbers if third < r <= 2 * third)
+        errors_last = sum(1 for r in error_run_numbers if r > 2 * third)
+
+        # Analyze clustering (consecutive errors)
+        max_consecutive = 1
+        current_consecutive = 1
+
+        for i in range(1, len(error_run_numbers)):
+            if error_run_numbers[i] == error_run_numbers[i-1] + 1:
+                current_consecutive += 1
+                max_consecutive = max(max_consecutive, current_consecutive)
+            else:
+                current_consecutive = 1
+
+        # Clustering score: ratio of max consecutive to total errors
+        # High score (close to 1) = errors are clustered
+        # Low score (close to 0) = errors are distributed
+        clustering_score = max_consecutive / total_errors if total_errors > 0 else 0.0
+
+        # Extract error types from metadata if available
+        error_types = {}
+        for m in error_metrics:
+            if hasattr(m, 'metadata') and m.metadata and 'error_message' in m.metadata:
+                error_msg = m.metadata['error_message']
+                # Categorize error types by first few words
+                error_type = ' '.join(error_msg.split()[:3]) if error_msg else "Unknown"
+                error_types[error_type] = error_types.get(error_type, 0) + 1
+
+        return {
+            "total_errors": total_errors,
+            "clustering_score": clustering_score,
+            "errors_in_first_third": errors_first,
+            "errors_in_middle_third": errors_middle,
+            "errors_in_last_third": errors_last,
+            "max_consecutive_errors": max_consecutive,
+            "error_types": error_types,
+            "interpretation": f"Clustering: {'high' if clustering_score > 0.5 else 'distributed'}, "
+                            f"Timing: {'early' if errors_first > errors_last else 'late' if errors_last > errors_first else 'uniform'}"
+        }
 
     def __repr__(self) -> str:
         """String representation."""

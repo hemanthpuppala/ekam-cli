@@ -67,7 +67,7 @@ function openHelpSidebar(metricName) {
     if (!metadata) {
         content.innerHTML = `
             <div class="metric-help-section">
-                <h4>⚠️ No information available</h4>
+                <h4> No information available</h4>
                 <p>Metadata for metric "${metricName}" is not yet available.</p>
             </div>
         `;
@@ -84,12 +84,12 @@ function openHelpSidebar(metricName) {
         </div>
 
         <div class="metric-help-section">
-            <h4>📊 Detailed Explanation</h4>
+            <h4> Detailed Explanation</h4>
             <p>${metadata.detailedExplanation}</p>
         </div>
 
         <div class="metric-help-section">
-            <h4>🔢 Calculation</h4>
+            <h4> Calculation</h4>
             <p>${metadata.calculation}</p>
             <div class="help-formula">${metadata.formula}</div>
         </div>
@@ -99,7 +99,7 @@ function openHelpSidebar(metricName) {
     if (metadata.interpretation) {
         html += `
             <div class="metric-help-section">
-                <h4>📈 Interpretation Thresholds</h4>
+                <h4> Interpretation Thresholds</h4>
                 <div class="help-thresholds">
         `;
 
@@ -135,7 +135,7 @@ function openHelpSidebar(metricName) {
     if (metadata.recommendations && Object.keys(metadata.recommendations).length > 0) {
         html += `
             <div class="metric-help-section">
-                <h4>💡 Recommendations</h4>
+                <h4> Recommendations</h4>
         `;
 
         for (const [level, recommendations] of Object.entries(metadata.recommendations)) {
@@ -156,7 +156,7 @@ function openHelpSidebar(metricName) {
     if (metadata.relatedMetrics && metadata.relatedMetrics.length > 0) {
         html += `
             <div class="metric-help-section">
-                <h4>🔗 Related Metrics</h4>
+                <h4> Related Metrics</h4>
                 <p>Also consider:</p>
                 <ul>
                     ${metadata.relatedMetrics.map(m => {
@@ -172,7 +172,7 @@ function openHelpSidebar(metricName) {
     if (metadata.statisticalNote) {
         html += `
             <div class="metric-help-section">
-                <h4>📊 Statistical Note</h4>
+                <h4> Statistical Note</h4>
                 <p style="font-style: italic; color: var(--text-muted);">${metadata.statisticalNote}</p>
             </div>
         `;
@@ -182,7 +182,7 @@ function openHelpSidebar(metricName) {
     if (metadata.limitations) {
         html += `
             <div class="metric-help-section">
-                <h4>⚠️ Limitations</h4>
+                <h4> Limitations</h4>
                 <p style="color: var(--accent-warning);">${metadata.limitations}</p>
             </div>
         `;
@@ -202,7 +202,7 @@ function closeHelpSidebar() {
 }
 
 function getCategoryIcon(category) {
-    return CATEGORY_METADATA[category]?.icon || '📊';
+    return CATEGORY_METADATA[category]?.icon || '';
 }
 
 // ===== INTERPRETATION BADGE GENERATION =====
@@ -277,7 +277,7 @@ function generateRecommendations() {
     if (recommendations.length === 0) {
         content.innerHTML = `
             <div style="text-align: center; padding: 3rem; color: var(--text-secondary);">
-                <div style="font-size: 3rem; margin-bottom: 1rem;">✅</div>
+                <div style="font-size: 3rem; margin-bottom: 1rem;"></div>
                 <h3>All metrics look good!</h3>
                 <p>No specific recommendations at this time.</p>
             </div>
@@ -307,7 +307,7 @@ function generateRecommendations() {
                     ${rec.recommendations.map(r => `<li>${r}</li>`).join('')}
                 </ul>
                 <button class="info-button" onclick="openHelpSidebar('${rec.metric}')">
-                    ℹ️ Learn More
+                    ℹ Learn More
                 </button>
             </div>
         `;
@@ -426,7 +426,7 @@ function renderComparison() {
             <div style="margin-bottom: 2rem;">
                 <h4 style="color: var(--text-primary); margin-bottom: 1rem; display: flex; align-items: center; justify-content: space-between;">
                     ${metadata.name}
-                    <button class="info-button" onclick="openHelpSidebar('${metricName}')">ℹ️ Info</button>
+                    <button class="info-button" onclick="openHelpSidebar('${metricName}')">ℹ Info</button>
                 </h4>
                 <table class="comparison-table">
                     <thead>
@@ -449,7 +449,7 @@ function renderComparison() {
 
             html += `
                 <tr class="${rowClass}">
-                    <td>${shortName} ${isWinner ? '🏆' : ''}</td>
+                    <td>${shortName} ${isWinner ? '' : ''}</td>
                     <td>${formatMetricValue(data.mean, metadata.unit)}</td>
                     <td>${formatMetricValue(data.median, metadata.unit)}</td>
                     <td>${formatMetricValue(data.std_dev, metadata.unit)}</td>
@@ -546,10 +546,10 @@ function exportDetailedReport() {
 </head>
 <body>
     <div class="container">
-        <h1>📊 VLM Benchmark Detailed Report</h1>
+        <h1> VLM Benchmark Detailed Report</h1>
         <p><strong>Generated:</strong> ${new Date().toLocaleString()}</p>
 
-        <h2>📋 Executive Summary</h2>
+        <h2> Executive Summary</h2>
         <p>This report provides a comprehensive model comparison with detailed explanations of each metric, showing which model performs best for each benchmark.</p>
     `;
 
@@ -653,7 +653,7 @@ function exportDetailedReport() {
             for (const model of metricData.models) {
                 const isWinner = winnerModel && model.model_id === winnerModel.model_id;
                 const rowClass = isWinner ? 'winner' : '';
-                const winnerIcon = isWinner ? '<span class="winner-icon">🏆</span>' : '';
+                const winnerIcon = isWinner ? '<span class="winner-icon"></span>' : '';
                 const modelName = model.model_id.split('/').pop() || model.model_id;
 
                 html += `
@@ -808,11 +808,11 @@ function enhanceRenderedMetrics() {
         if (!card.querySelector('.info-button')) {
             const infoBtn = document.createElement('button');
             infoBtn.className = 'info-button';
-            infoBtn.innerHTML = 'ℹ️ Info';
+            infoBtn.innerHTML = 'ℹ Info';
             infoBtn.onclick = () => openHelpSidebar(metricName);
             card.appendChild(infoBtn);
         }
     }
 }
 
-console.log('✨ Enhanced dashboard features loaded');
+console.log(' Enhanced dashboard features loaded');
