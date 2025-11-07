@@ -315,8 +315,7 @@ class ProviderSelectionMenu:
 
         # Show persistent Ekam-CLI header
         tui.clear_screen()
-        tui.console.print("[dim]Select a provider to begin model inference[/dim]")
-        tui.console.print()
+        tui.show_step_heading("Provider Selection")
 
         # Use arrow-key selection
         choice = professional_prompt.get_arrow_selection(
@@ -569,6 +568,7 @@ class ModelSelectionMenu:
             filtered_models = models
 
         tui.clear_screen()
+        tui.show_step_heading(f"Model Selection - {provider.upper()}")
 
         # Group models by type
         categorized = {}
@@ -824,8 +824,8 @@ class EndpointMenu:
 
         # Show persistent Ekam-CLI header
         tui.clear_screen()
-        tui.console.print(f"[bold]Model:[/bold] {model_name}")
-        tui.console.print(f"[dim]Type: {model_type.upper()}[/dim]")
+        tui.show_step_heading(f"Endpoint Selection - {model_name}")
+        tui.console.print(f"[dim]Model Type: {model_type.upper()}[/dim]")
         tui.console.print()
 
         # Use arrow-key selection

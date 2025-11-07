@@ -62,8 +62,6 @@ def show_quantization_or_inference_menu() -> str:
 
     # Show step heading with underline (Ekam-CLI header already shown by clear_screen)
     tui.show_step_heading("Main Menu")
-    tui.console.print("[dim]Production-ready for Windows, Linux, and macOS[/dim]")
-    tui.console.print("[dim]Full transparency and hardware capability detection[/dim]")
     tui.console.print()
 
     # Use arrow-key selection
@@ -136,12 +134,7 @@ def run_quantization_mode(session_manager: SessionManager) -> str:
 
         # Show header
         tui.clear_screen()
-        terminal_width = tui.console.width
-        tui.console.print()
-        tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-        tui.console.print("[bold cyan]Quantization Mode[/bold cyan]".center(terminal_width))
-        tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-        tui.console.print()
+        tui.show_step_heading("Quantization Mode")
 
         if status_text:
             tui.console.print(f"[yellow]Status:[/yellow] {status_text}")
@@ -251,12 +244,7 @@ def run_benchmarking_mode(session_manager: SessionManager) -> str:
 
             # Show header
             tui.clear_screen()
-            terminal_width = tui.console.width
-            tui.console.print()
-            tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-            tui.console.print("[bold cyan]Benchmark Mode[/bold cyan]".center(terminal_width))
-            tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-            tui.console.print()
+            tui.show_step_heading("Benchmark Mode")
             tui.console.print("[dim]Comprehensive performance testing and analysis[/dim]")
             tui.console.print()
 
@@ -339,14 +327,9 @@ def _run_foreground_benchmark(runner: "BenchmarkRunner", config: "BenchmarkConfi
 
     # Clear screen completely - no previous steps visible
     tui.clear_screen()
-    terminal_width = tui.console.width
 
     # Show concise configuration summary at the top
-    tui.console.print()
-    tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-    tui.console.print("[bold cyan]Running Benchmark[/bold cyan]".center(terminal_width))
-    tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-    tui.console.print()
+    tui.show_step_heading("Running Benchmark")
 
     # Configuration summary table
     summary_table = Table.grid(padding=(0, 2))

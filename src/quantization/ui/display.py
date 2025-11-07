@@ -707,7 +707,7 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
         options.append((
             "advanced",
             "[magenta]Advanced 4-bit (GPTQ/AWQ/BnB)[/magenta]",
-            "High-quality 4-bit • Requires CUDA • Production-ready • .safetensors"
+            "High-quality 4-bit • Requires CUDA • .safetensors"
         ))
 
     # Option 3: GGUF (only if not VLM)

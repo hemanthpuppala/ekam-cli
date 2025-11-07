@@ -17,6 +17,7 @@ from src.benchmarking.suites.base_suite import BaseSuite
 from src.benchmarking.models.benchmark_config import BenchmarkConfig
 from src.benchmarking.models.suite_result import SuiteResult
 from src.benchmarking.models.metric_types import SuiteType, ResultStatus, MetricUnit, ModelType
+from src.benchmarking.models.suite_configs import ResourcesConfig, resources_config_from_params
 from src.benchmarking.core.progress_display import ProgressPhase
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
@@ -67,11 +68,26 @@ class ResourcesSuite(BaseSuite):
         try:
             # Setup
             self.setup(config)
+
+            # Load suite-specific configuration
+            suite_config = resources_config_from_params(config.parameters)
             logger.info(f"Starting Resources suite for {len(config.models)} model(s)")
+            logger.info(f"Configuration: {suite_config.num_runs} runs, {suite_config.num_warmup} warmup, {suite_config.timeout_seconds}s timeout")
+            logger.info(f"Monitoring: {', '.join(suite_config.capabilities_to_monitor)} (sampling every {suite_config.monitor_sampling_rate_ms}ms)")
 
             # Start progress tracking
-            self._progress_start(config.num_runs, len(config.models))
+            self._progress_start(suite_config.num_runs, len(config.models))
             self._progress_update_phase(ProgressPhase.INITIALIZING)
+
+            # Device capability detection
+            device_capabilities = self._detect_device_capabilities()
+            logger.info("Device Capabilities:")
+            logger.info(f"  CPU: {device_capabilities['cpu_available']}")
+            logger.info(f"  NVIDIA GPU: {device_capabilities['nvidia_available']}")
+            logger.info(f"  Metal/MPS (Apple): {device_capabilities['mps_available']}")
+            logger.info(f"  ROCm (AMD): {device_capabilities['rocm_available']}")
+            logger.info(f"  Temperature monitoring: {device_capabilities['temperature_available']}")
+            logger.info(f"  Power monitoring: {device_capabilities['power_available']}")
 
             # Diagnostic logging
             logger.info(f"Configuration:")
@@ -106,11 +122,11 @@ class ResourcesSuite(BaseSuite):
                         logger.info(f"  Endpoint: {endpoint}")
 
                         # Warmup runs
-                        if config.num_warmup > 0:
-                            logger.info(f"  Running {config.num_warmup} warmup runs...")
-                            self._emit_progress(f"Running {config.num_warmup} warmup runs...")
+                        if suite_config.num_warmup > 0:
+                            logger.info(f"  Running {suite_config.num_warmup} warmup runs...")
+                            self._emit_progress(f"Running {suite_config.num_warmup} warmup runs...")
                             self._progress_update_phase(ProgressPhase.WARMUP)
-                            for warmup_num in range(1, config.num_warmup + 1):
+                            for warmup_num in range(1, suite_config.num_warmup + 1):
                                 self._progress_update_run(warmup_num, is_warmup=True)
                                 prompt = test_prompts[warmup_num % len(test_prompts)]
                                 self._execute_resource_run(
@@ -119,13 +135,14 @@ class ResourcesSuite(BaseSuite):
                                     prompt=prompt,
                                     run_number=warmup_num,
                                     is_warmup=True,
-                                    config=config
+                                    config=config,
+                                    suite_config=suite_config
                                 )
 
                         # Counted runs
-                        logger.info(f"  Running {config.num_runs} benchmark runs...")
+                        logger.info(f"  Running {suite_config.num_runs} benchmark runs...")
                         self._progress_update_phase(ProgressPhase.RUNNING)
-                        for run_num in range(1, config.num_runs + 1):
+                        for run_num in range(1, suite_config.num_runs + 1):
                             total_runs_attempted += 1
                             self._progress_update_run(run_num, is_warmup=False)
                             prompt = test_prompts[run_num % len(test_prompts)]
@@ -136,7 +153,8 @@ class ResourcesSuite(BaseSuite):
                                 prompt=prompt,
                                 run_number=run_num,
                                 is_warmup=False,
-                                config=config
+                                config=config,
+                                suite_config=suite_config
                             )
 
                             if success:
@@ -203,7 +221,8 @@ class ResourcesSuite(BaseSuite):
         prompt: str,
         run_number: int,
         is_warmup: bool,
-        config: BenchmarkConfig
+        config: BenchmarkConfig,
+        suite_config: ResourcesConfig
     ) -> bool:
         """
         Execute a single resource benchmark run with monitoring and memory optimization.
@@ -277,7 +296,7 @@ class ResourcesSuite(BaseSuite):
                     endpoint=endpoint,
                     input_data=input_data,
                     parameters=config.parameters,
-                    timeout=600
+                    timeout=suite_config.timeout_seconds
                 )
 
             # Post-run cleanup
@@ -406,6 +425,118 @@ class ResourcesSuite(BaseSuite):
         )
 
         return result.get("output", "")
+
+    def _detect_device_capabilities(self) -> Dict[str, bool]:
+        """
+        Detect available device capabilities for resource monitoring.
+
+        Checks for:
+        - CPU availability (always True)
+        - NVIDIA GPU support
+        - Metal/MPS (Apple Silicon)
+        - ROCm (AMD GPU)
+        - Temperature monitoring
+        - Power consumption monitoring
+
+        Returns:
+            Dictionary with capability flags
+        """
+        capabilities = {
+            'cpu_available': True,  # CPU is always available
+            'nvidia_available': False,
+            'mps_available': False,
+            'rocm_available': False,
+            'temperature_available': False,
+            'power_available': False
+        }
+
+        # Check for PyTorch and GPU support
+        try:
+            import torch
+
+            # Check Metal/MPS (Apple Silicon)
+            if hasattr(torch.backends, 'mps'):
+                capabilities['mps_available'] = torch.backends.mps.is_available()
+                logger.debug(f"Metal/MPS available: {capabilities['mps_available']}")
+
+            # Check NVIDIA CUDA
+            if torch.cuda.is_available():
+                # Could be NVIDIA or AMD ROCm
+                # Check for NVIDIA specifically
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    capabilities['nvidia_available'] = True
+                    logger.debug(f"NVIDIA GPU available: {capabilities['nvidia_available']}")
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    # If pynvml fails, might be ROCm
+                    capabilities['rocm_available'] = True
+                    logger.debug(f"ROCm GPU available: {capabilities['rocm_available']}")
+
+        except ImportError:
+            logger.warning("PyTorch not available - GPU detection skipped")
+        except Exception as e:
+            logger.warning(f"Error during GPU detection: {e}")
+
+        # Check temperature monitoring availability
+        try:
+            import platform
+            system = platform.system().lower()
+
+            if system == 'linux':
+                # Linux usually has good temperature sensor support
+                import os
+                capabilities['temperature_available'] = os.path.exists('/sys/class/thermal')
+            elif system == 'darwin':
+                # macOS temperature monitoring is limited without sudo
+                # Check if powermetrics is available (requires sudo)
+                import subprocess
+                try:
+                    result = subprocess.run(['which', 'powermetrics'],
+                                          capture_output=True, timeout=1)
+                    capabilities['temperature_available'] = result.returncode == 0
+                except Exception:
+                    capabilities['temperature_available'] = False
+            elif system == 'windows':
+                # Windows temperature monitoring via WMI
+                try:
+                    import wmi
+                    capabilities['temperature_available'] = True
+                except ImportError:
+                    capabilities['temperature_available'] = False
+
+            logger.debug(f"Temperature monitoring available: {capabilities['temperature_available']}")
+
+        except Exception as e:
+            logger.warning(f"Error detecting temperature monitoring: {e}")
+
+        # Check power monitoring availability
+        try:
+            # Power monitoring typically requires:
+            # - NVIDIA GPU: available via nvidia-smi/pynvml
+            # - Linux: available via RAPL (Running Average Power Limit)
+            # - macOS: requires sudo access to powermetrics
+            # - Windows: limited support via WMI
+
+            if capabilities['nvidia_available']:
+                # NVIDIA GPUs support power monitoring
+                capabilities['power_available'] = True
+            elif system == 'linux':
+                # Check for Intel RAPL
+                import os
+                rapl_path = '/sys/class/powercap/intel-rapl'
+                capabilities['power_available'] = os.path.exists(rapl_path)
+            elif system == 'darwin':
+                # macOS power metrics require sudo
+                capabilities['power_available'] = False  # Conservative default
+
+            logger.debug(f"Power monitoring available: {capabilities['power_available']}")
+
+        except Exception as e:
+            logger.warning(f"Error detecting power monitoring: {e}")
+
+        return capabilities
 
     def __repr__(self) -> str:
         """String representation."""

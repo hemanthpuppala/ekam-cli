@@ -2,7 +2,7 @@ providers:
   ollama:
     enabled: true
     host: http://localhost:11434
-    timeout_seconds: 600  # Increased from 120 to 600 for VLM inference
+    timeout_seconds: 600
   huggingface:
     enabled: true
     cache_dir: ~/.cache/huggingface/hub/
@@ -10,7 +10,7 @@ providers:
     - cuda
     - mps
     - cpu
-    hf_token: ${HF_TOKEN}  # Set via environment variable
+    hf_token: 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
   lm_studio:
     enabled: false
     host: http://localhost:1234
@@ -37,4 +37,4 @@ providers:
 system:
   max_image_dimension: 1920
   memory_safety_margin_gb: 1.0
-  default_timeout_seconds: 600  # Increased from 120 to 600 for VLM inference
+  default_timeout_seconds: 600

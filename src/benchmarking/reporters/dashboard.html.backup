@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ekam-CLI Benchmark Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-content">
+            <div class="header-title">
+                <div class="header-logo">E</div>
+                <h1>Ekam-CLI Benchmark Dashboard</h1>
+            </div>
+            <div class="header-actions">
+                <button class="btn" onclick="exportAllPNG()">
+                    <span>📊</span> Export Charts
+                </button>
+                <button class="theme-toggle" onclick="toggleTheme()">
+                    <span id="theme-icon">🌙</span>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Control Bar -->
+    <div class="control-bar">
+        <div class="control-bar-content">
+            <select class="filter-select" id="model-filter" onchange="applyFilters()">
+                <option value="">All Models</option>
+            </select>
+            <select class="filter-select" id="metric-filter" onchange="applyFilters()">
+                <option value="">All Metrics</option>
+            </select>
+            <select class="filter-select" id="aggregation-filter" onchange="changeAggregationLevel()">
+                <option value="global">📊 Global View (All Models)</option>
+                <option value="per_model">🎯 Per Model View</option>
+                <option value="per_endpoint">🔍 Per Endpoint View</option>
+            </select>
+            <button class="btn btn-secondary" onclick="toggleComparisonMode()" id="comparison-btn">
+                <span>⚖️</span> Compare Models
+            </button>
+            <button class="btn btn-secondary" onclick="toggleRecommendations()" id="recommendations-btn">
+                <span>💡</span> Recommendations
+            </button>
+            <button class="btn btn-secondary" onclick="exportDetailedReport()">
+                <span>📄</span> Export Report
+            </button>
+        </div>
+    </div>
+
+    <!-- Alerts Container -->
+    <div id="alerts-container"></div>
+
+    <!-- Main Content -->
+    <div class="container">
+        <!-- Stats Overview -->
+        <div class="stats-grid" id="stats-overview"></div>
+
+        <!-- Dashboard Grid -->
+        <div class="dashboard-grid" id="dashboard-grid"></div>
+    </div>
+
+    <!-- Modal -->
+    <div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2 id="modal-title">Run Details</h2>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modal-body"></div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="pinCurrentRun()">
+                    📌 Pin to Panel
+                </button>
+                <button class="btn" onclick="closeModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Panel -->
+    <div class="bottom-panel" id="bottom-panel">
+        <div class="panel-header">
+            <h3>📌 Pinned Runs for Comparison</h3>
+            <div class="panel-actions">
+                <button class="btn" onclick="clearPinnedRuns()">Clear All</button>
+                <button class="btn" onclick="toggleBottomPanel()">Close</button>
+            </div>
+        </div>
+        <div class="panel-content" id="panel-content"></div>
+    </div>
+
+    <!-- Custom Tooltip -->
+    <div class="custom-tooltip" id="custom-tooltip"></div>
+
+    <!-- Help Sidebar -->
+    <div class="help-sidebar" id="help-sidebar">
+        <div class="help-sidebar-header">
+            <h3 id="help-title">Metric Information</h3>
+            <button class="help-close" onclick="closeHelpSidebar()">&times;</button>
+        </div>
+        <div class="help-sidebar-content" id="help-content">
+            <!-- Dynamically populated -->
+        </div>
+    </div>
+
+    <!-- Recommendations Panel -->
+    <div class="recommendations-panel" id="recommendations-panel">
+        <div class="panel-header">
+            <h3>💡 Recommendations & Insights</h3>
+            <div class="panel-actions">
+                <button class="btn" onclick="toggleRecommendations()">Close</button>
+            </div>
+        </div>
+        <div class="panel-content" id="recommendations-content">
+            <!-- Dynamically populated -->
+        </div>
+    </div>
+
+    <!-- Model Comparison Panel -->
+    <div class="comparison-panel" id="comparison-panel">
+        <div class="panel-header">
+            <h3>⚖️ Model Comparison</h3>
+            <div class="panel-actions">
+                <button class="btn" onclick="toggleComparisonMode()">Close</button>
+            </div>
+        </div>
+        <div class="comparison-controls">
+            <label>Select models to compare:</label>
+            <div id="comparison-model-selectors"></div>
+        </div>
+        <div class="panel-content" id="comparison-content">
+            <!-- Dynamically populated -->
+        </div>
+    </div>
+
+    <!-- Missing Data Modal -->
+    <div class="modal-overlay" id="missing-data-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>Missing Data Details</h2>
+                <button class="modal-close" onclick="document.getElementById('missing-data-modal').classList.remove('active')">&times;</button>
+            </div>
+            <div class="modal-body" id="missing-data-modal-content">
+                <!-- Dynamically populated -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Embedded Data (populated by dashboard_generator.py) -->
+    <script>
+        // This will be populated by the dashboard generator
+        window.EMBEDDED_DATA = {
+            json: ``,
+            metricsCSV: ``,
+            aggregatesCSV: ``
+        };
+    </script>
+
+    <!-- Metric Metadata -->
+    <script src="metric_metadata.js"></script>
+
+    <!-- Main JavaScript -->
+    <script src="dashboard.js"></script>
+
+    <!-- Enhanced Features -->
+    <script src="dashboard_enhancements.js"></script>
+</body>
+</html>

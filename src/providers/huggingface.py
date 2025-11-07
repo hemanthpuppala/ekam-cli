@@ -289,7 +289,7 @@ class HuggingFaceProvider(BaseProvider):
         try:
             if hasattr(self.config, 'hf_token') and self.config.hf_token:
                 hf_token = self.config.hf_token
-                logger.debug("Using HF token from config")
+                logger.info("✓ Using HF token from config.yaml")
                 return hf_token
         except (AttributeError, KeyError):
             pass
@@ -297,7 +297,8 @@ class HuggingFaceProvider(BaseProvider):
         # Try environment variables
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         if hf_token:
-            logger.debug("Using HF token from environment variable")
+            masked = hf_token[:10] + "..." if len(hf_token) > 10 else "***"
+            logger.info(f"✓ Using HF token from environment ({masked})")
             return hf_token
 
         # Try local token file
@@ -307,12 +308,12 @@ class HuggingFaceProvider(BaseProvider):
                 with open(token_file, 'r') as f:
                     hf_token = f.read().strip()
                     if hf_token:
-                        logger.debug("Using HF token from ~/.huggingface/token")
+                        logger.info("✓ Using HF token from ~/.huggingface/token")
                         return hf_token
             except Exception as e:
                 logger.debug(f"Could not read token file: {e}")
 
-        logger.debug("No HuggingFace token found (will use public access)")
+        logger.warning("⚠ No HuggingFace token found (using public access only)")
         return None
 
     def _get_best_device(self) -> str:
@@ -1238,6 +1239,8 @@ class HuggingFaceProvider(BaseProvider):
                     }
                     if "torch_dtype" in base_kwargs:
                         minimal_kwargs["torch_dtype"] = base_kwargs["torch_dtype"]
+                    if "token" in base_kwargs:
+                        minimal_kwargs["token"] = base_kwargs["token"]
                     model = auto_class.from_pretrained(model_id, **minimal_kwargs)
 
                 if not hasattr(model, "generate"):
@@ -1898,7 +1901,7 @@ class HuggingFaceProvider(BaseProvider):
             True if successful
         """
         logger.info(f"Downloading HuggingFace model: {model_name}")
-        
+
         # NOTE: Do NOT use suppress_transformers_output() here!
         # We want users to see download progress bars during installation.
 
@@ -1909,7 +1912,10 @@ class HuggingFaceProvider(BaseProvider):
             token_kwarg = {}
             if self.hf_token:
                 token_kwarg = {"token": self.hf_token}
-                logger.debug("Using HF token for model download")
+                masked = self.hf_token[:10] + "..." if len(self.hf_token) > 10 else "***"
+                logger.info(f"✓ Using HF token for download ({masked})")
+            else:
+                logger.warning("⚠ No HF token available - public access only")
 
             # STEP 1: Check if this is a GGUF repository
             # GGUF repos contain .gguf files and should be downloaded directly
@@ -2059,6 +2065,9 @@ class HuggingFaceProvider(BaseProvider):
             from huggingface_hub import snapshot_download
             
             # Progress bars shown during download
+            logger.info(f"Calling snapshot_download with token: {'Yes' if token_kwarg else 'No'}")
+            logger.debug(f"snapshot_download params: repo_id={model_name}, cache_dir={self.cache_dir}, token_kwarg={list(token_kwarg.keys())}")
+
             snapshot_download(
                 repo_id=model_name,
                 cache_dir=str(self.cache_dir),
@@ -2230,7 +2239,7 @@ class HuggingFaceProvider(BaseProvider):
             return False
 
     def estimate_model_size(self, model_name: str) -> float:
-        """Estimate model size (rough estimate based on name).
+        """Estimate model size by querying actual file sizes from HuggingFace Hub.
 
         Args:
             model_name: Model identifier
@@ -2238,15 +2247,73 @@ class HuggingFaceProvider(BaseProvider):
         Returns:
             Estimated size in GB
         """
-        # Rough estimates based on common model sizes
+        try:
+            from huggingface_hub import HfFileSystem
+
+            # Setup authentication
+            token_kwarg = {}
+            if self.hf_token:
+                token_kwarg = {"token": self.hf_token}
+
+            # Use HfFileSystem to get file info
+            fs = HfFileSystem(**token_kwarg)
+
+            # List all files in the repo
+            try:
+                files_info = fs.ls(model_name, detail=True)
+            except Exception as e:
+                logger.debug(f"Could not list files for {model_name}, using fallback: {e}")
+                return self._estimate_size_from_name(model_name)
+
+            # Calculate total size of model files
+            total_size_bytes = 0
+            model_extensions = ['.safetensors', '.bin', '.gguf', '.pth', '.pt']
+
+            for file_info in files_info:
+                file_path = file_info.get('name', '')
+                file_size = file_info.get('size', 0)
+
+                # Only count model weight files
+                if any(file_path.endswith(ext) for ext in model_extensions):
+                    total_size_bytes += file_size
+                    logger.debug(f"Found model file: {file_path} ({file_size / 1e9:.2f} GB)")
+
+            # Convert to GB
+            if total_size_bytes > 0:
+                size_gb = total_size_bytes / (1024**3)
+                logger.info(f"Estimated size for {model_name}: {size_gb:.2f} GB (from actual files)")
+                return size_gb
+            else:
+                logger.debug(f"No model files found for {model_name}, using name-based estimate")
+                return self._estimate_size_from_name(model_name)
+
+        except Exception as e:
+            logger.debug(f"Error estimating size for {model_name}: {e}")
+            return self._estimate_size_from_name(model_name)
+
+    def _estimate_size_from_name(self, model_name: str) -> float:
+        """Fallback: Estimate size based on model name patterns.
+
+        Args:
+            model_name: Model identifier
+
+        Returns:
+            Estimated size in GB
+        """
         name_lower = model_name.lower()
 
-        if "7b" in name_lower:
-            return 14.0  # 7B models ~14GB fp16
+        if "70b" in name_lower:
+            return 140.0
+        elif "30b" in name_lower:
+            return 60.0
         elif "13b" in name_lower:
             return 26.0
+        elif "7b" in name_lower:
+            return 14.0
         elif "3b" in name_lower:
             return 6.0
+        elif "2b" in name_lower:
+            return 4.0
         elif "1b" in name_lower:
             return 2.0
         else:

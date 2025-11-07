@@ -29,6 +29,7 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
     from ..models.model import ModelInfo
 
     tui.clear_screen()
+    tui.show_step_heading("Question Answering Endpoint")
 
     # Show endpoint information
     tui.show_panel(

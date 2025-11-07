@@ -27,6 +27,7 @@ def run_chat_endpoint(session_manager: SessionManager, model_info: "ModelInfo") 
     from ..models.model import ModelInfo
 
     tui.clear_screen()
+    tui.show_step_heading("Text Chat Endpoint")
 
     # Warn if using VLM for text-only chat
     if str(model_info.model_type).lower() == "vlm":

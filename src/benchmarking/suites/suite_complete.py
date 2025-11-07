@@ -20,6 +20,7 @@ from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.models.benchmark_config import BenchmarkConfig
 from src.benchmarking.models.suite_result import SuiteResult, AggregateStats
 from src.benchmarking.models.metric_types import SuiteType, ResultStatus
+from src.benchmarking.models.suite_configs import CompleteConfig, complete_config_from_params
 from src.benchmarking.utils import MemoryOptimizer
 from loguru import logger
 
@@ -77,79 +78,66 @@ class CompleteSuite(BaseSuite):
         try:
             # Setup
             self.setup(config)
-            logger.info(
-                f"Starting Complete System Analysis for {len(config.models)} model(s)"
-            )
+
+            # Load suite-specific configuration
+            suite_config = complete_config_from_params(config.parameters)
+            logger.info(f"Starting Complete System Analysis for {len(config.models)} model(s)")
+            logger.info(f"Suites to run: {', '.join(suite_config.suites_to_run)}")
+            logger.info(f"Execution order: {' → '.join(suite_config.suite_execution_order)}")
+            logger.info(f"Stop on failure: {suite_config.stop_on_suite_failure}")
 
             # Store individual suite results
             suite_results = {}
 
-            # Read suite-specific run configurations from parameters
-            speed_runs = config.parameters.get("speed_runs", config.num_runs)
-            resources_runs = config.parameters.get("resources_runs", config.num_runs)
-            quality_runs = config.parameters.get("quality_runs", config.num_runs)
-            stress_duration = config.parameters.get("stress_duration_minutes", 15)
+            # Run suites in configured order
+            for suite_name in suite_config.suite_execution_order:
+                if suite_name not in suite_config.suites_to_run:
+                    continue
 
-            logger.info(f"Complete suite configuration:")
-            logger.info(f"  Speed runs: {speed_runs}")
-            logger.info(f"  Resources runs: {resources_runs}")
-            logger.info(f"  Quality runs: {quality_runs}")
-            logger.info(f"  Stress duration: {stress_duration} minutes")
+                logger.info("=" * 60)
+                logger.info(f"Running {suite_name.title()} suite...")
+                logger.info("=" * 60)
 
-            # Run Speed suite
-            logger.info("=" * 60)
-            logger.info("Running Speed & Throughput suite...")
-            logger.info("=" * 60)
-            try:
-                speed_config = config.model_copy(update={"num_runs": speed_runs})
-                speed_result = self.speed_suite.run(speed_config)
-                suite_results["speed"] = speed_result
-                logger.info(f"Speed suite completed with status: {speed_result.status.value}")
-            except Exception as e:
-                logger.error(f"Speed suite failed: {str(e)}")
-                suite_results["speed"] = None
+                try:
+                    # Get suite-specific configuration
+                    suite_specific_config = suite_config.get_or_create_suite_config(suite_name)
 
-            # Run Resources suite
-            logger.info("=" * 60)
-            logger.info("Running Resource Efficiency suite...")
-            logger.info("=" * 60)
-            try:
-                resources_config = config.model_copy(update={"num_runs": resources_runs})
-                resources_result = self.resources_suite.run(resources_config)
-                suite_results["resources"] = resources_result
-                logger.info(f"Resources suite completed with status: {resources_result.status.value}")
-            except Exception as e:
-                logger.error(f"Resources suite failed: {str(e)}")
-                suite_results["resources"] = None
+                    # Create custom parameters dict with suite-specific config
+                    suite_params = config.parameters.copy()
 
-            # Run Quality suite
-            logger.info("=" * 60)
-            logger.info("Running Quality & Consistency suite...")
-            logger.info("=" * 60)
-            try:
-                quality_config = config.model_copy(update={"num_runs": quality_runs})
-                quality_result = self.quality_suite.run(quality_config)
-                suite_results["quality"] = quality_result
-                logger.info(f"Quality suite completed with status: {quality_result.status.value}")
-            except Exception as e:
-                logger.error(f"Quality suite failed: {str(e)}")
-                suite_results["quality"] = None
+                    # Merge suite-specific parameters
+                    if suite_name == "speed":
+                        suite_params["speed"] = suite_specific_config.model_dump() if suite_specific_config else {}
+                        suite_result = self.speed_suite.run(config.model_copy(update={"parameters": suite_params}))
+                    elif suite_name == "resources":
+                        suite_params["resources"] = suite_specific_config.model_dump() if suite_specific_config else {}
+                        suite_result = self.resources_suite.run(config.model_copy(update={"parameters": suite_params}))
+                    elif suite_name == "quality":
+                        suite_params["quality"] = suite_specific_config.model_dump() if suite_specific_config else {}
+                        suite_result = self.quality_suite.run(config.model_copy(update={"parameters": suite_params}))
+                    elif suite_name == "stress":
+                        suite_params["stress"] = suite_specific_config.model_dump() if suite_specific_config else {}
+                        suite_result = self.stress_suite.run(config.model_copy(update={"parameters": suite_params}))
+                    else:
+                        logger.warning(f"Unknown suite: {suite_name}, skipping")
+                        continue
 
-            # Run Stress suite
-            logger.info("=" * 60)
-            logger.info("Running Stress & Endurance suite...")
-            logger.info("=" * 60)
-            try:
-                # Create custom config for stress suite with duration parameter
-                stress_params = config.parameters.copy()
-                stress_params["duration_minutes"] = stress_duration
-                stress_config = config.model_copy(update={"parameters": stress_params})
-                stress_result = self.stress_suite.run(stress_config)
-                suite_results["stress"] = stress_result
-                logger.info(f"Stress suite completed with status: {stress_result.status.value}")
-            except Exception as e:
-                logger.error(f"Stress suite failed: {str(e)}")
-                suite_results["stress"] = None
+                    suite_results[suite_name] = suite_result
+                    logger.info(f"{suite_name.title()} suite completed with status: {suite_result.status.value}")
+
+                    # Check if we should stop on failure
+                    if suite_config.stop_on_suite_failure and suite_result.status == ResultStatus.FAILED:
+                        logger.error(f"{suite_name.title()} suite failed - stopping execution")
+                        break
+
+                except Exception as e:
+                    logger.error(f"{suite_name.title()} suite failed: {str(e)}")
+                    suite_results[suite_name] = None
+
+                    # Check if we should stop on failure
+                    if suite_config.stop_on_suite_failure:
+                        logger.error(f"{suite_name.title()} suite encountered error - stopping execution")
+                        break
 
             # Aggregate all metrics from sub-suites
             self._aggregate_suite_results(suite_results)

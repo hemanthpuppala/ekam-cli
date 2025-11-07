@@ -15,6 +15,7 @@ from src.benchmarking.suites.base_suite import BaseSuite
 from src.benchmarking.models.benchmark_config import BenchmarkConfig
 from src.benchmarking.models.suite_result import SuiteResult
 from src.benchmarking.models.metric_types import SuiteType, ResultStatus, MetricUnit, ModelType
+from src.benchmarking.models.suite_configs import SpeedConfig, speed_config_from_params
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
 from src.benchmarking.utils import MemoryOptimizer, memory_tracked_operation, RetryWithCleanup
@@ -63,7 +64,12 @@ class SpeedSuite(BaseSuite):
         try:
             # Setup
             self.setup(config)
+
+            # Load suite-specific configuration
+            suite_config = speed_config_from_params(config.parameters)
             logger.info(f"Starting Speed suite for {len(config.models)} model(s)")
+            logger.info(f"Configuration: {suite_config.num_runs} runs, {suite_config.num_warmup} warmup, {suite_config.timeout_seconds}s timeout")
+            logger.info(f"Timing metrics: {', '.join(suite_config.timing_metrics_to_capture)}")
 
             # Prepare test data
             test_prompts = self._get_test_data(config)
@@ -86,12 +92,12 @@ class SpeedSuite(BaseSuite):
 
                         # Warmup runs - critical for discovering working inference methods
                         warmup_success = True
-                        if config.num_warmup > 0:
-                            logger.info(f"  Running {config.num_warmup} warmup runs...")
-                            self._emit_progress(f"Running {config.num_warmup} warmup runs...")
+                        if suite_config.num_warmup > 0:
+                            logger.info(f"  Running {suite_config.num_warmup} warmup runs...")
+                            self._emit_progress(f"Running {suite_config.num_warmup} warmup runs...")
                             warmup_failures = 0
 
-                            for warmup_num in range(1, config.num_warmup + 1):
+                            for warmup_num in range(1, suite_config.num_warmup + 1):
                                 prompt = test_prompts[warmup_num % len(test_prompts)]
                                 success, latency_ms = self._execute_speed_run(
                                     model_id=model_id,
@@ -99,11 +105,12 @@ class SpeedSuite(BaseSuite):
                                     prompt=prompt,
                                     run_number=warmup_num,
                                     is_warmup=True,
-                                    config=config
+                                    config=config,
+                                    suite_config=suite_config
                                 )
 
                                 if success:
-                                    self._emit_progress(f"Warmup run {warmup_num}/{config.num_warmup} completed in {latency_ms:.2f}ms")
+                                    self._emit_progress(f"Warmup run {warmup_num}/{suite_config.num_warmup} completed in {latency_ms:.2f}ms")
                                     # At least one warmup succeeded - we found a working method
                                     logger.info(f"✓ Warmup {warmup_num} succeeded - inference method confirmed")
                                     break
@@ -111,10 +118,10 @@ class SpeedSuite(BaseSuite):
                                     warmup_failures += 1
 
                             # If all warmup runs failed, skip this model/endpoint
-                            if warmup_failures == config.num_warmup:
+                            if warmup_failures == suite_config.num_warmup:
                                 warmup_success = False
                                 logger.error(
-                                    f"✗ All {config.num_warmup} warmup runs failed for {model_id}:{endpoint}. "
+                                    f"✗ All {suite_config.num_warmup} warmup runs failed for {model_id}:{endpoint}. "
                                     f"Skipping model - no compatible inference method found."
                                 )
                                 self._record_error(
@@ -129,8 +136,8 @@ class SpeedSuite(BaseSuite):
                             continue
 
                         # Counted runs
-                        logger.info(f"  Running {config.num_runs} benchmark runs...")
-                        for run_num in range(1, config.num_runs + 1):
+                        logger.info(f"  Running {suite_config.num_runs} benchmark runs...")
+                        for run_num in range(1, suite_config.num_runs + 1):
                             total_runs_attempted += 1
                             prompt = test_prompts[run_num % len(test_prompts)]
 
@@ -140,13 +147,14 @@ class SpeedSuite(BaseSuite):
                                 prompt=prompt,
                                 run_number=run_num,
                                 is_warmup=False,
-                                config=config
+                                config=config,
+                                suite_config=suite_config
                             )
 
                             if success:
                                 total_runs_successful += 1
                                 # Emit progress with latency for each completed run
-                                self._emit_progress(f"Run {run_num}/{config.num_runs} completed in {latency_ms:.2f}ms")
+                                self._emit_progress(f"Run {run_num}/{suite_config.num_runs} completed in {latency_ms:.2f}ms")
 
                 finally:
                     # Unload model after all runs complete to free memory
@@ -196,7 +204,8 @@ class SpeedSuite(BaseSuite):
         prompt: str,
         run_number: int,
         is_warmup: bool,
-        config: BenchmarkConfig
+        config: BenchmarkConfig,
+        suite_config: SpeedConfig
     ) -> tuple[bool, float]:
         """
         Execute a single speed benchmark run with memory optimization.
@@ -265,36 +274,78 @@ class SpeedSuite(BaseSuite):
 
             # Use memory-tracked context + retry mechanism
             retry_handler = RetryWithCleanup(
-                max_retries=2,
+                max_retries=suite_config.max_retries,
                 cleanup_between_retries=True,
-                backoff_seconds=2.0
+                backoff_seconds=suite_config.retry_backoff_seconds
             )
 
             def execute_with_timing():
-                """Inner function for retry wrapper."""
+                """Inner function for retry wrapper with advanced timing metrics."""
                 with memory_tracked_operation(
                     operation_name=operation_name,
-                    min_required_mb=250.0,  # Require at least 250MB for VLM inference
+                    min_required_mb=suite_config.min_memory_mb,
                     auto_cleanup=True
                 ):
-                    start_time = time.time()
+                    # Advanced timing tracking
+                    timing_data = {
+                        'start_time': time.time(),
+                        'first_token_time': None,
+                        'token_times': [],
+                        'end_time': None
+                    }
+
+                    # Streaming callback to capture TTFT and ITL
+                    def token_callback(token: str, is_first: bool = False):
+                        """Callback for streaming tokens."""
+                        current_time = time.time()
+                        if is_first and timing_data['first_token_time'] is None:
+                            timing_data['first_token_time'] = current_time
+                        timing_data['token_times'].append(current_time)
+
+                    # Add streaming callback to parameters if not present
+                    exec_params = config.parameters.copy() if config.parameters else {}
+                    exec_params['_stream_callback'] = token_callback
+                    exec_params['_enable_timing'] = True
 
                     result = self.executor.execute(
                         model_type=config.model_type,
                         model_id=model_id,
                         endpoint=endpoint,
                         input_data=input_data,
-                        parameters=config.parameters,
-                        timeout=600  # 10 minute timeout for large models
+                        parameters=exec_params,
+                        timeout=suite_config.timeout_seconds
                     )
 
-                    end_time = time.time()
-                    latency_ms = (end_time - start_time) * 1000
+                    timing_data['end_time'] = time.time()
 
-                    return result, latency_ms
+                    # Calculate metrics
+                    total_latency_ms = (timing_data['end_time'] - timing_data['start_time']) * 1000
+
+                    # Calculate TTFT if we got first token timing
+                    ttft_ms = None
+                    if timing_data['first_token_time']:
+                        ttft_ms = (timing_data['first_token_time'] - timing_data['start_time']) * 1000
+
+                    # Calculate inter-token latency (ITL) and decode latency
+                    itl_ms = None
+                    decode_latency_ms = None
+                    if len(timing_data['token_times']) > 1:
+                        # ITL = average time between tokens
+                        inter_token_gaps = [
+                            (timing_data['token_times'][i] - timing_data['token_times'][i-1]) * 1000
+                            for i in range(1, len(timing_data['token_times']))
+                        ]
+                        if inter_token_gaps:
+                            itl_ms = sum(inter_token_gaps) / len(inter_token_gaps)
+
+                        # Decode latency = time from first token to last token
+                        if timing_data['first_token_time']:
+                            decode_latency_ms = (timing_data['token_times'][-1] - timing_data['first_token_time']) * 1000
+
+                    return result, total_latency_ms, ttft_ms, itl_ms, decode_latency_ms
 
             # Execute with retry
-            result, latency_ms = retry_handler.execute(execute_with_timing)
+            result, latency_ms, ttft_ms, itl_ms, decode_latency_ms = retry_handler.execute(execute_with_timing)
 
             # Extract raw response (untruncated)
             raw_response = result.get("output", "")
@@ -306,7 +357,7 @@ class SpeedSuite(BaseSuite):
                 "raw_response": raw_response
             }
 
-            # Record latency metric with full I/O metadata
+            # Record total latency metric with full I/O metadata
             self._record_metric(
                 name="latency_ms",
                 value=latency_ms,
@@ -317,6 +368,58 @@ class SpeedSuite(BaseSuite):
                 is_warmup=is_warmup,
                 metadata=run_metadata
             )
+
+            # Record Time to First Token (TTFT) - prefill phase (if configured)
+            if ttft_ms is not None and suite_config.should_capture_metric("ttft_ms"):
+                self._record_metric(
+                    name="ttft_ms",
+                    value=ttft_ms,
+                    unit=MetricUnit.MILLISECONDS,
+                    run_number=run_number,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=is_warmup,
+                    metadata=run_metadata
+                )
+
+            # Also record prefill latency (TTFT is the prefill phase) (if configured)
+            if ttft_ms is not None and suite_config.should_capture_metric("prefill_latency_ms"):
+                self._record_metric(
+                    name="prefill_latency_ms",
+                    value=ttft_ms,
+                    unit=MetricUnit.MILLISECONDS,
+                    run_number=run_number,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=is_warmup,
+                    metadata=run_metadata
+                )
+
+            # Record Inter-Token Latency (ITL) - decode phase smoothness (if configured)
+            if itl_ms is not None and suite_config.should_capture_metric("itl_ms"):
+                self._record_metric(
+                    name="inter_token_latency_ms",
+                    value=itl_ms,
+                    unit=MetricUnit.MILLISECONDS,
+                    run_number=run_number,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=is_warmup,
+                    metadata=run_metadata
+                )
+
+            # Record Decode latency (total decode phase time) (if configured)
+            if decode_latency_ms is not None and suite_config.should_capture_metric("decode_latency_ms"):
+                self._record_metric(
+                    name="decode_latency_ms",
+                    value=decode_latency_ms,
+                    unit=MetricUnit.MILLISECONDS,
+                    run_number=run_number,
+                    model_id=model_id,
+                    endpoint=endpoint,
+                    is_warmup=is_warmup,
+                    metadata=run_metadata
+                )
 
             # Calculate and record throughput if token count available
             if "token_count" in result.get("metadata", {}):
