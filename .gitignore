@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+.___pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+Reference files/
+test1/
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+denali-venv/
+ekam-venv/
+*-venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Application Specific
+results/
+!results/quantizations/
+!results/quantizations/.gitkeep
+logs/
+*.log
+
+# Development & Documentation
+specs/
+CLAUDE.md
+PRODUCTION_CHAT_TEMPLATES.md
+.specify/
+test_images/
+*_IMPLEMENTATION_PLAN.md
+
+# External Dependencies
+llama.cpp/
+
+# Model Caches (large files)
+*.gguf
+*.bin
+*.safetensors
+*.pth
+*.pt
+*.onnx
+*.engine
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+.cache/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+tests/
+
+# OS
+Thumbs.db
+.DS_Store
+.claude/
+
+# Ignore macOS AppleDouble files
+._*
+
+# Windows reserved filename
+nul

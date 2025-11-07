@@ -1,0 +1,163 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ekam"
+version = "0.1.0"
+description = "EKAM - Efficient Knowledge & AI Models. A comprehensive benchmarking and testing suite for VLMs (Vision Language Models) and LLMs (Large Language Models)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "EKAM Contributors"}
+]
+keywords = [
+    "vlm",
+    "llm",
+    "benchmarking",
+    "testing",
+    "vision-language-models",
+    "large-language-models",
+    "quantization",
+    "inference"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core dependencies - No version pinning, always latest
+dependencies = [
+    # UI and Core utilities
+    "rich",
+    "prompt-toolkit",
+    "pydantic",
+    "httpx",
+    "pillow",
+    "pyyaml",
+    "psutil",
+    "loguru",
+
+    # Core ML packages - Latest for all architectures
+    "torch",
+    "torchvision",
+    "transformers",  # Latest with Qwen 3, LLaMA 3.x, VLMs
+
+    # GGUF Quantization support (Ollama, llama.cpp compatible)
+    "llama-cpp-python",
+    "gguf",
+
+    # HuggingFace model management
+    "huggingface-hub",
+    "safetensors",
+    "protobuf",
+    "sentencepiece",
+
+    # Advanced quantization support (GPTQ, QLoRA, GGUF, bfloat16, fp8, int8)
+    "accelerate",
+    "bitsandbytes",
+    "gptqmodel",  # Latest GPTQ v2
+
+    # Finetuning support
+    "peft",
+    "trl",  # Transformers Reinforcement Learning
+
+    # Apple Silicon (Mac M1/M2/M3/M4) optimization
+    "mlx",
+    "mlx-lm",
+    "mlx-vlm",
+
+    # CPU Feature Detection
+    "py-cpuinfo",
+
+    # Benchmarking dependencies
+    "numpy",
+    "scipy",
+    "pandas",
+    "plotly",
+    "matplotlib",
+    "jinja2",
+    "nltk",
+    "rouge-score",
+    "sentence-transformers",
+
+    # Testing utilities
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-mock",
+    "freezegun",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    "mypy",
+    "isort",
+]
+
+cuda = [
+    "flash-attn",      # High-speed attention for CUDA 11.6+/ROCm 5.3+
+    "vllm",            # High-throughput LLM serving
+    "nvidia-ml-py",    # NVIDIA GPU monitoring
+]
+
+intel = [
+    "openvino",
+    "openvino-dev",
+    "optimum",
+    "intel-extension-for-pytorch",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/ekam"
+Documentation = "https://github.com/yourusername/ekam"
+Repository = "https://github.com/yourusername/ekam.git"
+Issues = "https://github.com/yourusername/ekam/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"  # Support Python 3.9+
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN", "B"]
+ignore = ["ANN101", "ANN102"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]  # Support Python 3.9+
+include = '\.pyi?$'
+
+[tool.mypy]
+python_version = "3.9"  # Support Python 3.9+
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true

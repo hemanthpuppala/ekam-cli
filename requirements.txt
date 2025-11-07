@@ -1,0 +1,95 @@
+# ============================================
+# EKAM - Latest Dependencies (No Version Pinning)
+# ============================================
+# Always installs latest stable versions
+# No version constraints = always current & compatible
+
+# UI and Core utilities
+rich
+prompt-toolkit
+pydantic
+httpx
+pillow
+pyyaml
+psutil
+loguru
+
+# ============================================
+# PyTorch - Latest for all platforms
+# ============================================
+# Auto-selects appropriate version for your platform
+torch
+torchvision
+
+# ============================================
+# Transformers - Latest model architecture support
+# ============================================
+# Automatically handles Qwen 3, LLaMA 3.x, latest VLMs
+transformers
+
+# ============================================
+# GGUF Quantization (Ollama, llama.cpp compatible)
+# ============================================
+llama-cpp-python
+gguf
+
+# ============================================
+# HuggingFace - Latest model management
+# ============================================
+huggingface-hub
+safetensors
+protobuf
+sentencepiece
+
+# ============================================
+# Advanced Quantization - All methods supported
+# ============================================
+# GPTQ, QLoRA, GGUF, bfloat16, fp8, int8
+
+# Core acceleration
+accelerate
+bitsandbytes
+
+# GPTQ Quantization (high-performance inference)
+gptqmodel  # Latest GPTQ v2
+
+# QLoRA Fine-tuning support
+peft
+trl
+
+# ============================================
+# Apple Silicon (Mac M1/M2/M3/M4) Optimization
+# ============================================
+# MLX: Native Metal-accelerated ML framework
+mlx
+mlx-lm
+mlx-vlm
+
+# ============================================
+# CPU/System Optimization
+# ============================================
+py-cpuinfo
+
+# ============================================
+# Benchmarking & Analysis
+# ============================================
+numpy
+scipy
+pandas
+plotly
+matplotlib
+jinja2
+
+# NLP Quality Metrics
+nltk
+rouge-score
+sentence-transformers
+
+# ============================================
+# Testing & Development
+# ============================================
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+freezegun
