@@ -13,10 +13,12 @@ Provides intelligent backend selection based on available hardware.
 
 import platform
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
+import subprocess
+import sys
 
 from loguru import logger
 
@@ -78,6 +80,35 @@ class DeviceCapabilities:
 
     # Backend availability
     backends: list[str] = None
+    
+    # Additional production metadata
+    python_version: str = ""
+    torch_version: str = ""
+    transformers_version: str = ""
+    cuda_version: Optional[str] = None
+    rocm_version: Optional[str] = None
+    
+    # Quantization backend versions
+    bitsandbytes_version: Optional[str] = None
+    llama_cpp_version: Optional[str] = None
+    awq_version: Optional[str] = None
+    
+    # Detailed capability flags for production
+    can_quantize_fp16: bool = True
+    can_quantize_int8: bool = False
+    can_quantize_int4: bool = False
+    can_quantize_gguf: bool = False
+    can_quantize_awq: bool = False
+    can_quantize_gptq: bool = False
+    can_quantize_bnb: bool = False
+    
+    # Runtime performance indicators
+    optimal_batch_size: int = 1
+    recommended_context_length: int = 2048
+    
+    # Warnings and recommendations
+    warnings: List[str] = field(default_factory=list)
+    recommendations: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         if self.backends is None:
@@ -348,15 +379,99 @@ class PlatformDetector:
             backends.append("optimum")
         except ImportError:
             pass
+        
+        try:
+            import accelerate
+            backends.append("accelerate")
+        except ImportError:
+            pass
 
         return backends
+    
+    @staticmethod
+    def get_version_info() -> Dict[str, Optional[str]]:
+        """Get version information for all relevant packages.
+        
+        Returns:
+            Dictionary of package names to version strings
+        """
+        versions = {
+            "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        }
+        
+        # Core dependencies
+        for package in ["torch", "transformers", "bitsandbytes", "llama_cpp", "awq", "optimum", "accelerate"]:
+            try:
+                if package == "llama_cpp":
+                    import llama_cpp
+                    versions[package] = getattr(llama_cpp, "__version__", "unknown")
+                elif package == "awq":
+                    import awq
+                    versions[package] = getattr(awq, "__version__", "unknown")
+                else:
+                    mod = __import__(package)
+                    versions[package] = getattr(mod, "__version__", "unknown")
+            except ImportError:
+                versions[package] = None
+        
+        # CUDA version
+        try:
+            import torch
+            if torch.cuda.is_available():
+                versions["cuda"] = torch.version.cuda
+            else:
+                versions["cuda"] = None
+        except:
+            versions["cuda"] = None
+        
+        # ROCm version
+        try:
+            import torch
+            if hasattr(torch.version, "hip"):
+                versions["rocm"] = torch.version.hip
+            else:
+                versions["rocm"] = None
+        except:
+            versions["rocm"] = None
+        
+        return versions
+    
+    @staticmethod
+    def check_llama_cpp_tools() -> bool:
+        """Check if llama.cpp CLI tools are available.
+        
+        Returns:
+            True if llama-quantize binary is found
+        """
+        possible_paths = [
+            Path("/opt/homebrew/bin/llama-quantize"),
+            Path("/usr/local/bin/llama-quantize"),
+            Path.home() / ".llama.cpp" / "quantize",
+            Path("./llama.cpp/quantize"),
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                return True
+        
+        # Check PATH
+        try:
+            result = subprocess.run(
+                ["which", "llama-quantize"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode == 0
+        except:
+            return False
 
     @classmethod
     def detect_all(cls) -> DeviceCapabilities:
-        """Detect all platform and device capabilities.
+        """Detect all platform and device capabilities with production-grade metadata.
 
         Returns:
-            Complete device capabilities
+            Complete device capabilities with version info and recommendations
         """
         platform_type = cls.detect_platform()
         device_type = cls.detect_device_type()
@@ -365,11 +480,55 @@ class PlatformDetector:
         has_gpu, gpu_name, gpu_memory = cls.get_gpu_info()
         supports_fp16, supports_int8, supports_int4 = cls.detect_quantization_support()
         backends = cls.detect_available_backends()
+        versions = cls.get_version_info()
 
         # Determine edge device status
         is_raspberry_pi = platform_type == PlatformType.RASPBERRY_PI
         is_jetson = platform_type == PlatformType.JETSON
         is_edge_device = is_raspberry_pi or is_jetson or total_ram < 8.0
+        
+        # Determine quantization capabilities
+        has_llama_cpp = cls.check_llama_cpp_tools()
+        can_quantize_gguf = has_llama_cpp or versions.get("llama_cpp") is not None
+        can_quantize_bnb = device_type == DeviceType.CUDA and "bitsandbytes" in backends
+        can_quantize_awq = device_type == DeviceType.CUDA and versions.get("awq") is not None
+        can_quantize_gptq = device_type == DeviceType.CUDA and "optimum" in backends
+        can_quantize_int8 = can_quantize_bnb  # INT8 requires BnB on CUDA
+        can_quantize_int4 = can_quantize_bnb  # INT4 requires BnB on CUDA
+        
+        # Build warnings and recommendations
+        warnings = []
+        recommendations = []
+        
+        if not has_gpu:
+            warnings.append("No GPU detected - inference will be CPU-only (slower)")
+            recommendations.append("Consider using GGUF quantization for better CPU performance")
+        
+        if device_type == DeviceType.CUDA and not can_quantize_bnb:
+            recommendations.append("Install bitsandbytes for INT8/INT4 quantization: pip install bitsandbytes")
+        
+        if not can_quantize_gguf and device_type in [DeviceType.CPU, DeviceType.METAL]:
+            recommendations.append("Install llama.cpp for GGUF quantization: brew install llama.cpp (macOS) or build from source")
+        
+        if available_ram < 8.0:
+            warnings.append(f"Low RAM detected ({available_ram:.1f}GB) - may struggle with large models")
+            recommendations.append("Use quantized models (Q4_K_M or smaller) for better performance")
+        
+        if is_edge_device:
+            recommendations.append("Edge device detected - use small quantized models (< 4GB) for optimal performance")
+        
+        # Determine optimal settings
+        optimal_batch_size = 1
+        recommended_context_length = 2048
+        
+        if device_type == DeviceType.CUDA and gpu_memory and gpu_memory > 16:
+            optimal_batch_size = 4
+            recommended_context_length = 4096
+        elif device_type == DeviceType.CUDA and gpu_memory and gpu_memory > 8:
+            optimal_batch_size = 2
+            recommended_context_length = 2048
+        elif available_ram < 8:
+            recommended_context_length = 1024
 
         capabilities = DeviceCapabilities(
             platform=platform_type,
@@ -391,6 +550,29 @@ class PlatformDetector:
             is_raspberry_pi=is_raspberry_pi,
             is_jetson=is_jetson,
             backends=backends,
+            # Version info
+            python_version=versions["python"],
+            torch_version=versions.get("torch", "not installed"),
+            transformers_version=versions.get("transformers", "not installed"),
+            cuda_version=versions.get("cuda"),
+            rocm_version=versions.get("rocm"),
+            bitsandbytes_version=versions.get("bitsandbytes"),
+            llama_cpp_version=versions.get("llama_cpp"),
+            awq_version=versions.get("awq"),
+            # Capability flags
+            can_quantize_fp16=True,  # Always available
+            can_quantize_int8=can_quantize_int8,
+            can_quantize_int4=can_quantize_int4,
+            can_quantize_gguf=can_quantize_gguf,
+            can_quantize_awq=can_quantize_awq,
+            can_quantize_gptq=can_quantize_gptq,
+            can_quantize_bnb=can_quantize_bnb,
+            # Performance settings
+            optimal_batch_size=optimal_batch_size,
+            recommended_context_length=recommended_context_length,
+            # Feedback
+            warnings=warnings,
+            recommendations=recommendations,
         )
 
         logger.info(f"Platform detected: {platform_type.value}")
@@ -402,9 +584,19 @@ class PlatformDetector:
             logger.info(f"GPU: {gpu_name}" + (f" ({gpu_memory:.1f}GB)" if gpu_memory else ""))
 
         logger.info(f"Backends: {', '.join(backends)}")
-        logger.info(f"Quantization support: FP16={supports_fp16}, INT8={supports_int8}, INT4={supports_int4}")
+        logger.info(f"Python: {versions['python']}, PyTorch: {versions.get('torch', 'N/A')}")
+        logger.info(f"Quantization: FP16=✓, INT8={'✓' if can_quantize_int8 else '✗'}, INT4={'✓' if can_quantize_int4 else '✗'}, GGUF={'✓' if can_quantize_gguf else '✗'}")
 
         if is_edge_device:
             logger.info("Edge device detected - will use optimized settings")
+        
+        if warnings:
+            for warning in warnings:
+                logger.warning(warning)
+        
+        if recommendations:
+            logger.info("Recommendations:")
+            for rec in recommendations:
+                logger.info(f"  • {rec}")
 
         return capabilities

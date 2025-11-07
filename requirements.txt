@@ -1,30 +1,97 @@
 # UI and Core utilities
-rich>=13.7.0
-pydantic>=2.5.0
-httpx>=0.25.0
-pillow>=10.1.0
-pyyaml>=6.0
-psutil>=5.9.0
-loguru>=0.7.0
+rich>=14.2.0
+prompt-toolkit>=3.0.43  # Professional text input with proper escape sequence handling
+pydantic>=2.12.3
+httpx>=0.28.1
+pillow>=12.0.0
+pyyaml>=6.0.3
+psutil>=7.1.2
+loguru>=0.7.3
 
-# Core ML packages - pinned stable versions to prevent conflicts
-# These specific versions are tested and confirmed working together
-torch==2.5.1
-torchvision==0.20.1
-transformers==4.56.2  # Upgraded for Qwen3 support (backward compatible)
+# Core ML packages - updated to latest stable versions
+# torch 2.9.0 has improved attention implementations and better Mac support
+torch==2.9.0
+torchvision==0.24.0  # Must match torch 2.9.0 version
+transformers>=4.57.1  # Latest stable with InternVL3 support
 
 # GGUF Quantization support (works on all platforms)
-llama-cpp-python>=0.2.20
-gguf>=0.1.0
+llama-cpp-python>=0.3.16
+gguf>=0.17.1
 
 # HuggingFace model management
-huggingface-hub>=0.19.0
-safetensors>=0.4.0
-protobuf>=3.20.0
-sentencepiece>=0.1.99
+huggingface-hub>=0.36.0
+safetensors>=0.6.2
+protobuf>=6.33.0
+sentencepiece>=0.2.1
 
 # Advanced quantization support (BnB, GPTQ)
 # Note: bitsandbytes has limited support on Apple Silicon (CPU-only on M-series)
-# These versions work with torch 2.5.1 and transformers 4.46.2
-accelerate==1.0.1
-bitsandbytes==0.42.0
+# These versions work with torch 2.9.0 and transformers 4.57.1
+accelerate>=1.11.0
+bitsandbytes>=0.42.0
+
+# Finetuning support
+# PEFT: Parameter-Efficient Fine-Tuning library (LoRA, QLoRA, Adapters, etc)
+peft>=0.14.0
+
+# ============================================
+# 2025 OPTIONAL OPTIMIZATIONS
+# ============================================
+# Install based on your hardware and needs
+
+# Flash Attention 2/3 (2-4x faster inference, 8x less memory)
+# Requires CUDA 11.6+ or ROCm 5.3+
+# Install: pip install flash-attn --no-build-isolation
+# flash-attn>=2.0.0  # Uncomment for CUDA/ROCm systems
+
+# Apple Silicon (Mac M1/M2/M3/M4) - Up to 85x faster VLM inference
+# MLX: Native Metal-accelerated ML framework
+# Install: pip install mlx mlx-lm mlx-vlm
+# Updated to 0.29.3 (mlx) and 0.3.4 (mlx-vlm) which adds InternVL3 support!
+mlx>=0.29.3  # Uncomment for macOS with Apple Silicon
+mlx-lm>=0.28.3  # Uncomment for LLM support on Mac
+mlx-vlm>=0.3.4  # Uncomment for VLM support on Mac (InternVL3 support added!)
+
+# Intel CPU/iGPU Optimization - Optimized for AVX-512, VNNI, AMX
+# OpenVINO: Intel's inference optimization toolkit
+# Install: pip install openvino openvino-dev optimum[openvino]
+# openvino>=2025.0  # Uncomment for Intel CPU optimization
+# openvino-dev>=2025.0  # Uncomment for model conversion tools
+# optimum[openvino]>=1.16.0  # Uncomment for HuggingFace + OpenVINO
+
+# Intel CPU Extensions (Alternative to OpenVINO)
+# IPEX: Intel Extension for PyTorch
+# Install: pip install intel-extension-for-pytorch
+# intel-extension-for-pytorch>=2.3.0  # Uncomment for Intel CPUs
+
+# Production Inference Engine (Optional - for high-throughput deployments)
+# vLLM: High-performance LLM/VLM serving (requires CUDA)
+# Install: pip install vllm
+# vllm>=0.5.0  # Uncomment for production deployments with CUDA
+
+# CPU Feature Detection
+py-cpuinfo>=9.0.0  # Already at latest stable
+
+# GPU Monitoring (Optional - for detailed NVIDIA GPU metrics)
+# nvidia-ml-py (pynvml) - NVIDIA Management Library Python bindings
+# Install: pip install nvidia-ml-py
+# nvidia-ml-py>=12.560.30  # Uncomment for detailed NVIDIA GPU monitoring
+
+# ============================================
+# BENCHMARKING DEPENDENCIES
+# ============================================
+# Statistical analysis and data processing
+numpy>=1.21.0  # Numerical computing for statistics
+scipy>=1.7.0  # Advanced statistics (percentiles, distributions)
+pandas>=1.3.0  # Data manipulation for CSV export
+
+# Visualization and reporting
+plotly>=5.0.0  # Interactive HTML charts
+matplotlib>=3.5.0  # Static PNG/PDF charts
+jinja2>=3.0.0  # HTML templating for reports
+
+# Testing utilities
+pytest-asyncio>=0.20.0  # Async test support
+pytest-cov>=4.0.0  # Coverage reporting
+pytest-mock>=3.10.0  # Mocking utilities
+freezegun>=1.2.0  # Time mocking for tests

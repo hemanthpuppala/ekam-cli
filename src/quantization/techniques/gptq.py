@@ -71,6 +71,7 @@ class GPTQQuantizer(BaseQuantizer):
         """Get source model path for quantization.
 
         GPTQ works with HuggingFace models.
+        Note: Ollama/GGUF models are converted to HF format by orchestrator first.
 
         Args:
             model_info: Model to quantize
@@ -78,6 +79,16 @@ class GPTQQuantizer(BaseQuantizer):
         Returns:
             Path to model directory, or None if not compatible
         """
+        # Check if source_path is a converted HF directory (from Ollama/GGUF)
+        # The orchestrator updates source_path after GGUF→HF conversion
+        if model_info.source_path and model_info.source_path.exists():
+            # If it's a directory with config.json, it's a HF model
+            if model_info.source_path.is_dir():
+                config_file = model_info.source_path / "config.json"
+                if config_file.exists():
+                    logger.info(f"Using converted HF model: {model_info.source_path}")
+                    return model_info.source_path
+
         # GPTQ works with HuggingFace models
         if model_info.provider != ProviderType.HUGGINGFACE:
             return None
@@ -138,13 +149,18 @@ class GPTQQuantizer(BaseQuantizer):
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting GPTQ {task.quant_type.display_name} quantization")
 
-            # Check if auto-gptq is available
-            available, message = self.check_availability()
+            # Check if auto-gptq is available and auto-install if needed
+            available, message = self.check_and_install_dependencies(
+                auto_install=True,
+                show_progress=True
+            )
             if not available:
                 task.status = TaskStatus.FAILED
                 task.error = message
                 logger.error(f"Auto-GPTQ not available: {message}")
                 return False
+            
+            logger.info(f"✓ Auto-GPTQ available: {message}")
 
             # Update progress: Validating
             if progress_callback:

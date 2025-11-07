@@ -1,6 +1,8 @@
-# VLM/LLM CLI - High-Performance Multi-Provider Testing Tool
+# Ekam-CLI - Unified AI Model Interface
 
-A production-ready CLI for testing Vision-Language Models (VLMs) and Large Language Models (LLMs) across multiple providers with automatic resource management.
+**Ekam** (एकम्) means "Unity" in Sanskrit - representing the unified interface for all your AI model testing needs.
+
+A production-ready CLI for testing Vision-Language Models (VLMs) and Large Language Models (LLMs) across multiple providers with automatic resource management, quantization, and comprehensive benchmarking.
 
 ## Key Features
 

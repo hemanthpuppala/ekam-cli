@@ -302,6 +302,9 @@ def run_chat_endpoint(session_manager: SessionManager, model_info: "ModelInfo") 
             end_time = time.perf_counter()
             elapsed_ms = (end_time - start_time) * 1000
 
+            # Log raw LLM response (before any cleaning/processing) - FULL response without truncation
+            logger.debug(f"Raw LLM response ({len(response)} chars): {response}")
+
             # Store exchange in session if using history
             if use_history and active_session:
                 active_session.add_exchange(message, response, elapsed_ms)
@@ -351,6 +354,6 @@ def run_chat_endpoint(session_manager: SessionManager, model_info: "ModelInfo") 
             tui.prompt("Press Enter to continue...", style="dim")
 
         except Exception as e:
-            logger.error(f"Chat inference failed: {e}")
+            logger.error(f"Chat inference failed: {e}", exc_info=True)
             tui.show_error(f"Inference failed: {e}")
             tui.prompt("Press Enter to continue...", style="dim")

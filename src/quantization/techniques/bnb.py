@@ -71,6 +71,7 @@ class BitsAndBytesQuantizer(BaseQuantizer):
         """Get source model path for quantization.
 
         BitsAndBytes works with HuggingFace models.
+        Note: Ollama/GGUF models are converted to HF format by orchestrator first.
 
         Args:
             model_info: Model to quantize
@@ -78,6 +79,16 @@ class BitsAndBytesQuantizer(BaseQuantizer):
         Returns:
             Path to model directory, or None if not compatible
         """
+        # Check if source_path is a converted HF directory (from Ollama/GGUF)
+        # The orchestrator updates source_path after GGUF→HF conversion
+        if model_info.source_path and model_info.source_path.exists():
+            # If it's a directory with config.json, it's a HF model
+            if model_info.source_path.is_dir():
+                config_file = model_info.source_path / "config.json"
+                if config_file.exists():
+                    logger.info(f"Using converted HF model: {model_info.source_path}")
+                    return model_info.source_path
+
         # BitsAndBytes works with HuggingFace models
         if model_info.provider != ProviderType.HUGGINGFACE:
             return None
@@ -138,13 +149,18 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting BitsAndBytes {task.quant_type.display_name} quantization")
 
-            # Check if bitsandbytes is available
-            available, message = self.check_availability()
+            # Check if bitsandbytes is available and auto-install if needed
+            available, message = self.check_and_install_dependencies(
+                auto_install=True,
+                show_progress=True
+            )
             if not available:
                 task.status = TaskStatus.FAILED
                 task.error = message
                 logger.error(f"BitsAndBytes not available: {message}")
                 return False
+            
+            logger.info(f"✓ BitsAndBytes available: {message}")
 
             # Update progress: Validating
             if progress_callback:
@@ -195,11 +211,14 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             else:
                 raise ValueError(f"Unsupported BitsAndBytes quantization type: {task.quant_type}")
 
-            # Load model with quantization
+            # Load model with quantization (suppress transformers output)
             logger.info("Loading model with BitsAndBytes quantization config...")
             if progress_callback:
                 progress_callback(30.0, None)
             task.progress = 30.0
+
+            # Import output suppressor for clean TUI
+            from ...utils.output_suppressor import suppress_transformers_output
 
             # Try AutoModelForCausalLM first (works for LLMs)
             # Fallback to AutoModel for VLMs and other architectures
@@ -207,13 +226,16 @@ class BitsAndBytesQuantizer(BaseQuantizer):
                 from transformers import AutoModel
 
                 logger.info("Attempting to load with AutoModelForCausalLM...")
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_identifier,
-                    quantization_config=bnb_config,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                )
+                
+                with suppress_transformers_output():
+                    model = AutoModelForCausalLM.from_pretrained(
+                        model_identifier,
+                        quantization_config=bnb_config,
+                        device_map="auto",
+                        trust_remote_code=True,
+                        low_cpu_mem_usage=True,
+                    )
+                
                 logger.info("Model loaded successfully with AutoModelForCausalLM")
 
             except Exception as e:
@@ -221,13 +243,15 @@ class BitsAndBytesQuantizer(BaseQuantizer):
                 logger.info("Trying AutoModel as fallback (for VLMs and other architectures)...")
 
                 try:
-                    model = AutoModel.from_pretrained(
-                        model_identifier,
-                        quantization_config=bnb_config,
-                        device_map="auto",
-                        trust_remote_code=True,
-                        low_cpu_mem_usage=True,
-                    )
+                    with suppress_transformers_output():
+                        model = AutoModel.from_pretrained(
+                            model_identifier,
+                            quantization_config=bnb_config,
+                            device_map="auto",
+                            trust_remote_code=True,
+                            low_cpu_mem_usage=True,
+                        )
+                    
                     logger.info("Model loaded successfully with AutoModel")
 
                 except Exception as e2:
@@ -246,12 +270,52 @@ class BitsAndBytesQuantizer(BaseQuantizer):
                 progress_callback(70.0, None)
             task.progress = 70.0
 
-            # Load tokenizer
-            logger.info("Loading tokenizer...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                model_identifier,
-                trust_remote_code=True,
-            )
+            # Load tokenizer/processor (VLMs need processor)
+            logger.info("Detecting model type and loading tokenizer/processor...")
+            
+            # Detect if VLM
+            is_vlm = False
+            processor_or_tokenizer = None
+            
+            try:
+                config = model.config
+                arch = config.architectures[0] if hasattr(config, 'architectures') and config.architectures else ""
+                
+                vlm_patterns = [
+                    "ForConditionalGeneration", "VisionTextDual", "Llava", "Blip",
+                    "Qwen2VL", "Qwen3VL", "QwenVL", "InstructBlip", "Idefics"
+                ]
+                is_vlm = any(pattern in arch for pattern in vlm_patterns)
+                
+                if not is_vlm:
+                    config_dict = config.to_dict()
+                    is_vlm = any(key in config_dict for key in ["vision_config", "visual_config", "image_encoder"])
+                
+                logger.info(f"Model architecture: {arch}, VLM: {is_vlm}")
+            except Exception as e:
+                logger.debug(f"Could not detect VLM from config: {e}")
+            
+            # Load processor for VLMs, tokenizer for LLMs
+            if is_vlm:
+                try:
+                    logger.info("Loading processor for VLM...")
+                    from transformers import AutoProcessor
+                    
+                    processor_or_tokenizer = AutoProcessor.from_pretrained(
+                        model_identifier,
+                        trust_remote_code=True
+                    )
+                    logger.info("✓ Processor loaded successfully (VLM)")
+                except Exception as e:
+                    logger.warning(f"Failed to load processor for VLM, trying tokenizer: {e}")
+                    is_vlm = False
+            
+            if not is_vlm:
+                logger.info("Loading tokenizer...")
+                processor_or_tokenizer = AutoTokenizer.from_pretrained(
+                    model_identifier,
+                    trust_remote_code=True,
+                )
 
             # Update progress: Saving
             if progress_callback:
@@ -265,9 +329,14 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             output_dir = task.output_path.parent / task.output_path.stem
             logger.info(f"Saving quantized model to: {output_dir}")
 
-            # Save model and tokenizer
+            # Save model and tokenizer/processor
             model.save_pretrained(output_dir)
-            tokenizer.save_pretrained(output_dir)
+            processor_or_tokenizer.save_pretrained(output_dir)
+            
+            if is_vlm:
+                logger.info("✓ Saved VLM processor (includes image_processor + tokenizer)")
+            else:
+                logger.info("✓ Saved tokenizer")
 
             # Update task output_path to the directory
             task.output_path = output_dir

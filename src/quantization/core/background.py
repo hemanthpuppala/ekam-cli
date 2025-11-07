@@ -13,7 +13,11 @@ from ..techniques.generic import GenericQuantizer
 from ..techniques.gptq import GPTQQuantizer
 from ..techniques.awq import AWQQuantizer
 from ..techniques.bnb import BitsAndBytesQuantizer
-from ..models import QuantizationTask, TaskStatus
+from ..techniques.mlx import MLXQuantizer
+from ..techniques.openvino import OpenVINOQuantizer
+from ..techniques.dequantization import DequantizationQuantizer
+from ..models import QuantizationTask, TaskStatus, QuantizationModule
+from ..orchestrator import QuantizationOrchestrator
 
 
 class BackgroundJobManager:
@@ -36,6 +40,12 @@ class BackgroundJobManager:
         self.gptq_quantizer = GPTQQuantizer()
         self.awq_quantizer = AWQQuantizer()
         self.bnb_quantizer = BitsAndBytesQuantizer()
+        self.mlx_quantizer = MLXQuantizer()
+        self.openvino_quantizer = OpenVINOQuantizer()
+        self.dequantization_quantizer = DequantizationQuantizer()
+
+        # Initialize orchestrator for multi-step conversions
+        self.orchestrator = QuantizationOrchestrator()
 
         # Load saved state
         self._load_state()
@@ -80,23 +90,101 @@ class BackgroundJobManager:
                     if progress_callback:
                         progress_callback(task.task_id, progress, eta)
 
-                # Execute quantization based on method family
-                method_family = task.quant_type.method_family
+                # STEP 1: Check if conversion is needed (Ollama/GGUF → other formats)
+                # Orchestrator now returns BOTH path AND directive
+                # NOTE: For VLMs, orchestrator may raise ValueError if unsupported quantization is requested
+                try:
+                    conversion_path, quantizer_directive = self.orchestrator.determine_conversion_path(
+                        task.model_info, task.quant_type
+                    )
+                    logger.debug(f"Conversion path: {conversion_path.value}")
+                    logger.debug(f"Quantizer directive: {quantizer_directive.value}")
 
-                if method_family == "Generic":
-                    success = self.generic_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "GGUF":
-                    success = self.gguf_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "GPTQ":
-                    success = self.gptq_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "AWQ":
-                    success = self.awq_quantizer.quantize(task, progress_wrapper)
-                elif method_family == "BitsAndBytes":
-                    success = self.bnb_quantizer.quantize(task, progress_wrapper)
-                else:
+                    # Store directive on task for quantizer to check
+                    task.quantizer_directive = quantizer_directive.value
+
+                except ValueError as e:
+                    # Orchestrator rejected this combination (e.g., VLM + GGUF)
+                    logger.error(str(e))
                     task.status = TaskStatus.FAILED
-                    task.error = f"Quantization method {method_family} not yet implemented"
+                    task.error = str(e)
                     success = False
+                    return
+
+                converted_path = None
+                if self.orchestrator.needs_conversion(conversion_path):
+                    logger.info(f"Multi-step conversion required: {conversion_path.value}")
+
+                    # Execute conversion pipeline (GGUF → FP16, etc.)
+                    converted_path = self.orchestrator.execute_conversion_pipeline(
+                        task, conversion_path, progress_wrapper
+                    )
+
+                    if not converted_path:
+                        task.status = TaskStatus.FAILED
+                        task.error = "Format conversion failed"
+                        success = False
+                        return
+
+                    logger.info(f"Conversion completed: {converted_path}")
+
+                    # Update task to use converted model
+                    # Store original source_path for cleanup
+                    original_source_path = task.model_info.source_path
+                    task.model_info.source_path = converted_path
+
+                # STEP 2: Check orchestrator directive before proceeding with quantization
+                # FP16 is NOT a quantization - it's just dtype conversion
+                # After format conversion (GGUF → FP16 Safetensors), we're DONE for FP16
+                # For INT8/INT4/etc., we need to apply additional quantization
+                if task.quantizer_directive == "skip":
+                    logger.info(
+                        f"Quantizer directive is SKIP - conversion output is final\n"
+                        f"Final output: {converted_path}"
+                    )
+                    # CRITICAL: Update task.output_path to actual converted directory
+                    # so metadata is saved to the correct location
+                    if converted_path:
+                        task.output_path = converted_path
+                        logger.debug(f"Updated task.output_path to converted directory: {converted_path}")
+                    task.status = TaskStatus.COMPLETED
+                    success = True
+                else:
+                    # STEP 3: Execute quantization based on module (takes priority) or method family
+                    # Check module first for platform-specific quantizers
+                    if task.module == QuantizationModule.MLX:
+                        success = self.mlx_quantizer.quantize(task, progress_wrapper)
+                    elif task.module == QuantizationModule.OPENVINO:
+                        success = self.openvino_quantizer.quantize(task, progress_wrapper)
+                    else:
+                        # Fall back to method family routing
+                        method_family = task.quant_type.method_family
+
+                        if method_family == "Generic":
+                            success = self.generic_quantizer.quantize(task, progress_wrapper)
+                        elif method_family == "GGUF":
+                            success = self.gguf_quantizer.quantize(task, progress_wrapper)
+                        elif method_family == "GPTQ":
+                            success = self.gptq_quantizer.quantize(task, progress_wrapper)
+                        elif method_family == "AWQ":
+                            success = self.awq_quantizer.quantize(task, progress_wrapper)
+                        elif method_family == "BitsAndBytes":
+                            success = self.bnb_quantizer.quantize(task, progress_wrapper)
+                        elif method_family == "Dequantization":
+                            success = self.dequantization_quantizer.quantize(task, progress_wrapper)
+                        else:
+                            task.status = TaskStatus.FAILED
+                            task.error = f"Quantization method {method_family} not yet implemented"
+                            success = False
+
+                # STEP 3: Keep intermediate files for user (don't cleanup)
+                # Users may want to use the FP16 GGUF file for other purposes
+                if converted_path and success:
+                    logger.info(f"Intermediate file preserved: {converted_path}")
+                    logger.info("You can use this FP16 GGUF file with llama.cpp or Ollama")
+                elif converted_path and not success:
+                    logger.info(f"Quantization failed, but intermediate file saved: {converted_path}")
+                    logger.info("You can use this FP16 GGUF file directly or try a different quantization method")
 
                 # Update completion time
                 if success:

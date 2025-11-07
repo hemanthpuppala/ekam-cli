@@ -51,43 +51,107 @@ def _try_parse_json_detections(raw_response: str, object_name: str) -> list[dict
     Returns:
         List of parsed detections or empty list
     """
+    logger.debug(f"_try_parse_json_detections called with object_name={object_name}")
+    logger.debug(f"Raw response type: {type(raw_response)}, length: {len(str(raw_response))}")
+    logger.debug(f"Raw response (FULL, no truncation): {raw_response}")
+
     try:
-        # Extract JSON from markdown code blocks if present
-        json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', raw_response, re.DOTALL)
+        # Extract JSON from markdown code blocks if present (try both array and object)
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', raw_response, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
+            logger.debug(f"Found JSON in markdown code block")
         else:
-            # Try to find JSON array in the text
-            json_match = re.search(r'\[.*?\]', raw_response, re.DOTALL)
+            # Try to find JSON object (new format) first
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw_response, re.DOTALL)
             if json_match:
                 json_str = json_match.group(0)
+                logger.debug(f"Found JSON object in text")
             else:
-                return []
+                # Try to find JSON array (old format)
+                json_match = re.search(r'\[.*?\]', raw_response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                    logger.debug(f"Found JSON array in text")
+                else:
+                    logger.debug(f"No JSON found in response")
+                    return []
 
         # Parse JSON
+        logger.debug(f"Attempting to parse JSON: {json_str}")
         data = json.loads(json_str)
 
+        # Handle new dict format: {"object_1": [x1, y1, x2, y2], "object_2": [x1, y1, x2, y2]}
+        if isinstance(data, dict) and not any(k in data for k in ['bbox', 'bbox_2d', 'bounding_box', 'box', 'coordinates', 'coord', 'x_min', 'y_min', 'x_max', 'y_max']):
+            logger.debug(f"Detected new dict format with keys: {list(data.keys())}")
+            detections = []
+            for key, bbox in data.items():
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    # Extract base object name (remove _1, _2, etc.)
+                    label = re.sub(r'_\d+$', '', key)
+                    detection_dict = {
+                        'label': label,
+                        'bbox': bbox,
+                        'confidence': 0.9
+                    }
+                    logger.debug(f"Adding detection from new format: {detection_dict}")
+                    detections.append(detection_dict)
+
+            if detections:
+                logger.info(f"✓ Successfully parsed {len(detections)} detections from new dict format")
+                return detections
+            else:
+                logger.warning(f"No valid detections in new dict format")
+                return []
+
+        # Old format: convert to list
         if not isinstance(data, list):
             data = [data]
 
         detections = []
-        for item in data:
+        logger.debug(f"Processing {len(data)} items from parsed JSON")
+
+        for idx, item in enumerate(data):
+            logger.debug(f"Processing item {idx + 1}/{len(data)}: {item}")
+
             if not isinstance(item, dict):
+                logger.debug(f"Item {idx + 1} is not a dict, skipping")
                 continue
 
             # Extract bbox with various possible keys
             bbox = None
+
+            # First check for array-style bbox
             for bbox_key in ['bbox', 'bbox_2d', 'bounding_box', 'box', 'coordinates', 'coord']:
                 if bbox_key in item:
                     bbox = item[bbox_key]
+                    logger.debug(f"Found bbox with key '{bbox_key}': {bbox}")
                     break
 
+            # If not found, check for moondream-style x_min/y_min/x_max/y_max format
+            is_moondream_format = False
+            if not bbox and 'x_min' in item and 'y_min' in item and 'x_max' in item and 'y_max' in item:
+                bbox = [
+                    item['x_min'],
+                    item['y_min'],
+                    item['x_max'],
+                    item['y_max']
+                ]
+                is_moondream_format = True
+                logger.info(f"✓ Converted moondream bbox format to standard: {bbox}")
+
             if not bbox or len(bbox) != 4:
-                logger.debug(f"Skipping detection with invalid bbox: {item}")
+                logger.warning(f"Skipping detection with invalid bbox: {item}")
                 continue
 
             # Extract label
-            label = item.get('label', item.get('class', item.get('name', object_name)))
+            # Moondream doesn't return labels, so use object_name for moondream format
+            if is_moondream_format and 'label' not in item:
+                label = object_name
+                logger.debug(f"Using object_name as label for moondream format: {label}")
+            else:
+                label = item.get('label', item.get('class', item.get('name', object_name)))
+                logger.debug(f"Extracted label: {label}")
             # Remove quotes if present
             if isinstance(label, str):
                 label = label.strip("'\"")
@@ -95,14 +159,19 @@ def _try_parse_json_detections(raw_response: str, object_name: str) -> list[dict
             # Extract confidence
             confidence = item.get('confidence', item.get('score', item.get('prob', 0.9)))
 
-            detections.append({
+            detection_dict = {
                 'label': label,
                 'bbox': bbox,
                 'confidence': float(confidence)
-            })
+            }
+            logger.debug(f"Adding detection {len(detections) + 1}: {detection_dict}")
+            detections.append(detection_dict)
 
         if detections:
-            logger.info(f"Parsed {len(detections)} detections from JSON response")
+            logger.info(f"✓ Successfully parsed {len(detections)} detections from JSON response")
+            logger.debug(f"Final detections list (FULL): {detections}")
+        else:
+            logger.warning(f"No detections parsed from JSON data")
 
         return detections
 
@@ -208,7 +277,19 @@ def _try_parse_json_point(raw_response: str) -> Optional[dict]:
         # Parse JSON
         data = json.loads(json_str)
 
-        # Extract x, y with various possible keys
+        # Check for new format: {"object_name": [x, y]}
+        # Look for any key that has an array value with 2 elements
+        for key, value in data.items():
+            if isinstance(value, list) and len(value) == 2:
+                try:
+                    x = float(value[0])
+                    y = float(value[1])
+                    logger.info(f"Parsed point from new dict format: ({x}, {y})")
+                    return {"x": x, "y": y}
+                except (ValueError, TypeError):
+                    continue
+
+        # Old format: Extract x, y with various possible keys
         x = None
         y = None
 

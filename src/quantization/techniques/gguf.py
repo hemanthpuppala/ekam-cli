@@ -135,6 +135,18 @@ class GGUFQuantizer(BaseQuantizer):
             # GGUF provider stores local path
             if hasattr(model_info, "local_path") and model_info.local_path:
                 return Path(model_info.local_path)
+            # Try source_path (new unified field)
+            elif model_info.source_path:
+                return model_info.source_path
+
+        elif model_info.provider == ProviderType.OLLAMA:
+            # Ollama models: use source_path which points to blob file
+            if model_info.source_path:
+                logger.info(f"Using Ollama model blob: {model_info.source_path}")
+                return model_info.source_path
+            else:
+                logger.warning(f"Ollama model {model_info.name} has no source_path")
+                return None
 
         elif model_info.provider == ProviderType.HUGGINGFACE:
             # HuggingFace models: use model_id as path or download location
@@ -211,6 +223,51 @@ class GGUFQuantizer(BaseQuantizer):
                     logger.info(f"Found GGUF file: {source_path}")
                 elif source_path.is_dir():
                     # It's a HF model directory (safetensors format) - needs conversion
+
+                    # PRODUCTION CHECK: Verify architecture compatibility with llama.cpp BEFORE conversion
+                    # This prevents wasted time and provides clear feedback for unsupported models
+                    logger.info("Checking architecture compatibility with llama.cpp/GGUF...")
+                    
+                    try:
+                        import json
+                        config_path = source_path / "config.json"
+                        if config_path.exists():
+                            with open(config_path, 'r') as f:
+                                config = json.load(f)
+                            
+                            arch_type = config.get('model_type', 'unknown')
+                            logger.debug(f"Model architecture: {arch_type}")
+                            
+                            # Check if architecture is supported by llama.cpp
+                            is_supported, support_msg = self._check_llamacpp_architecture_support(arch_type)
+                            
+                            if not is_supported:
+                                logger.error(f"Architecture '{arch_type}' not supported by llama.cpp")
+                                task.status = TaskStatus.FAILED
+                                task.error = (
+                                    f"❌ Model architecture '{arch_type}' not supported by llama.cpp\n\n"
+                                    f"Model: {task.model_info.model_id}\n"
+                                    f"Architecture: {arch_type}\n\n"
+                                    f"{support_msg}\n\n"
+                                    f"🔧 Solutions:\n\n"
+                                    f"1. **Use Generic FP16** (Recommended - works with ALL models):\n"
+                                    f"   → Works with LLMs and VLMs\n"
+                                    f"   → 50% size reduction\n"
+                                    f"   → No architecture restrictions\n\n"
+                                    f"2. **Use OpenVINO** (Intel CPU optimized):\n"
+                                    f"   → INT4/INT8 quantization\n"
+                                    f"   → Works with most architectures\n\n"
+                                    f"3. **Use MLX** (Mac only - if architecture is supported):\n"
+                                    f"   → Check MLX compatibility separately\n\n"
+                                    f"💡 This model will NOT work with GGUF quantization. Please choose an alternative method."
+                                )
+                                return False
+                            
+                            logger.info(f"✓ Architecture '{arch_type}' supported by llama.cpp")
+                    
+                    except Exception as e:
+                        logger.warning(f"Could not pre-check architecture compatibility: {e}")
+                        logger.info("Continuing with conversion - llama.cpp will report if unsupported")
 
                     # Check if it's a VLM (Vision-Language Model)
                     is_vlm, architecture_name = self._check_if_vlm(source_path)
@@ -304,12 +361,25 @@ class GGUFQuantizer(BaseQuantizer):
 
         cmd = [
             str(self.quantize_binary),
+            "--allow-requantize",  # Allow requantizing already quantized models
             str(source_path),
             str(task.output_path),
             quant_type_arg,
         ]
 
         logger.info(f"Running quantization command: {' '.join(cmd)}")
+
+        # Check if source is already quantized (requantization)
+        if source_path.suffix == ".gguf":
+            try:
+                # Quick check - if file exists and is GGUF, it might be quantized
+                logger.warning(
+                    f"Requantizing from already quantized GGUF model. "
+                    f"This may reduce quality compared to quantizing from FP16/FP32. "
+                    f"Source: {source_path.name}"
+                )
+            except Exception:
+                pass
 
         # Update task status
         task.status = TaskStatus.RUNNING
@@ -395,6 +465,85 @@ class GGUFQuantizer(BaseQuantizer):
 
         factor = size_factors.get(quant_type, 0.5)
         return model_info.size_gb * factor
+
+    def _check_llamacpp_architecture_support(self, arch_type: str) -> tuple[bool, str]:
+        """Check if architecture is supported by llama.cpp dynamically.
+        
+        llama.cpp supports a specific set of transformer architectures.
+        This method checks against known supported architectures.
+        
+        Args:
+            arch_type: Model architecture type (e.g., 'llama', 'hf_olmo', 'mistral')
+            
+        Returns:
+            (is_supported, message) tuple
+        """
+        # Known supported architectures in llama.cpp
+        # Based on convert_hf_to_gguf.py's Model classes
+        supported_architectures = {
+            # Core Llama family
+            'llama', 'llama2', 'llama3',
+            
+            # Mistral family
+            'mistral', 'mixtral',
+            
+            # Phi family
+            'phi', 'phi2', 'phi3', 'phi3small',
+            
+            # Qwen family
+            'qwen', 'qwen2', 'qwen2moe',
+            
+            # Google
+            'gemma', 'gemma2',
+            
+            # GPT family
+            'gpt2', 'gpt_neox', 'gptj', 'gpt_bigcode',
+            
+            # Other supported
+            'falcon', 'baichuan', 'starcoder', 'starcoder2',
+            'mpt', 'bloom', 'stablelm', 'refact', 'persimmon',
+            'olmo',  # Standard OLMo (not hf_olmo)
+            'openelm', 'arctic', 'deepseek', 'deepseek2',
+            'command-r', 'dbrx', 'megrez', 'exaone',
+            'orion', 'internlm2', 'granite', 'chameleon',
+            'cohere', 'mamba'
+        }
+        
+        # Normalize architecture name (lowercase, remove special chars)
+        arch_normalized = arch_type.lower().replace('-', '').replace('_', '')
+        
+        # Check exact match
+        if arch_type.lower() in supported_architectures:
+            return True, f"Architecture '{arch_type}' is supported by llama.cpp"
+        
+        # Check normalized match (handles variants like gpt-2 vs gpt2)
+        for supported in supported_architectures:
+            supported_norm = supported.replace('-', '').replace('_', '')
+            if arch_normalized == supported_norm:
+                return True, f"Architecture '{arch_type}' is supported by llama.cpp"
+        
+        # Check if it's a known unsupported architecture
+        known_unsupported = {
+            'hf_olmo': 'OLMo with HuggingFace wrapper is not supported. Standard OLMo models may work.',
+            'olmo_hf': 'OLMo with HuggingFace wrapper is not supported. Standard OLMo models may work.',
+        }
+        
+        if arch_type.lower() in known_unsupported:
+            reason = known_unsupported[arch_type.lower()]
+            return False, (
+                f"llama.cpp does not support this architecture variant.\n"
+                f"{reason}\n\n"
+                f"Supported architectures include: llama, mistral, phi, qwen, gemma, gpt2, falcon, etc.\n"
+                f"For a complete list, visit: https://github.com/ggerganov/llama.cpp"
+            )
+        
+        # Unknown architecture - be optimistic but warn
+        logger.warning(f"Architecture '{arch_type}' not in known list, conversion may fail")
+        return True, (
+            f"Architecture '{arch_type}' is not in the known supported list.\n"
+            f"llama.cpp will determine compatibility during conversion.\n"
+            f"If conversion fails, try Generic FP16 or OpenVINO quantization instead."
+        )
 
     def _check_if_vlm(self, model_path: Path) -> tuple[bool, str]:
         """Check if a HuggingFace model is a Vision-Language Model.

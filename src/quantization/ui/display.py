@@ -73,7 +73,7 @@ def select_model_to_quantize(
     tui.clear_screen()
 
     # Show available models (even if empty, show manual option)
-    tui.console.print("[bold cyan]Select Model to Quantize[/bold cyan]\n")
+    tui.console.print("[dim]Choose a model to quantize[/dim]\n")
 
     if quantizable_models:
         from rich.table import Table
@@ -273,6 +273,7 @@ def handle_manual_model_path(quantization_manager: Optional["QuantizationManager
     from ...models.endpoints import ProviderType
 
     tui.clear_screen()
+
     tui.show_panel(
         """[bold cyan]Manual Model Path[/bold cyan]
 
@@ -312,6 +313,7 @@ Provide the path to a model directory or file.
 
         # Show compatibility results
         tui.clear_screen()
+
         if compat["compatible"]:
             # Compatible - show options
             methods_str = "\n  • ".join(compat["available_methods"])
@@ -392,17 +394,54 @@ def ask_quantization_method(model_info: ModelInfo) -> str:
         model_info: Model to be quantized
 
     Returns:
-        "generic", "advanced", or "gguf_conversion"
+        "generic", "advanced", "gguf_conversion", "dequantization", "mlx", or "openvino"
 
     Raises:
         UserExitException: If user wants to exit
     """
     from ...models.endpoints import ProviderType, ModelType
 
-    # Only show this menu for HuggingFace models
-    if model_info.provider != ProviderType.HUGGINGFACE:
-        return "gguf"  # GGUF models use direct GGUF quantization
+    # For pure GGUF files (not Ollama), show GGUF and dequantization options
+    if model_info.provider == ProviderType.GGUF:
+        # GGUF models can be requantized or dequantized
+        # Show GGUF options with arrow-key selection
+        from ...cli.text_input import professional_prompt
+        from .navigation import NavigationException, NavigationAction
 
+        tui.clear_screen()
+
+        tui.console.print()
+        tui.console.print(f"[bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)")
+        tui.console.print(f"[bold]Provider:[/bold] GGUF")
+        tui.console.print()
+
+        options = [
+            ("gguf", "[green]GGUF Requantization[/green]", "Change compression level • Q4/Q5/Q6/Q8 • .gguf output"),
+            ("dequantization", "[cyan]Dequantization[/cyan]", "Recover full precision • FP16/FP32 • GGUF or HF output"),
+            ("BACK", "[dim]◄ Go back[/dim]", "Return to model selection"),
+            ("MAIN", "[dim]⌂ Main menu[/dim]", "Go to main menu"),
+            ("HOME", "[dim]⌂ Home[/dim]", "Go to home"),
+        ]
+
+        choice = professional_prompt.get_arrow_selection(
+            options=options,
+            title="GGUF Model Options",
+            instructions="Use ↑/↓ to navigate, Enter to select"
+        )
+
+        if choice == "BACK":
+            raise UserExitException("User cancelled")
+        elif choice == "MAIN":
+            raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+        elif choice == "HOME":
+            raise NavigationException(NavigationAction.HOME, "User requested home menu")
+        elif choice is None:
+            raise UserExitException("User cancelled")
+
+        logger.info(f"User selected {choice} for {model_info.name}")
+        return choice
+
+    # For Ollama and HuggingFace models, show the full quantization method menu
     # Check if CUDA GPU is available (required for Advanced methods)
     has_cuda = False
     try:
@@ -444,12 +483,30 @@ def ask_quantization_method(model_info: ModelInfo) -> str:
         platform_desc = "macOS"
         if machine in ["arm64", "aarch64"]:
             platform_desc += " (Apple Silicon)"
+            is_apple_silicon = True
         else:
             platform_desc += " (Intel)"
+            is_apple_silicon = False
     elif "arm" in machine.lower() or "aarch" in machine.lower():
         platform_desc = "ARM CPU"
+        is_apple_silicon = False
     else:
         platform_desc = "CPU"
+        is_apple_silicon = False
+
+    # Check for MLX and OpenVINO
+    has_mlx = False
+    has_openvino = False
+    try:
+        import mlx.core  # noqa
+        has_mlx = True
+    except ImportError:
+        pass
+    try:
+        import openvino  # noqa
+        has_openvino = True
+    except ImportError:
+        pass
 
     # Build header with system info
     if has_cuda:
@@ -459,6 +516,14 @@ All quantization methods available on your system."""
         system_header = f"""[bold yellow]⚠ System: {platform_desc} - No CUDA GPU[/bold yellow]
 Advanced methods disabled (require NVIDIA CUDA GPU)."""
 
+    # Pre-compute conditional strings for Python 3.8+ f-string compatibility
+    # (nested quotes in f-strings are only supported in Python 3.12+)
+    gguf_method = "GGUF Requantization" if model_info.provider == ProviderType.OLLAMA else "GGUF Conversion"
+    gguf_desc = "Requantize Ollama model to different GGUF level" if model_info.provider == ProviderType.OLLAMA else "Convert HF model to GGUF format"
+    gguf_speed = "Fast process (direct requantization)" if model_info.provider == ProviderType.OLLAMA else "Takes longer (includes conversion step)"
+    gguf_speed2 = "Fast process (direct requantization)" if model_info.provider == ProviderType.OLLAMA else "Slower process (includes conversion step)"
+    precision_source = 'Ollama/quantized GGUF' if model_info.provider == ProviderType.OLLAMA else 'HuggingFace'
+
     # Always show all 3 options, but gray out incompatible ones
     if has_cuda:
         # CUDA available - all methods enabled
@@ -467,14 +532,16 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
 {system_header}
 
 [bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)
+[bold]Provider:[/bold] {model_info.provider.value.upper() if hasattr(model_info.provider, 'value') else str(model_info.provider).upper()}
 [bold]Type:[/bold] {model_type_str}{vlm_note}
 
-[bold]1. Generic Quantization[/bold] [dim](FP16/INT8/INT4)[/dim] [green]✓ Available[/green]
+{f"[bold]1. Generic Quantization[/bold] [dim](FP16/INT8/INT4)[/dim] {'[yellow]⚠ Limited[/yellow]' if model_info.provider == ProviderType.OLLAMA else '[green]✓ Available[/green]'}" if has_cuda else f"[bold]1. Generic Quantization[/bold] [dim](FP16 only)[/dim] {'[yellow]⚠ Limited[/yellow]' if model_info.provider == ProviderType.OLLAMA else '[green]✓ Available[/green]'}"}
   • Simple PyTorch quantization
   • Works on CPU and GPU
   • Output: .safetensors format
   • Best for: Quick size reduction, all devices
   • {"Quantizes entire VLM (vision + language)" if is_vlm else "Stable for all models"}
+  {f"• [yellow]⚠ Ollama models: Use GGUF (option 3) instead[/yellow]" if model_info.provider == ProviderType.OLLAMA else ""}
 
 [bold]2. Advanced 4-bit Quantization[/bold] [dim](GPTQ/AWQ/BnB)[/dim] [green]✓ Available[/green]
   • High-quality 4-bit quantization
@@ -484,19 +551,47 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   • {"Works with VLMs (quantizes entire model)" if is_vlm else "Works with all LLMs"}
   • Slower processing time
 
-{"[bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else "[dim][bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+{f"[bold]3. {gguf_method}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else f"[dim][bold]3. {gguf_method}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• {gguf_desc}" if not is_vlm else f"[dim]• {gguf_desc}[/dim]"}
   {"• Maximum compatibility (llama.cpp, Ollama)" if not is_vlm else "[dim]• Maximum compatibility (llama.cpp, Ollama)[/dim]"}
   {"• CPU-optimized for inference" if not is_vlm else "[dim]• CPU-optimized for inference[/dim]"}
-  {"• Portable across platforms" if not is_vlm else "[dim]• Portable across platforms[/dim]"}
   {"• Output: .gguf format" if not is_vlm else "[dim]• Output: .gguf format[/dim]"}
-  {"• Takes longer (includes conversion step)" if not is_vlm else "[dim]• Takes longer (includes conversion step)[/dim]"}
+  {f"• {gguf_speed}" if not is_vlm else f"[dim]• {gguf_speed}[/dim]"}
   {"• Stable for LLMs" if not is_vlm else "[dim]• [red]NOT SUPPORTED for VLMs[/red] (llama.cpp limitation)[/dim]"}
+
+{"[bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [green]✓ Available[/green]" if is_apple_silicon and has_mlx else "[dim][bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Native Metal GPU acceleration" if is_apple_silicon and has_mlx else "[dim]• Native Metal GPU acceleration[/dim]"}
+  {"• 85x faster inference on Mac" if is_apple_silicon and has_mlx else "[dim]• 85x faster inference on Mac[/dim]"}
+  {"• VLM: Quantizes entire model (both vision + language)" if is_vlm and is_apple_silicon and has_mlx else "[dim]• VLM: Quantizes entire model (both vision + language)[/dim]"}
+  {"• Output: MLX format" if is_apple_silicon and has_mlx else "[dim]• Output: MLX format[/dim]"}
+  {"• " if not (is_apple_silicon and has_mlx) else ""}{"[red]Requires: macOS + Apple Silicon + pip install mlx mlx-lm mlx-vlm[/red]" if not (is_apple_silicon and has_mlx) else ""}
+
+{"[bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [green]✓ Available[/green]" if has_openvino else "[dim][bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Optimized for Intel CPUs (AVX-512, VNNI, AMX)" if has_openvino else "[dim]• Optimized for Intel CPUs (AVX-512, VNNI, AMX)[/dim]"}
+  {"• Supports Intel iGPU acceleration" if has_openvino else "[dim]• Supports Intel iGPU acceleration[/dim]"}
+  {"• VLM: Vision encoder + language decoder supported" if has_openvino else "[dim]• VLM: Vision encoder + language decoder supported[/dim]"}
+  {"• Output: OpenVINO IR format" if has_openvino else "[dim]• Output: OpenVINO IR format[/dim]"}
+  {"• " if has_openvino else ""}{"[red]Requires: pip install openvino optimum[openvino][/red]" if not has_openvino else ""}
+
+{f"[bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [green]✓ Available[/green]" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim][bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• Recover full precision from {precision_source} model" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Recover full precision from model[/dim]"}
+  {f"• Output: FP16/FP32 GGUF or HuggingFace safetensors" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Output: FP16/FP32 GGUF or HuggingFace safetensors[/dim]"}
+  {f"• Useful: Convert between formats, prepare for advanced quantization" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Useful: Convert between formats[/dim]"}
 
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
-[dim]Recommendation: {"Use Generic (1) or Advanced (2) - GGUF not supported for VLMs" if is_vlm else "Use Advanced (2) for best quality, or GGUF (3) for llama.cpp"}[/dim]"""
-        valid_choices = ["1", "2"] if is_vlm else ["1", "2", "3"]
+[dim]Recommendation: {"Use Generic (1), Advanced (2), or MLX (4)" if is_vlm else "Use Advanced (2), MLX (4), or GGUF (3)"}{"" if model_info.provider != ProviderType.OLLAMA else " (or Dequantization (6) for Ollama models)"}[/dim]"""
+        # Determine valid choices
+        base_choices = ["1", "2"] if is_vlm else ["1", "2", "3"]
+        if is_apple_silicon and has_mlx:
+            base_choices.append("4")
+        if has_openvino:
+            base_choices.append("5")
+        # Add dequantization for Ollama and HF models (non-VLM)
+        if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE]:
+            base_choices.append("6")
+        valid_choices = base_choices
     else:
         # No CUDA - show all 3 options but gray out Advanced
         menu_text = f"""[bold cyan]Choose Quantization Method[/bold cyan]
@@ -504,6 +599,7 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
 {system_header}
 
 [bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)
+[bold]Provider:[/bold] {model_info.provider.value.upper() if hasattr(model_info.provider, 'value') else str(model_info.provider).upper()}
 [bold]Type:[/bold] {model_type_str}{vlm_note}
 
 [bold]1. Generic Quantization[/bold] [dim](FP16 only)[/dim] [green]✓ Available[/green]
@@ -522,7 +618,8 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
   • Disabled methods: Generic INT8/INT4, BitsAndBytes, GPTQ, AWQ
   • 💡 Use Generic FP16 or GGUF instead[/dim]
 
-{"[bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else "[dim][bold]3. GGUF Conversion[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+{f"[bold]3. {gguf_method}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [green]✓ Available[/green]" if not is_vlm else f"[dim][bold]3. {gguf_method}[/bold] [dim](Q4_K_M/Q5_K_M/Q6_K/Q8_0)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• {gguf_desc}" if not is_vlm else f"[dim]• {gguf_desc}[/dim]"}
   {"• Maximum compatibility (llama.cpp, Ollama)" if not is_vlm else "[dim]• Maximum compatibility (llama.cpp, Ollama)[/dim]"}
   {"• CPU-optimized for inference" if not is_vlm else "[dim]• CPU-optimized for inference[/dim]"}
   {"• Multiple bit depths available:" if not is_vlm else "[dim]• Multiple bit depths available:[/dim]"}
@@ -530,83 +627,155 @@ Advanced methods disabled (require NVIDIA CUDA GPU)."""
     {"- Q5_K_M: ~60% of original (better quality)" if not is_vlm else "[dim]- Q5_K_M: ~60% of original (better quality)[/dim]"}
     {"- Q8_0: ~90% of original (minimal quality loss)" if not is_vlm else "[dim]- Q8_0: ~90% of original (minimal quality loss)[/dim]"}
   {"• Output: .gguf format" if not is_vlm else "[dim]• Output: .gguf format[/dim]"}
-  {"• Slower process (includes conversion step)" if not is_vlm else "[dim]• Slower process (includes conversion step)[/dim]"}
+  {f"• {gguf_speed2}" if not is_vlm else f"[dim]• {gguf_speed2}[/dim]"}
   {"• Works for pure LLMs" if not is_vlm else "[dim]• [red]NOT SUPPORTED for VLMs[/red] (llama.cpp doesn't support VLM architectures)[/dim]"}
+
+{"[bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [green]✓ Available[/green]" if is_apple_silicon and has_mlx else "[dim][bold]4. MLX Quantization[/bold] [dim](4-bit for Apple Silicon)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Native Metal GPU acceleration" if is_apple_silicon and has_mlx else "[dim]• Native Metal GPU acceleration[/dim]"}
+  {"• 85x faster inference on Mac" if is_apple_silicon and has_mlx else "[dim]• 85x faster inference on Mac[/dim]"}
+  {"• VLM: Quantizes entire model (both vision + language)" if is_vlm and is_apple_silicon and has_mlx else "[dim]• VLM: Quantizes entire model (both vision + language)[/dim]"}
+  {"• Output: MLX format" if is_apple_silicon and has_mlx else "[dim]• Output: MLX format[/dim]"}
+  {"• " if not (is_apple_silicon and has_mlx) else ""}{"[red]Requires: macOS + Apple Silicon + pip install mlx mlx-lm mlx-vlm[/red]" if not (is_apple_silicon and has_mlx) else ""}
+
+{"[bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [green]✓ Available[/green]" if has_openvino else "[dim][bold]5. OpenVINO Quantization[/bold] [dim](INT4/INT8 for Intel)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {"• Optimized for Intel CPUs (AVX-512, VNNI, AMX)" if has_openvino else "[dim]• Optimized for Intel CPUs (AVX-512, VNNI, AMX)[/dim]"}
+  {"• Supports Intel iGPU acceleration" if has_openvino else "[dim]• Supports Intel iGPU acceleration[/dim]"}
+  {"• VLM: Vision encoder + language decoder supported" if has_openvino else "[dim]• VLM: Vision encoder + language decoder supported[/dim]"}
+  {"• Output: OpenVINO IR format" if has_openvino else "[dim]• Output: OpenVINO IR format[/dim]"}
+  {"• " if has_openvino else ""}{"[red]Requires: pip install openvino optimum[openvino][/red]" if not has_openvino else ""}
+
+{f"[bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [green]✓ Available[/green]" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim][bold]6. Full Precision Conversion[/bold] [dim](Dequantization/Format Conversion)[/dim] [red]✗ Disabled[/red][/dim]"}
+  {f"• Recover full precision from {precision_source} model" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Recover full precision from model[/dim]"}
+  {f"• Output: FP16/FP32 GGUF or HuggingFace safetensors" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Output: FP16/FP32 GGUF or HuggingFace safetensors[/dim]"}
+  {f"• Useful: Convert between formats, prepare for advanced quantization" if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE] else "[dim]• Useful: Convert between formats[/dim]"}
 
 [bold]Navigation:[/bold]
   [b] Go back | [m] Main menu | [h] Home
 
 {'─'*60}
 [dim]💡 [bold]Recommendation for your {platform_desc} system:[/bold]
-{"• Use Generic FP16 (option 1) - GGUF not supported for VLMs" if is_vlm else "• Use Generic FP16 (1) for simplicity, or GGUF (3) for llama.cpp"}
+{"• MLX (4) recommended for Mac, or Generic FP16 (1)" if is_vlm and is_apple_silicon and has_mlx else "• Use Generic FP16 (option 1)"}
 • Advanced methods require NVIDIA CUDA GPU (use on Windows/Linux with NVIDIA GPU)[/dim]"""
 
-        # Valid choices depend on model type
+        # Determine valid choices based on system
+        base_choices = ["1"]  # Generic always available
+        if not is_vlm:
+            base_choices.append("3")  # GGUF for LLMs
+        if is_apple_silicon and has_mlx:
+            base_choices.append("4")  # MLX
+        if has_openvino:
+            base_choices.append("5")  # OpenVINO
+        # Add dequantization for Ollama and HF models (non-VLM)
+        if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE]:
+            base_choices.append("6")
+        valid_choices = base_choices
+
+    # Convert to arrow-key selection - show only available options
+    from ...cli.text_input import professional_prompt
+    from .navigation import NavigationException, NavigationAction
+
+    tui.clear_screen()
+
+    # Show system context header
+    tui.console.print()
+    if has_cuda:
+        tui.console.print("[green]✓ System: CUDA GPU Detected[/green] - All methods available")
+    else:
+        tui.console.print(f"[yellow]⚠ System: {platform_desc}[/yellow] - Limited methods")
+    tui.console.print()
+    tui.console.print(f"[bold]Model:[/bold] {model_info.name} ({model_info.size_gb:.1f} GB)")
+    tui.console.print(f"[bold]Type:[/bold] {model_type_str}")
+    if is_vlm:
+        tui.console.print("[yellow]🎨 VLM:[/yellow] GGUF not supported (llama.cpp limitation)")
+    tui.console.print()
+
+    # Build arrow-key options - only available methods
+    options = []
+
+    # Option 1: Generic (always available)
+    generic_desc = "PyTorch quantization • Works on all devices • .safetensors format"
+    if has_cuda:
+        generic_desc = "FP16/INT8/INT4 • PyTorch • Fast • .safetensors"
+    else:
+        generic_desc = "FP16 only • PyTorch • Mac compatible • .safetensors"
+    if is_apple_silicon:
+        generic_desc += " • ⭐ Recommended for Mac"
+    options.append(("generic", "[cyan]Generic Quantization[/cyan]", generic_desc))
+
+    # Option 2: Advanced (only if CUDA)
+    if has_cuda:
+        options.append((
+            "advanced",
+            "[magenta]Advanced 4-bit (GPTQ/AWQ/BnB)[/magenta]",
+            "High-quality 4-bit • Requires CUDA • Production-ready • .safetensors"
+        ))
+
+    # Option 3: GGUF (only if not VLM)
+    if not is_vlm:
+        gguf_label = "GGUF Requantization" if model_info.provider == ProviderType.OLLAMA else "GGUF Conversion"
+        gguf_desc = "Q4/Q5/Q6/Q8 levels • llama.cpp/Ollama compatible • CPU-optimized • .gguf"
+        options.append(("gguf_conversion", f"[green]{gguf_label}[/green]", gguf_desc))
+
+    # Option 4: MLX (only if Apple Silicon + has mlx)
+    if is_apple_silicon and has_mlx:
+        mlx_desc = "4-bit • Metal GPU • 85x faster on Mac • MLX format"
         if is_vlm:
-            valid_choices = ["1"]  # Only Generic for VLMs on Mac
-        else:
-            valid_choices = ["1", "3"]  # Generic and GGUF for LLMs on Mac
+            mlx_desc += " • Quantizes entire VLM"
+        options.append(("mlx", "[blue]MLX Quantization (Apple Silicon)[/blue]", mlx_desc))
 
-    tui.show_panel(menu_text, title="Quantization Method Selection", border_style="cyan")
+    # Option 5: OpenVINO (only if installed)
+    if has_openvino:
+        ovino_desc = "INT4/INT8 • Intel CPU/iGPU optimized • OpenVINO IR format"
+        if is_vlm:
+            ovino_desc += " • VLM supported"
+        options.append(("openvino", "[yellow]OpenVINO (Intel)[/yellow]", ovino_desc))
 
-    while True:
-        # Dynamic prompt based on available options
-        choice = tui.prompt("Choose [1/2/3/b/m/h]:", style="cyan").strip().lower()
+    # Option 6: Dequantization (only for Ollama/HF non-VLM)
+    if not is_vlm and model_info.provider in [ProviderType.OLLAMA, ProviderType.HUGGINGFACE]:
+        options.append((
+            "dequantization",
+            "[dim]Full Precision Conversion[/dim]",
+            "Recover FP16/FP32 • Format conversion • Prepare for re-quantization"
+        ))
 
-        # Check for navigation hotkeys
-        from .navigation import check_navigation_input, NavigationException, NavigationAction
+    # Navigation
+    options.extend([
+        ("BACK", "[dim]◄ Go back[/dim]", "Return to model selection"),
+        ("MAIN", "[dim]⌂ Main menu[/dim]", "Go to main menu"),
+        ("HOME", "[dim]⌂ Home[/dim]", "Go to home"),
+    ])
 
-        nav_action = check_navigation_input(choice)
-        if nav_action:
-            if nav_action == NavigationAction.BACK:
-                raise UserExitException("User cancelled")
-            elif nav_action == NavigationAction.MAIN_MENU:
-                raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
-            elif nav_action == NavigationAction.HOME:
-                raise NavigationException(NavigationAction.HOME, "User requested home menu")
+    # Show selection
+    choice = professional_prompt.get_arrow_selection(
+        options=options,
+        title="Select Quantization Method",
+        instructions="Use ↑/↓ to navigate, Enter to select"
+    )
 
-        # Legacy support for "quit" and "exit"
-        if choice in ["quit", "exit"]:
-            raise UserExitException("User cancelled")
+    # Handle navigation
+    if choice == "BACK":
+        raise UserExitException("User cancelled")
+    elif choice == "MAIN":
+        raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+    elif choice == "HOME":
+        raise NavigationException(NavigationAction.HOME, "User requested home menu")
+    elif choice is None:
+        raise UserExitException("User cancelled")
 
-        # Check if choice is valid for this system/model
-        if choice not in valid_choices and choice not in ["quit", "exit", "back", "b"]:
-            # User selected a disabled option - provide helpful feedback
-            if choice == "2" and not has_cuda:
-                tui.show_error(
-                    f"[red]✗ Option 2 (Advanced 4-bit) is disabled on {platform_desc}[/red]\n"
-                    f"Requires NVIDIA CUDA GPU. Use option 1 (Generic FP16) instead."
-                )
-                continue
-            elif choice == "3" and is_vlm:
-                tui.show_error(
-                    "[red]✗ Option 3 (GGUF) is disabled for VLMs[/red]\n"
-                    "llama.cpp doesn't support VLM architectures. Use option 1 (Generic FP16) instead."
-                )
-                continue
-            else:
-                tui.show_error(f"Invalid choice. Valid options: {', '.join(valid_choices)}, or 'b' to go back")
-                continue
+    logger.info(f"User selected {choice} quantization for {model_info.name}")
 
-        # Valid choice - process it
-        if choice == "1":
-            logger.info(f"User selected Generic quantization for {model_info.name}")
-            return "generic"
-        elif choice == "2":
-            logger.info(f"User selected Advanced 4-bit quantization for {model_info.name}")
-            return "advanced"
-        elif choice == "3":
-            logger.info(f"User selected GGUF conversion for {model_info.name}")
-            return "gguf_conversion"
+    # Return the method name (choice already contains the method name)
+    return choice
 
 
-def ask_vlm_quantization_scope(model_info: ModelInfo) -> str:
+def ask_vlm_quantization_scope(model_info: ModelInfo, quant_method: str = None) -> str:
     """Ask user if they want standard or component-level quantization for VLMs.
 
     Only shown for Vision-Language Models (VLMs).
 
     Args:
         model_info: VLM model to quantize
+        quant_method: Selected quantization method (for MLX warning)
 
     Returns:
         "standard" or "component_level"
@@ -615,75 +784,83 @@ def ask_vlm_quantization_scope(model_info: ModelInfo) -> str:
         UserExitException: If user wants to exit
     """
     from ...models.model import ModelType
+    from ...cli.text_input import professional_prompt
+    from .navigation import NavigationException, NavigationAction
 
     # Only ask for VLMs
     if model_info.model_type != ModelType.VLM:
         return "standard"
 
     tui.clear_screen()
-    tui.show_panel(
-        f"""[bold cyan]VLM Quantization Scope[/bold cyan]
 
-[bold]Model:[/bold] {model_info.name}
-[bold]Type:[/bold] Vision-Language Model (VLM)
+    # Show header with model info
+    tui.console.print()
+    tui.console.print(f"[bold cyan]VLM Quantization Scope[/bold cyan]")
+    tui.console.print()
+    tui.console.print(f"[bold]Model:[/bold] {model_info.name}")
+    tui.console.print(f"[bold]Type:[/bold] Vision-Language Model (VLM)")
+    if quant_method == "mlx":
+        tui.console.print()
+        tui.console.print("[yellow]⚠ MLX Note:[/yellow] MLX requires full model quantization")
+    tui.console.print()
 
-[bold]Choose quantization scope:[/bold]
+    # Build arrow-key options
+    options = []
 
-[bold]1. Standard Quantization[/bold] [dim](Recommended)[/dim]
-  • Quantize entire model (vision + language)
-  • Simpler, faster setup
-  • Most common use case
+    # Option 1: Standard (always available)
+    standard_desc = "Quantize entire model • Simpler, faster • Most common"
+    if quant_method == "mlx":
+        standard_desc += " • ✓ MLX compatible"
+    options.append((
+        "standard",
+        "[green]Standard Quantization (Recommended)[/green]",
+        standard_desc
+    ))
 
-[bold]2. Component-Level Control[/bold] [dim](Advanced)[/dim]
-  • Choose specific components to quantize
-  • Vision encoder only, language decoder only, or both
-  • Maximum flexibility for optimization
+    # Option 2: Component-level (conditional based on MLX)
+    if quant_method != "mlx":
+        options.append((
+            "component_level",
+            "[cyan]Component-Level Control (Advanced)[/cyan]",
+            "Choose specific components • Vision/Language separately • Maximum flexibility"
+        ))
 
-[bold]Navigation:[/bold]
-  [b] Go back | [m] Main menu | [h] Home
+    # Navigation options
+    options.extend([
+        ("BACK", "[dim]◄ Go back[/dim]", "Return to previous step"),
+        ("MAIN", "[dim]⌂ Main menu[/dim]", "Go to main menu"),
+        ("HOME", "[dim]⌂ Home[/dim]", "Go to home"),
+    ])
 
-[dim]Tip: Most users should choose Standard (option 1).
-Component-level is for advanced optimization scenarios.[/dim]""",
-        title="VLM Quantization Scope",
-        border_style="cyan",
+    # Show arrow-key selection
+    choice = professional_prompt.get_arrow_selection(
+        options=options,
+        title="Select Quantization Scope",
+        instructions="Use ↑/↓ to navigate, Enter to select"
     )
 
-    while True:
-        choice = tui.prompt("Choose [1/2/b/m/h]:", style="cyan").strip().lower()
+    # Handle navigation
+    if choice == "BACK":
+        raise UserExitException("User cancelled")
+    elif choice == "MAIN":
+        raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+    elif choice == "HOME":
+        raise NavigationException(NavigationAction.HOME, "User requested home menu")
+    elif choice is None:
+        raise UserExitException("User cancelled")
 
-        # Check for navigation hotkeys
-        from .navigation import check_navigation_input, NavigationException, NavigationAction
-
-        nav_action = check_navigation_input(choice)
-        if nav_action:
-            if nav_action == NavigationAction.BACK:
-                raise UserExitException("User cancelled")
-            elif nav_action == NavigationAction.MAIN_MENU:
-                raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
-            elif nav_action == NavigationAction.HOME:
-                raise NavigationException(NavigationAction.HOME, "User requested home menu")
-
-        if choice in ["quit", "exit"]:
-            raise UserExitException("User cancelled")
-
-        if choice == "1":
-            logger.info("User selected standard VLM quantization (entire model)")
-            return "standard"
-        elif choice == "2":
-            logger.info("User selected component-level VLM quantization")
-            return "component_level"
-        else:
-            tui.show_error("Invalid choice. Enter 1, 2, 'b', 'm', or 'h'")
-            continue
+    logger.info(f"User selected {choice} VLM quantization scope")
+    return choice
 
 
-def ask_vlm_components(model_info: ModelInfo) -> str:
+def ask_vlm_components(model_info: ModelInfo, quant_method: str) -> str:
     """Ask user which VLM components to quantize.
 
     Only shown when component-level control is selected.
 
     Args:
         model_info: VLM model to quantize
+        quant_method: Selected quantization method ("mlx", "openvino", etc.)
 
     Returns:
         "vision", "language", or "both"
@@ -692,47 +869,41 @@ def ask_vlm_components(model_info: ModelInfo) -> str:
         UserExitException: If user wants to exit
     """
     tui.clear_screen()
-    tui.show_panel(
-        f"""[bold cyan]Select VLM Components to Quantize[/bold cyan]
+
+    # MLX: Force full model quantization (both components)
+    if quant_method == "mlx":
+        tui.show_panel(
+            f"""[bold yellow]MLX Quantization - Component Selection[/bold yellow]
 
 [bold]Model:[/bold] {model_info.name}
 
-[bold]VLM Architecture:[/bold]
-  Vision Encoder → Projection → Language Decoder
+[bold red]⚠ MLX VLM Limitation[/bold red]
 
-[bold]Choose components to quantize:[/bold]
+MLX quantization for VLMs requires quantizing the ENTIRE model:
+  • [yellow]⚠ Vision Encoder + Language Decoder[/yellow] (both required)
+  • [red]✗ Component-level extraction NOT supported[/red]
 
-[bold]1. Vision Encoder Only[/bold]
-  • Quantize image/video processing component
-  • Language decoder stays in original precision
-  • Use case: Reduce vision model size, keep language quality
+[bold yellow]Auto-Selected: Both Components (Full Model)[/bold yellow]
+  • Vision encoder will be quantized to 4-bit
+  • Language decoder will be quantized to 4-bit
+  • MLX converts the entire VLM model to 4-bit format
 
-[bold]2. Language Decoder Only[/bold]
-  • Quantize text generation component
-  • Vision encoder stays in original precision
-  • Use case: Reduce language model size, keep vision quality
-  • [green]✓ GGUF conversion available[/green]
+[bold]Architecture:[/bold]
+  Vision Encoder (4-bit) → Projection → Language Decoder (4-bit)
 
-[bold]3. Both Components[/bold] [dim](Recommended)[/dim]
-  • Quantize entire VLM (vision + language)
-  • Maximum size reduction
-  • Most common use case
+[bold]Note:[/bold] For language-only quantization, use Generic FP16 method instead.
 
 [bold]Navigation:[/bold]
-  [b] Go back | [m] Main menu | [h] Home
+  [Enter] Continue | [b] Go back | [m] Main menu | [h] Home
 
-[dim]Tip: Most users should choose Both (option 3).
-Component-specific quantization is for advanced scenarios.[/dim]""",
-        title="VLM Component Selection",
-        border_style="cyan",
-    )
+[dim]Press Enter to proceed with full model quantization...[/dim]""",
+            title="MLX Component Selection (Auto)",
+            border_style="yellow",
+        )
 
-    while True:
-        choice = tui.prompt("Choose [1/2/3/b/m/h]:", style="cyan").strip().lower()
+        choice = tui.prompt("[Enter/b/m/h]:", style="cyan").strip().lower()
 
-        # Check for navigation hotkeys
         from .navigation import check_navigation_input, NavigationException, NavigationAction
-
         nav_action = check_navigation_input(choice)
         if nav_action:
             if nav_action == NavigationAction.BACK:
@@ -742,21 +913,88 @@ Component-specific quantization is for advanced scenarios.[/dim]""",
             elif nav_action == NavigationAction.HOME:
                 raise NavigationException(NavigationAction.HOME, "User requested home menu")
 
-        if choice in ["quit", "exit"]:
+        if choice in ["quit", "exit", "b"]:
             raise UserExitException("User cancelled")
 
-        if choice == "1":
-            logger.info("User selected vision encoder only")
-            return "vision"
-        elif choice == "2":
-            logger.info("User selected language decoder only")
-            return "language"
-        elif choice == "3":
-            logger.info("User selected both components")
-            return "both"
-        else:
-            tui.show_error("Invalid choice. Enter 1, 2, 3, 'b', 'm', or 'h'")
-            continue
+        logger.info("MLX: Auto-selected full model quantization (both components - forced)")
+        return "both"
+
+    # Show component selection using arrow keys
+    from ...cli.text_input import professional_prompt
+    from .navigation import NavigationException, NavigationAction
+
+    is_mlx_blocked = quant_method == "mlx"
+
+    tui.clear_screen()
+
+    # Show header
+    tui.console.print()
+    tui.console.print(f"[bold cyan]VLM Component Selection[/bold cyan]")
+    tui.console.print()
+    tui.console.print(f"[bold]Model:[/bold] {model_info.name}")
+    tui.console.print(f"[bold]Architecture:[/bold] Vision Encoder → Projection → Language Decoder")
+    if is_mlx_blocked:
+        tui.console.print()
+        tui.console.print("[yellow]⚠ MLX Note:[/yellow] Only 'Both Components' option available")
+    tui.console.print()
+
+    # Build options
+    options = []
+
+    # Option 1: Vision only (if not MLX)
+    if not is_mlx_blocked:
+        options.append((
+            "vision",
+            "[cyan]Vision Encoder Only[/cyan]",
+            "Quantize image processing • Language stays full precision"
+        ))
+
+    # Option 2: Language only (if not MLX) - RECOMMENDED
+    if not is_mlx_blocked:
+        options.append((
+            "language",
+            "[green]Language Decoder Only ⭐ Recommended[/green]",
+            "Quantize text generation (largest part) • Vision stays full precision • Best quality/size"
+        ))
+
+    # Option 3: Both (always available)
+    both_label = "[magenta]Both Components[/magenta]"
+    both_desc = "Quantize entire VLM • Maximum size reduction • Most common"
+    if is_mlx_blocked:
+        both_label = "[green]Both Components (MLX Required)[/green]"
+        both_desc = "Quantize entire VLM • Only option for MLX"
+    options.append((
+        "both",
+        both_label,
+        both_desc
+    ))
+
+    # Navigation
+    options.extend([
+        ("BACK", "[dim]◄ Go back[/dim]", "Return to previous step"),
+        ("MAIN", "[dim]⌂ Main menu[/dim]", "Go to main menu"),
+        ("HOME", "[dim]⌂ Home[/dim]", "Go to home"),
+    ])
+
+    # Show selection
+    choice = professional_prompt.get_arrow_selection(
+        options=options,
+        title="Select Components to Quantize",
+        instructions="Use ↑/↓ to navigate, Enter to select"
+    )
+
+    # Handle navigation
+    if choice == "BACK":
+        raise UserExitException("User cancelled")
+    elif choice == "MAIN":
+        raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+    elif choice == "HOME":
+        raise NavigationException(NavigationAction.HOME, "User requested home menu")
+    elif choice is None:
+        raise UserExitException("User cancelled")
+
+    logger.info(f"User selected {choice} component(s)")
+    return choice
 
 
 def ask_gpu_preference() -> bool:
@@ -802,6 +1040,7 @@ def ask_gpu_preference() -> bool:
 
         logger.info(f"No CUDA GPU detected - using CPU for quantization (Platform: {platform_desc})")
         tui.clear_screen()
+
         tui.show_panel(
             f"""[bold yellow]⚠ Hardware Detection: Mac/CPU System[/bold yellow]
 
@@ -837,50 +1076,40 @@ GPTQ, AWQ). These advanced methods have been automatically disabled.
         return False
 
     # CUDA GPU available - ask user preference
+    # Convert to arrow-key selection
+    from ...cli.text_input import professional_prompt
+    from .navigation import NavigationException, NavigationAction
+
     tui.clear_screen()
-    tui.show_panel(
-        """[bold cyan]Hardware Selection[/bold cyan]
 
-[bold]CUDA GPU detected![/bold]
+    tui.console.print()
+    tui.console.print("[green]✓ CUDA GPU Detected[/green]")
+    tui.console.print()
 
-Choose processing device:
+    options = [
+        (False, "[green]CPU[/green]", "Works on all systems • Slower • GGUF compatible"),
+        (True, "[cyan]GPU (CUDA) ⭐ Recommended[/cyan]", "Faster • Required for BnB/GPTQ/AWQ"),
+        ("BACK", "[dim]◄ Go back[/dim]", "Return to previous step"),
+        ("MAIN", "[dim]⌂ Main menu[/dim]", "Go to main menu"),
+        ("HOME", "[dim]⌂ Home[/dim]", "Go to home"),
+    ]
 
-[1] [green]CPU[/green]  - Works on all systems, slower
-[2] [cyan]GPU (CUDA)[/cyan]  - Faster, enables all quantization methods
-
-[bold]Navigation:[/bold]
-  [b] Go back | [m] Main menu | [h] Home
-
-[dim]Note: GGUF quantization with llama.cpp primarily uses CPU.
-BitsAndBytes/GPTQ/AWQ require GPU (option 2).[/dim]""",
-        title="GPU Preference",
-        border_style="cyan",
+    choice = professional_prompt.get_arrow_selection(
+        options=options,
+        title="Select Processing Device",
+        instructions="Use ↑/↓ to navigate, Enter to select"
     )
 
-    while True:
-        choice = tui.prompt("Choose [1/2/b/m/h]:", style="cyan").strip().lower()
+    if choice == "BACK":
+        raise UserExitException("User cancelled")
+    elif choice == "MAIN":
+        raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+    elif choice == "HOME":
+        raise NavigationException(NavigationAction.HOME, "User requested home menu")
+    elif choice is None:
+        raise UserExitException("User cancelled")
 
-        # Check for navigation hotkeys
-        from .navigation import check_navigation_input, NavigationException, NavigationAction
-
-        nav_action = check_navigation_input(choice)
-        if nav_action:
-            if nav_action == NavigationAction.BACK:
-                raise UserExitException("User cancelled")
-            elif nav_action == NavigationAction.MAIN_MENU:
-                raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
-            elif nav_action == NavigationAction.HOME:
-                raise NavigationException(NavigationAction.HOME, "User requested home menu")
-
-        if choice in ["quit", "exit"]:
-            raise UserExitException("User cancelled")
-
-        if choice == "1":
-            return False
-        elif choice == "2":
-            return True
-        else:
-            tui.show_error("Invalid choice. Enter 1, 2, 'b', 'm', or 'h'")
+    return choice
 
 
 def select_quantization_type(
@@ -899,94 +1128,75 @@ def select_quantization_type(
     Raises:
         UserExitException: If user wants to exit
     """
+    # Convert to arrow-key selection - only show available options
+    from ...cli.text_input import professional_prompt
+    from .navigation import NavigationException, NavigationAction
+
     tui.clear_screen()
 
-    tui.console.print("[bold cyan]Select Quantization Type[/bold cyan]\n")
-    tui.console.print("[dim]All available options for this method (grayed = not available on your system):[/dim]\n")
+    # Show header with info
+    tui.console.print()
+    tui.console.print("[bold cyan]Select Quantization Type[/bold cyan]")
+    tui.console.print()
 
-    # Track which indices are selectable
-    valid_indices = []
+    # Build arrow-key options - only available types
+    options = []
 
-    for idx, rec in enumerate(recommendations, 1):
-        # Determine styling based on availability
-        if not rec.is_available:
-            # Grayed out - not available
-            marker = "[dim]✗"
-            name_style = f"[dim]{rec.quant_type.display_name} - [red]NOT AVAILABLE[/red][/dim]"
-            quality_bar = "[dim]" + ("█" * rec.quality_score + "▒" * (10 - rec.quality_score)) + "[/dim]"
-            speed_bar = "[dim]" + ("█" * rec.speed_score + "▒" * (10 - rec.speed_score)) + "[/dim]"
-        elif rec.is_recommended:
-            # Recommended
-            marker = "⭐"
-            name_style = f"[cyan]{rec.quant_type.display_name}[/cyan]"
-            quality_bar = "█" * rec.quality_score + "▒" * (10 - rec.quality_score)
-            speed_bar = "█" * rec.speed_score + "▒" * (10 - rec.speed_score)
-            valid_indices.append(idx)
-        else:
-            # Available but not recommended
-            marker = "  "
-            name_style = f"[cyan]{rec.quant_type.display_name}[/cyan]"
-            quality_bar = "█" * rec.quality_score + "▒" * (10 - rec.quality_score)
-            speed_bar = "█" * rec.speed_score + "▒" * (10 - rec.speed_score)
-            valid_indices.append(idx)
-
-        tui.console.print(f"{marker} [{idx}] {name_style}")
-
+    for rec in recommendations:
         if rec.is_available:
-            tui.console.print(f"      [dim]Size: ~{rec.estimated_size_gb:.1f}GB | Time: ~{rec.estimated_time_minutes:.0f}min[/dim]")
-            tui.console.print(f"      Quality: {quality_bar} {rec.quality_score}/10")
-            tui.console.print(f"      Speed:   {speed_bar} {rec.speed_score}/10")
-            tui.console.print(f"      [dim]Best for: {rec.best_for}[/dim]")
-
+            # Build label with quality indicators
             if rec.is_recommended:
-                tui.console.print(f"      [bold green]⭐ RECOMMENDED[/bold green]")
-        else:
-            # Show why it's unavailable
-            tui.console.print(f"      [dim red]Reason: {rec.unavailable_reason}[/dim red]")
-            tui.console.print(f"      [dim]Would be: ~{rec.estimated_size_gb:.1f}GB, Quality {rec.quality_score}/10[/dim]")
-
-        tui.console.print()
-
-    tui.console.print("  [b] [dim]Go back[/dim] | [m] [dim]Main menu[/dim] | [h] [dim]Home[/dim]\n")
-
-    while True:
-        choice = tui.prompt(f"Choose [1-{len(recommendations)}/b/m/h]:", style="cyan").strip().lower()
-
-        # Check for navigation hotkeys
-        from .navigation import check_navigation_input, NavigationException, NavigationAction
-
-        nav_action = check_navigation_input(choice)
-        if nav_action:
-            if nav_action == NavigationAction.BACK:
-                return None
-            elif nav_action == NavigationAction.MAIN_MENU:
-                raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
-            elif nav_action == NavigationAction.HOME:
-                raise NavigationException(NavigationAction.HOME, "User requested home menu")
-
-        # Legacy support
-        if choice in ["exit", "quit"]:
-            return None
-
-        try:
-            idx = int(choice)
-            if 1 <= idx <= len(recommendations):
-                selected_rec = recommendations[idx - 1]
-
-                # Check if this option is available
-                if not selected_rec.is_available:
-                    tui.show_error(
-                        f"[red]✗ {selected_rec.quant_type.display_name} is not available on your system[/red]\n"
-                        f"{selected_rec.unavailable_reason}\n"
-                        f"Please select an available option ({', '.join(map(str, valid_indices))})."
-                    )
-                    continue
-
-                return selected_rec
+                label = f"[green]⭐ {rec.quant_type.display_name} (Recommended)[/green]"
             else:
-                tui.show_error(f"Invalid choice. Enter 1-{len(recommendations)}, 'b', 'm', or 'h'")
-        except ValueError:
-            tui.show_error("Invalid input. Enter a number, 'b', 'm', or 'h'")
+                label = f"[cyan]{rec.quant_type.display_name}[/cyan]"
+
+            # Build description with key metrics
+            quality_bar = "█" * rec.quality_score + "▒" * (10 - rec.quality_score)
+            speed_bar = "█" * rec.speed_score + "▒" * (10 - rec.speed_score)
+            description = (
+                f"~{rec.estimated_size_gb:.1f}GB • ~{rec.estimated_time_minutes:.0f}min • "
+                f"Q:{quality_bar} {rec.quality_score}/10 • S:{speed_bar} {rec.speed_score}/10"
+            )
+
+            options.append((rec.quant_type, label, description))
+
+    # Add navigation
+    options.extend([
+        ("BACK", "[dim]◄ Go back[/dim]", "Return to method selection"),
+        ("MAIN", "[dim]⌂ Main menu[/dim]", "Go to main menu"),
+        ("HOME", "[dim]⌂ Home[/dim]", "Go to home"),
+    ])
+
+    # Show selection
+    choice = professional_prompt.get_arrow_selection(
+        options=options,
+        title="Select Quantization Level",
+        instructions="Use ↑/↓ to navigate, Enter to select"
+    )
+
+    # Handle navigation
+    if choice == "BACK":
+        return None
+    elif choice == "MAIN":
+        raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
+    elif choice == "HOME":
+        raise NavigationException(NavigationAction.HOME, "User requested home menu")
+    elif choice is None:
+        return None
+
+    # Find the selected recommendation
+    selected_rec = None
+    for rec in recommendations:
+        if rec.quant_type == choice:
+            selected_rec = rec
+            break
+
+    if selected_rec:
+        logger.info(f"User selected {selected_rec.quant_type.display_name}")
+        return selected_rec
+
+    # Should not reach here
+    return None
 
 
 def confirm_quantization(
@@ -1038,55 +1248,22 @@ def ask_background_mode() -> bool:
     Raises:
         UserExitException: If user wants to exit
     """
-    tui.clear_screen()
-    tui.show_panel(
-        """[bold cyan]Processing Mode[/bold cyan]
+    from src.cli.text_input import TextInput
 
-[bold]Choose how to run quantization:[/bold]
+    professional_prompt = TextInput()
 
-[1] [green]Live monitoring[/green]
-    • Watch progress in real-time
-    • See detailed output
-    • Blocks other operations
+    options = [
+        (False, "[green]Live Monitoring[/green]", "Watch real-time • Detailed output • Blocks operations"),
+        (True, "[cyan]Background ⭐ Recommended[/cyan]", "Returns immediately • Status bar • Use /background to monitor")
+    ]
 
-[2] [cyan]Background[/cyan]
-    • Returns to menu immediately
-    • Persistent status bar shows progress
-    • Can perform other tasks
-    • Use [yellow]/background[/yellow] command to monitor
-
-[bold]Navigation:[/bold]
-  [b] Go back | [m] Main menu | [h] Home
-
-[dim]Recommendation: Use background for long-running quantizations (>10min)[/dim]""",
+    choice = professional_prompt.get_arrow_selection(
+        options=options,
         title="Processing Mode",
-        border_style="cyan",
+        instructions="↑/↓: Navigate | Enter: Select | b: Back | m: Main | h: Home\n[dim]Tip: Use background for long-running quantizations (>10min)[/dim]"
     )
 
-    while True:
-        choice = tui.prompt("Choose [1/2/b/m/h]:", style="cyan").strip().lower()
-
-        # Check for navigation hotkeys
-        from .navigation import check_navigation_input, NavigationException, NavigationAction
-
-        nav_action = check_navigation_input(choice)
-        if nav_action:
-            if nav_action == NavigationAction.BACK:
-                raise UserExitException("User cancelled")
-            elif nav_action == NavigationAction.MAIN_MENU:
-                raise NavigationException(NavigationAction.MAIN_MENU, "User requested main menu")
-            elif nav_action == NavigationAction.HOME:
-                raise NavigationException(NavigationAction.HOME, "User requested home menu")
-
-        if choice in ["quit", "exit"]:
-            raise UserExitException("User cancelled")
-
-        if choice == "1":
-            return False  # Live
-        elif choice == "2":
-            return True  # Background
-        else:
-            tui.show_error("Invalid choice. Enter 1 or 2")
+    return choice
 
 
 def show_live_progress(task):

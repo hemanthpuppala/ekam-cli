@@ -423,10 +423,82 @@ def save_annotated_image(
         logger.debug(f"No VLM resolution mismatch detected for point ({x}, {y}) on image {img_width}x{img_height}")
         return (int(x), int(y))
 
+    # GLOBAL VLM RESOLUTION DETECTION
+    # Check ALL bboxes to detect if they're from a common VLM resolution
+    # VLMs may use square (768x768) OR preserve aspect ratio (e.g., 1306x768)
+    # This prevents inconsistent scaling where some bboxes get scaled and others don't
+    global_vlm_width = None
+    global_vlm_height = None
+    global_scale_x = 1.0
+    global_scale_y = 1.0
+
+    # Find max X and Y coordinates separately across ALL detections
+    max_x = 0
+    max_y = 0
+    has_bboxes = False
+    for detection in detections:
+        if "bbox" in detection:
+            has_bboxes = True
+            bbox = detection["bbox"]
+            if len(bbox) == 4:
+                max_x = max(max_x, bbox[0], bbox[2])
+                max_y = max(max_y, bbox[1], bbox[3])
+
+    # If max coordinates exceed image dimensions, determine VLM resolution dynamically
+    if has_bboxes and (max_x > img_width or max_y > img_height):
+        # Dynamically determine VLM resolution from observed max coordinates
+        aspect_ratio = img_width / img_height
+
+        # If max_y exceeds image height, it's likely from VLM internal resolution
+        if max_y > img_height:
+            # Use max_y as VLM height (round to nearest 16 for common VLM quantization)
+            global_vlm_height = ((max_y + 8) // 16) * 16
+            # Infer width from aspect ratio
+            global_vlm_width = int(global_vlm_height * aspect_ratio)
+            logger.debug(f"Detected VLM height {global_vlm_height} from max_y={max_y}, inferred width {global_vlm_width} from aspect ratio {aspect_ratio:.3f}")
+
+        # If max_x exceeds image width, it's likely from VLM internal resolution
+        if max_x > img_width:
+            # Use max_x as VLM width (round to nearest 16)
+            detected_width = ((max_x + 8) // 16) * 16
+            if not global_vlm_width:
+                global_vlm_width = detected_width
+                # Infer height from aspect ratio
+                global_vlm_height = int(global_vlm_width / aspect_ratio)
+                logger.debug(f"Detected VLM width {global_vlm_width} from max_x={max_x}, inferred height {global_vlm_height} from aspect ratio {aspect_ratio:.3f}")
+            else:
+                # Both detected independently - use the detected values
+                pass
+
+        # If we detected VLM resolution, calculate scale factors
+        if global_vlm_width or global_vlm_height:
+            # Use detected dimensions, or fall back to image dimensions if not detected
+            vlm_w = global_vlm_width if global_vlm_width else img_width
+            vlm_h = global_vlm_height if global_vlm_height else img_height
+
+            global_scale_x = img_width / vlm_w
+            global_scale_y = img_height / vlm_h
+
+            logger.info(
+                f"Detected VLM resolution {vlm_w}x{vlm_h} across all detections "
+                f"(image is {img_width}x{img_height}). Applying uniform scaling ({global_scale_x:.2f}, {global_scale_y:.2f})"
+            )
+
     for detection in detections:
         # Draw bounding box if available
         if "bbox" in detection:
-            bbox = convert_bbox_to_pixels(detection["bbox"])
+            # Apply global VLM scaling if detected, otherwise use per-bbox conversion
+            if global_vlm_width or global_vlm_height:
+                bbox = detection["bbox"]
+                bbox = [
+                    int(bbox[0] * global_scale_x),
+                    int(bbox[1] * global_scale_y),
+                    int(bbox[2] * global_scale_x),
+                    int(bbox[3] * global_scale_y)
+                ]
+            else:
+                bbox = convert_bbox_to_pixels(detection["bbox"])
+
             draw.rectangle(bbox, outline="red", width=3)
 
             # Add label if available
@@ -437,7 +509,13 @@ def save_annotated_image(
         elif "coordinates" in detection:
             coords = detection["coordinates"]
             if isinstance(coords, dict) and "x" in coords and "y" in coords:
-                x, y = convert_point_to_pixels(coords["x"], coords["y"])
+                # Apply global VLM scaling if detected
+                if global_vlm_size:
+                    x = int(coords["x"] * global_scale_x)
+                    y = int(coords["y"] * global_scale_y)
+                else:
+                    x, y = convert_point_to_pixels(coords["x"], coords["y"])
+
                 # Draw crosshair
                 draw.line([(x - 10, y), (x + 10, y)], fill="red", width=2)
                 draw.line([(x, y - 10), (x, y + 10)], fill="red", width=2)

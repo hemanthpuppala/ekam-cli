@@ -20,7 +20,7 @@ def get_quantization_recommendations(
     Args:
         model_info: Model to quantize
         system_specs: System specifications
-        method_family: Quantization method family (GGUF, GPTQ, AWQ, BNB, Advanced, Generic)
+        method_family: Quantization method family (GGUF, GPTQ, AWQ, BNB, Advanced, Generic, Dequantization, MLX, OpenVINO)
         use_gpu: Whether GPU is available and will be used
 
     Returns:
@@ -32,6 +32,12 @@ def get_quantization_recommendations(
         recommendations = _get_generic_recommendations(model_info, system_specs, use_gpu)
     elif method_family == "GGUF":
         recommendations = _get_gguf_recommendations(model_info, system_specs)
+    elif method_family == "Dequantization":
+        recommendations = _get_dequantization_recommendations(model_info, system_specs)
+    elif method_family == "MLX":
+        recommendations = _get_mlx_recommendations(model_info, system_specs)
+    elif method_family == "OpenVINO":
+        recommendations = _get_openvino_recommendations(model_info, system_specs)
     elif method_family == "Advanced":
         # Advanced 4-bit quantization: Combine all advanced methods
         # GPTQ: GPU-optimized, good quality
@@ -468,6 +474,270 @@ def _get_bnb_recommendations(
                 speed_score=speed,
                 best_for=best_for + (" (CUDA GPU required)" if not has_cuda else ""),
                 requires_gpu=True,
+                is_available=is_available,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    return recommendations
+
+
+def _get_mlx_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs
+) -> list[QuantizationRecommendation]:
+    """Get MLX quantization recommendations (Apple Silicon only).
+    
+    MLX supports: INT2, INT3, INT4, INT6, INT8, FP16
+    NOT supported: INT5 (not available in MLX framework)
+    """
+    import platform
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    is_macos = platform.system() == "Darwin"
+    is_apple_silicon = platform.machine() in ["arm64", "aarch64"] and is_macos
+    has_mlx = False
+    try:
+        import mlx.core  # noqa
+        has_mlx = True
+    except ImportError:
+        pass
+
+    # MLX quantization configurations: (type, factor, quality, speed, best_for)
+    mlx_configs = [
+        (QuantizationType.INT4, 0.25, 8, 10, "RECOMMENDED - Best balance of quality and size"),
+        (QuantizationType.INT6, 0.375, 9, 9, "Good quality, moderate compression"),
+        (QuantizationType.INT8, 0.5, 9, 9, "Highest quality integer quantization"),
+        (QuantizationType.FP16, 0.5, 10, 10, "Baseline, minimal quality loss"),
+        (QuantizationType.INT3, 0.1875, 7, 10, "High compression, quality tradeoff"),
+        (QuantizationType.INT2, 0.125, 6, 10, "Maximum compression, significant quality loss"),
+    ]
+
+    for quant_type, factor, quality, speed, best_for in mlx_configs:
+        estimated_size = original_size_gb * factor
+        estimated_time = original_size_gb * 1.5
+
+        if is_apple_silicon and has_mlx:
+            reason = f"MLX {quant_type.display_name}: Native Apple Silicon quantization with Metal acceleration. "
+            reason += f"Estimated size: {estimated_size:.1f}GB. "
+            if quant_type == QuantizationType.INT4:
+                reason += "✓ RECOMMENDED for most use cases."
+            is_available = True
+            unavailable_reason = ""
+        else:
+            reason = f"MLX {quant_type.display_name}: NOT available on this system. "
+            if not is_macos:
+                reason += "Requires macOS."
+            elif not is_apple_silicon:
+                reason += "Requires Apple Silicon (M1/M2/M3/M4)."
+            elif not has_mlx:
+                reason += "Requires: pip install mlx mlx-lm mlx-vlm"
+            is_available = False
+            unavailable_reason = "Requires macOS with Apple Silicon + MLX installed"
+
+        recommendations.append(
+            QuantizationRecommendation(
+                quant_type=quant_type,
+                module=QuantizationModule.MLX,
+                reason=reason,
+                estimated_size_gb=estimated_size,
+                estimated_time_minutes=estimated_time,
+                quality_score=quality,
+                speed_score=speed,
+                best_for=best_for + (" (Apple Silicon Mac)" if is_apple_silicon else ""),
+                requires_gpu=False,
+                is_available=is_available,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    return recommendations
+
+
+def _get_openvino_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs
+) -> list[QuantizationRecommendation]:
+    """Get OpenVINO quantization recommendations (Intel CPU/iGPU).
+
+    OpenVINO NNCF supports: INT4, INT8, FP16
+    NOT supported: INT2, INT3, INT5, INT6 (not available in NNCF)
+    """
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    has_openvino = False
+    try:
+        import openvino  # noqa
+        has_openvino = True
+    except ImportError:
+        pass
+
+    # OpenVINO quantization configurations: (type, factor, quality, speed, best_for)
+    configs = [
+        (QuantizationType.INT8, 0.5, 9, 8, "RECOMMENDED - Best quality/size balance"),
+        (QuantizationType.INT4, 0.25, 8, 9, "Maximum compression for Intel hardware"),
+        (QuantizationType.FP16, 0.5, 10, 8, "Baseline, no compression artifacts"),
+    ]
+
+    for quant_type, factor, quality, speed, best_for in configs:
+        # Add 10% overhead for OpenVINO IR format
+        estimated_size = (original_size_gb * factor) * 1.1
+        estimated_time = original_size_gb * 2.0
+
+        if has_openvino:
+            reason = f"OpenVINO {quant_type.display_name}: Optimized for Intel CPUs (AVX-512, VNNI, AMX). "
+            reason += f"Estimated size: {estimated_size:.1f}GB. "
+            reason += "Supports Intel iGPU (XMX) and Arc GPU acceleration."
+            if quant_type == QuantizationType.INT8:
+                reason += " ✓ RECOMMENDED for production."
+            is_available = True
+            unavailable_reason = ""
+        else:
+            reason = f"OpenVINO {quant_type.display_name}: NOT available. "
+            reason += "Requires: pip install openvino optimum[openvino]"
+            is_available = False
+            unavailable_reason = "Requires OpenVINO installation"
+
+        recommendations.append(
+            QuantizationRecommendation(
+                quant_type=quant_type,
+                module=QuantizationModule.OPENVINO,
+                reason=reason,
+                estimated_size_gb=estimated_size,
+                estimated_time_minutes=estimated_time,
+                quality_score=quality,
+                speed_score=speed,
+                best_for=best_for + " (Intel CPUs/iGPUs)",
+                requires_gpu=False,
+                is_available=is_available,
+                unavailable_reason=unavailable_reason,
+            )
+        )
+
+    return recommendations
+
+
+def _get_dequantization_recommendations(
+    model_info: ModelInfo, system_specs: SystemSpecs
+) -> list[QuantizationRecommendation]:
+    """Get dequantization/conversion recommendations (convert to full precision format).
+
+    Supports:
+    1. Quantized GGUF → FP16/FP32 GGUF (dequantization)
+    2. Quantized GGUF → FP16/FP32 HuggingFace (dequantization + conversion)
+    3. Ollama models → FP16/FP32 GGUF or HF (conversion)
+    4. HuggingFace models → FP16/FP32 GGUF or HF (format conversion)
+
+    Useful for:
+    1. Converting Ollama models to other frameworks
+    2. Recovering full quality from quantized models
+    3. Converting between model formats while ensuring full precision
+    4. Preparing models for advanced quantization (GPTQ, AWQ, etc.)
+    """
+    from ...models.endpoints import ModelType
+
+    recommendations = []
+    original_size_gb = model_info.size_gb
+
+    # Determine source model availability
+    from ...models.provider import ProviderType
+    is_gguf_file = model_info.provider == ProviderType.GGUF
+    is_ollama_model = model_info.provider == ProviderType.OLLAMA
+    is_hf_model = model_info.provider == ProviderType.HUGGINGFACE
+
+    # Check if source exists
+    has_source = False
+    source_type = None
+
+    if is_gguf_file:
+        # For GGUF files, check local disk
+        has_source = bool(model_info.source_path and model_info.source_path.exists() and model_info.source_path.suffix.lower() == ".gguf")
+        source_type = "gguf_file"
+    elif is_ollama_model:
+        # For Ollama models, check model_id exists (managed by Ollama, not local disk)
+        has_source = bool(model_info.model_id)
+        source_type = "ollama"
+    elif is_hf_model:
+        # For HF models, they can be local or remote - just need model_id
+        has_source = bool(model_info.model_id)
+        source_type = "huggingface"
+
+    # Dequantization configurations: (type, size_factor, quality, speed, best_for)
+    # Quality is always high (recovering full precision)
+    # Speed depends on conversion complexity
+    dequant_configs = [
+        # GGUF outputs: Single-step dequantization (faster)
+        (QuantizationType.DEQUANT_FP16_GGUF, 2.0, 10, 8, "Ollama/llama.cpp, full FP16 quality"),
+        (QuantizationType.DEQUANT_FP32_GGUF, 4.0, 10, 7, "Ollama/llama.cpp, maximum precision"),
+        # HF outputs: Two-step conversion (slower but more compatible)
+        (QuantizationType.DEQUANT_FP16_HF, 2.0, 10, 7, "HuggingFace, PyTorch, TransformersJS"),
+        (QuantizationType.DEQUANT_FP32_HF, 4.0, 10, 6, "HuggingFace, maximum precision"),
+    ]
+
+    for quant_type, size_factor, quality, speed, best_for in dequant_configs:
+        estimated_size = original_size_gb * size_factor
+
+        # Time estimates
+        # GGUF file: ~1-2 min per GB (direct dequantization)
+        # Ollama: ~2-3 min per GB (pull + dequantize)
+        # HF→GGUF: ~3-4 min per GB (convert + dequant)
+        # HF→HF: ~2-3 min per GB (format conversion)
+        is_hf_output = "hf" in quant_type.value
+
+        if source_type == "gguf_file" and not is_hf_output:
+            time_per_gb = 1.5  # Direct GGUF dequant
+        elif source_type == "ollama" and not is_hf_output:
+            time_per_gb = 2.0  # Ollama pull + dequant
+        elif is_hf_output:
+            time_per_gb = 3.5  # Two-step conversion
+        else:
+            time_per_gb = 2.5  # Default
+
+        estimated_time = original_size_gb * time_per_gb
+
+        # Determine availability - support all three model types
+        if not has_source:
+            is_available = False
+            if is_gguf_file:
+                unavailable_reason = "Source GGUF file not found on disk."
+            elif is_ollama_model:
+                unavailable_reason = "Ollama model not registered. Install via: ollama pull <model>"
+            else:
+                unavailable_reason = "HuggingFace model identifier not found."
+            reason = f"{quant_type.display_name}: NOT available. {unavailable_reason}"
+        else:
+            is_available = True
+            unavailable_reason = ""
+            reason = f"{quant_type.display_name}: "
+
+            # Add operation description based on source and target
+            if is_hf_output:
+                if source_type == "gguf_file" or source_type == "ollama":
+                    reason += f"Convert GGUF → FP{32 if 'fp32' in quant_type.value else 16} HuggingFace. "
+                else:
+                    reason += f"Convert to FP{32 if 'fp32' in quant_type.value else 16} HuggingFace format. "
+            else:
+                reason += f"Dequantize → FP{32 if 'fp32' in quant_type.value else 16} GGUF. "
+
+            # Add RAM check
+            if estimated_size < system_specs.available_ram_gb * 0.7:
+                reason += f"Fits in RAM ({estimated_size:.1f}GB / {system_specs.available_ram_gb:.1f}GB). "
+            else:
+                reason += f"⚠️  May need {estimated_size:.1f}GB (available: {system_specs.available_ram_gb:.1f}GB). "
+
+            reason += f"Est. time: ~{estimated_time:.0f} min."
+
+        recommendations.append(
+            QuantizationRecommendation(
+                quant_type=quant_type,
+                module=QuantizationModule.LLAMA_CPP,
+                reason=reason,
+                estimated_size_gb=estimated_size,
+                estimated_time_minutes=estimated_time,
+                quality_score=quality,
+                speed_score=speed,
+                best_for=best_for,
+                requires_gpu=False,
                 is_available=is_available,
                 unavailable_reason=unavailable_reason,
             )

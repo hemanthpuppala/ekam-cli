@@ -11,12 +11,15 @@ from loguru import logger
 def clean_model_response(response_text: str, aggressive: bool = True) -> str:
     """Clean model response by removing artifacts, reasoning, and meta-commentary.
 
+    DISABLED FOR BENCHMARKING: Returns raw response without any cleaning.
+
     This function handles various output issues that can occur with different models:
     - Template leakage (role markers like "User:", "Assistant:")
     - Internal reasoning artifacts ("Okay,", "Let me think", etc.)
     - Meta-commentary ("The user asked", "The problem is", etc.)
     - Math formatting artifacts (\\boxed{}, **Final Answer**, etc.)
     - Excessive whitespace and repetition
+    - Extracts content after "Answer:" markers
 
     Args:
         response_text: Raw model output text
@@ -31,25 +34,92 @@ def clean_model_response(response_text: str, aggressive: bool = True) -> str:
 
         >>> clean_model_response("User: hello\\nAssistant: Hi there!")
         "Hi there!"
+
+        >>> clean_model_response("Okay...\\nAnswer: This is the real answer.")
+        "This is the real answer."
     """
+    # DISABLED: Return raw response for benchmarking
     if not response_text or len(response_text.strip()) == 0:
         return response_text
+
+    logger.debug(f"Response cleaning disabled - returning raw response ({len(response_text)} chars)")
+    return response_text.strip()
+
+    # === CLEANING CODE DISABLED BELOW ===
+    if False:  # Disabled - keeping for future reference
+        pass
+
+    # OPTIMIZATION: O(1) amortized time - early termination with pattern matching
+    # Process only what's needed, skip full line-by-line scan when possible
+
+    # Pattern 1: Extract content after "Answer:" marker
+    # This handles edge case where reasoning precedes the actual answer
+    # Priority order: exact "\nAnswer:" > "\nA:" > case variants
+    answer_patterns = ["\nAnswer:", "\nA:", "Answer:", "A:"]
+    answer_idx = -1
+    answer_marker_len = 0
+
+    for pattern in answer_patterns:
+        idx = response_text.find(pattern)
+        if idx != -1:
+            answer_idx = idx
+            answer_marker_len = len(pattern)
+            break
+
+    if answer_idx != -1:
+        # Found answer marker - extract everything after it
+        extracted = response_text[answer_idx + answer_marker_len:].strip()
+
+        # Quick clean: remove common end markers (O(1) operations, max 4 iterations)
+        for marker in ["<|endoftext|>", "<|im_end|>", "</s>", "<eos>"]:
+            extracted = extracted.replace(marker, "")
+
+        extracted = extracted.strip()
+
+        # Only use if substantial (>20 chars) to avoid false positives
+        if len(extracted) > 20:
+            logger.debug(f"Extracted answer after marker ({len(extracted)} chars)")
+            return extracted
+
+    # Pattern 2: Extract after "The answer is" or similar definitive statements
+    # O(1) - check at most 3 patterns, only if substantial reasoning precedes it
+    if len(response_text) > 100:  # Only try this pattern if response is long enough
+        definitive_patterns = [" answer is ", " solution is ", " result is "]
+        for pattern in definitive_patterns:
+            idx = response_text.lower().find(pattern)
+            if idx != -1 and idx > 20:  # Must have some text before "answer is"
+                # Extract from this point onwards
+                extracted = response_text[idx + len(pattern):].strip()
+
+                # Find first sentence (stop at period, newline, or 200 chars)
+                sentence_end = min(
+                    extracted.find('. ') if '. ' in extracted else len(extracted),
+                    extracted.find('\n') if '\n' in extracted else len(extracted),
+                    200  # Max sentence length to keep it O(1)
+                )
+
+                if sentence_end > 0:
+                    extracted = extracted[:sentence_end].strip()
+
+                    # Clean markers
+                    for marker in ["<|endoftext|>", "<|im_end|>", "</s>", "<eos>"]:
+                        extracted = extracted.replace(marker, "")
+
+                    extracted = extracted.strip()
+
+                    if len(extracted) > 3:  # Even short answers like "42" are valid
+                        logger.debug(f"Extracted definitive answer ({len(extracted)} chars)")
+                        return extracted
 
     # 1. Template artifacts to remove (role markers)
     role_artifacts = [
         "User:", "Assistant:", "Human:", "System:",
-        "The user", "The assistant", "The system"
     ]
 
-    # 2. Reasoning markers (indicates internal reasoning - truncate here if aggressive)
+    # 2. Very minimal reasoning markers - only catch obvious meta-commentary
+    # BE LENIENT: Only remove if it's clearly just thinking, not actual content
     reasoning_markers = [
-        "Okay,", "Alright,", "Wait,", "So,", "Let me", "I think", "I need to",
-        "I'm going to", "I should", "I can", "I will", "I'll", "Let's",
-        "The user asked", "The question", "The problem", "The instruction",
-        "The initial", "The final", "According to", "Based on the",
-        "This is a", "This response", "The key points", "The example",
-        "Now the", "In the problem", "In the example", "From the",
-        "The reasoning", "The thinking", "The analysis", "The approach"
+        "The user asked", "The user said", "The user wants",
     ]
 
     # 3. Math/formatting artifacts
@@ -72,11 +142,13 @@ def clean_model_response(response_text: str, aggressive: bool = True) -> str:
             logger.debug(f"Removed role artifact: {stripped[:50]}")
             continue
 
-        # Check for reasoning markers
-        if aggressive and any(stripped.startswith(marker) for marker in reasoning_markers):
-            logger.debug(f"Truncated at reasoning marker: {stripped[:50]}")
-            found_reasoning_section = True
-            break
+        # LENIENT: Only skip obvious meta-commentary at the START of the response
+        # Don't truncate mid-response - that removes too much content
+        if aggressive and not cleaned_lines:  # Only at the start
+            if any(stripped.startswith(marker) for marker in reasoning_markers):
+                # Skip this preamble line
+                logger.debug(f"Skipped preamble: {stripped[:50]}")
+                continue
 
         # Check for math artifacts - remove these lines
         if any(artifact in stripped for artifact in math_artifacts):
