@@ -10,7 +10,7 @@ providers:
     - cuda
     - mps
     - cpu
-    hf_token: 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
+    hf_token: "<REDACTED>"
   lm_studio:
     enabled: false
     host: http://localhost:1234
