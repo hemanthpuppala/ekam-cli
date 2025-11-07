@@ -1,0 +1,182 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ekam"
+version = "0.1.0"
+description = "EKAM - Efficient Knowledge & AI Models. A comprehensive benchmarking and testing suite for VLMs (Vision Language Models) and LLMs (Large Language Models)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "EKAM Contributors"}
+]
+keywords = [
+    "vlm",
+    "llm",
+    "benchmarking",
+    "testing",
+    "vision-language-models",
+    "large-language-models",
+    "quantization",
+    "inference"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Core dependencies - No version pinning, always latest
+# NOTE: Default installs CPU-only PyTorch. For CUDA support:
+#   pip uninstall torch torchvision -y
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Verify: python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+dependencies = [
+    # Core ML packages - Listed FIRST (required by gptqmodel)
+    "torch",
+    "torchvision",
+    "transformers",  # Latest with Qwen 3, LLaMA 3.x, VLMs
+
+    # UI and Core utilities
+    "rich",
+    "prompt-toolkit",
+    "pydantic",
+    "httpx",
+    "pillow",
+    "pyyaml",
+    "psutil",
+    "loguru",
+    "python-dotenv",
+
+    # GGUF Quantization support (Ollama, llama.cpp compatible)
+    "llama-cpp-python",
+    "gguf",
+
+    # HuggingFace model management
+    "huggingface-hub",
+    "safetensors",
+    "protobuf",
+    "sentencepiece",
+
+    # Advanced quantization support (GPTQ, QLoRA, GGUF, bfloat16, fp8, int8)
+    "accelerate",
+    # gptqmodel removed from core deps - install separately: pip install gptqmodel
+
+    # Finetuning support
+    "peft",
+    "trl",  # Transformers Reinforcement Learning
+
+    # CPU Feature Detection
+    "py-cpuinfo",
+
+    # Benchmarking dependencies
+    "numpy",
+    "scipy",
+    "pandas",
+    "plotly",
+    "matplotlib",
+    "jinja2",
+    "nltk",
+    "rouge-score",
+    "sentence-transformers",
+
+    # Testing utilities
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-mock",
+    "freezegun",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    "mypy",
+    "isort",
+]
+
+# GPTQ Quantization support (requires torch pre-installed)
+# Install AFTER main installation: pip install gptqmodel
+# WARNING: May have build issues on Windows - GGUF/bitsandbytes are alternatives
+gptq = [
+    "gptqmodel",       # Latest GPTQ v2 quantization
+]
+
+# Platform-specific: Apple Silicon (macOS M1/M2/M3/M4 only)
+# Install with: pip install -e ".[macos]"
+macos = [
+    "mlx",         # Native Metal-accelerated ML framework
+    "mlx-lm",      # MLX language model support
+    "mlx-vlm",     # MLX vision-language model support
+]
+
+# Platform-specific: Linux/WSL with CUDA
+# Install with: pip install -e ".[cuda]"
+cuda = [
+    "bitsandbytes",    # INT8 quantization (experimental on Windows)
+    "flash-attn",      # High-speed attention for CUDA 11.6+/ROCm 5.3+
+    "vllm",            # High-throughput LLM serving
+    "nvidia-ml-py",    # NVIDIA GPU monitoring
+]
+
+# Platform-specific: Intel optimizations
+# Install with: pip install -e ".[intel]"
+intel = [
+    "openvino",
+    "openvino-dev",
+    "optimum",
+    "intel-extension-for-pytorch",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/ekam"
+Documentation = "https://github.com/yourusername/ekam"
+Repository = "https://github.com/yourusername/ekam.git"
+Issues = "https://github.com/yourusername/ekam/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"  # Support Python 3.9+
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "ANN", "B"]
+ignore = ["ANN101", "ANN102"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.black]
+line-length = 100
+target-version = ["py39"]  # Support Python 3.9+
+include = '\.pyi?$'
+
+[tool.mypy]
+python_version = "3.9"  # Support Python 3.9+
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true

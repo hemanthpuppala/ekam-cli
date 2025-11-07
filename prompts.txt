@@ -1,0 +1,317 @@
+1. LLM DEFAULT_LLM_PROMPTS (20 prompts):
+
+  # Easy, Medium, Hard pattern
+  DEFAULT_LLM_PROMPTS = [
+      # 1-Easy
+      "What is Python?",
+      # 2-Medium
+      "Explain the difference between lists and tuples in Python.",
+      # 3-Hard
+      "How does Python's Global Interpreter Lock (GIL) affect multi-threaded performance?",
+      # 4-Easy
+      "What is an API?",
+      # 5-Medium
+      "Describe how REST APIs differ from GraphQL APIs.",
+      # 6-Hard
+      "Explain the CAP theorem and its implications for distributed systems.",
+      # 7-Easy
+      "Define machine learning.",
+      # 8-Medium
+      "What are the key differences between supervised and unsupervised learning?",
+      # 9-Hard
+      "Explain the mathematical foundation of backpropagation in neural networks.",
+      # 10-Easy
+      "What is a database?",
+      # 11-Medium
+      "Compare SQL and NoSQL databases in terms of use cases.",
+      # 12-Hard
+      "Describe database normalization and denormalization trade-offs in OLTP vs OLAP systems.",
+      # 13-Easy
+      "What is cloud computing?",
+      # 14-Medium
+      "Explain the differences between IaaS, PaaS, and SaaS.",
+      # 15-Hard
+      "How do microservices architectures handle distributed transactions and eventual consistency?",
+      # 16-Easy
+      "What is version control?",
+      # 17-Medium
+      "Explain git branching strategies for team collaboration.",
+      # 18-Hard
+      "Describe the internals of git's object storage and how it achieves deduplication.",
+      # 19-Easy
+      "What is cybersecurity?",
+      # 20-Medium
+      "Explain common web vulnerabilities like XSS and SQL injection.",
+  ]
+
+  2. SPEED_TEST_PROMPTS (20 prompts - short):
+
+  SPEED_TEST_PROMPTS = [
+      # 1-Easy
+      "Define AI.",
+      # 2-Medium
+      "Explain recursion briefly.",
+      # 3-Hard
+      "What is P vs NP?",
+      # 4-Easy
+      "What is HTTP?",
+      # 5-Medium
+      "Difference between HTTP and HTTPS?",
+      # 6-Hard
+      "How does TLS handshake work?",
+      # 7-Easy
+      "What is RAM?",
+      # 8-Medium
+      "Explain virtual memory.",
+      # 9-Hard
+      "Describe cache coherence protocols.",
+      # 10-Easy
+      "What is JSON?",
+      # 11-Medium
+      "JSON vs XML comparison.",
+      # 12-Hard
+      "Explain JSON Schema validation.",
+      # 13-Easy
+      "Define algorithm.",
+      # 14-Medium
+      "What is Big O notation?",
+      # 15-Hard
+      "Analyze quicksort time complexity.",
+      # 16-Easy
+      "What is a function?",
+      # 17-Medium
+      "Explain higher-order functions.",
+      # 18-Hard
+      "Describe function currying benefits.",
+      # 19-Easy
+      "What is encryption?",
+      # 20-Medium
+      "Symmetric vs asymmetric encryption?",
+  ]
+
+  3. QUALITY_TEST_PROMPTS (20 prompts - deterministic):
+
+  QUALITY_TEST_PROMPTS = [
+      # 1-Easy
+      "What is 5 + 7?",
+      # 2-Medium
+      "Calculate 15% of 200.",
+      # 3-Hard
+      "What is the square root of 144?",
+      # 4-Easy
+      "What is the capital of France?",
+      # 5-Medium
+      "Name the largest ocean on Earth.",
+      # 6-Hard
+      "What year did the first human land on the moon?",
+      # 7-Easy
+      "How many hours in a day?",
+      # 8-Medium
+      "How many weeks in a year?",
+      # 9-Hard
+      "How many seconds in a week?",
+      # 10-Easy
+      "What is H2O?",
+      # 11-Medium
+      "What is the atomic number of carbon?",
+      # 12-Hard
+      "What is Avogadro's number?",
+      # 13-Easy
+      "Spell 'necessary'.",
+      # 14-Medium
+      "What is the past tense of 'go'?",
+      # 15-Hard
+      "Define 'onomatopoeia'.",
+      # 16-Easy
+      "What color is the sky?",
+      # 17-Medium
+      "Name the primary colors.",
+      # 18-Hard
+      "Explain RGB color model.",
+      # 19-Easy
+      "How many continents exist?",
+      # 20-Medium
+      "Name the smallest country by area.",
+  ]
+
+  STRESS_TEST_PROMPTS stays at 3 (they cycle). Now VLM prompts:
+
+  4. VLM_VISION_QA_PROMPTS (20 prompts):
+
+  VLM_VISION_QA_PROMPTS = [
+      # 1-Easy
+      "What is the main object in this image?",
+      # 2-Medium
+      "Describe the setting and location shown in the image.",
+      # 3-Hard
+      "Analyze the composition and visual hierarchy of elements in this image.",
+      # 4-Easy
+      "What colors are most prominent?",
+      # 5-Medium
+      "Identify the mood or atmosphere conveyed by this image.",
+      # 6-Hard
+      "What cultural or historical context can you infer from the visual elements?",
+      # 7-Easy
+      "Are there any people in this image?",
+      # 8-Medium
+      "Describe what the people in this image are doing.",
+      # 9-Hard
+      "Analyze the body language and interactions between people in this image.",
+      # 10-Easy
+      "What animals can you see?",
+      # 11-Medium
+      "Identify the species and behavior of animals present.",
+      # 12-Hard
+      "What can you deduce about the animals' habitat or environment?",
+      # 13-Easy
+      "Is this indoors or outdoors?",
+      # 14-Medium
+      "What time of day does this appear to be taken?",
+      # 15-Hard
+      "Estimate the season and weather conditions based on visual cues.",
+      # 16-Easy
+      "What text is visible?",
+      # 17-Medium
+      "Read and interpret any signs, labels, or written content.",
+      # 18-Hard
+      "What language is the text in, and what does it communicate?",
+      # 19-Easy
+      "Count how many objects are present.",
+      # 20-Medium
+      "Identify and categorize the different types of objects.",
+  ]
+
+  5. VLM_CAPTION_PROMPTS (20 prompts):
+
+  VLM_CAPTION_PROMPTS = [
+      # 1-Easy
+      "Write a one-sentence caption.",
+      # 2-Medium
+      "Create a descriptive social media caption.",
+      # 3-Hard
+      "Write a poetic or artistic caption that captures the essence.",
+      # 4-Easy
+      "Describe what you see briefly.",
+      # 5-Medium
+      "Summarize the image's main content and context.",
+      # 6-Hard
+      "Provide a detailed narrative caption with background story.",
+      # 7-Easy
+      "Give this image a title.",
+      # 8-Medium
+      "Create a news headline for this image.",
+      # 9-Hard
+      "Write a compelling marketing tagline for this visual.",
+      # 10-Easy
+      "What's happening here?",
+      # 11-Medium
+      "Explain the action or event shown.",
+      # 12-Hard
+      "Describe the sequence of events leading to this moment.",
+      # 13-Easy
+      "Name the subject.",
+      # 14-Medium
+      "Identify and describe the primary subject in detail.",
+      # 15-Hard
+      "Analyze the subject's significance within the broader context.",
+      # 16-Easy
+      "Describe in 5 words.",
+      # 17-Medium
+      "Describe in a complete paragraph.",
+      # 18-Hard
+      "Write an analytical description with sensory details.",
+      # 19-Easy
+      "What emotion does this convey?",
+      # 20-Medium
+      "Describe the emotional narrative and symbolism present.",
+  ]
+
+  6. VLM_DETECT_PROMPTS (20 prompts):
+
+  VLM_DETECT_PROMPTS = [
+      # 1-Easy
+      "What's in the foreground?",
+      # 2-Medium
+      "List all objects in the foreground with their positions.",
+      # 3-Hard
+      "Analyze spatial relationships between foreground objects.",
+      # 4-Easy
+      "What's in the background?",
+      # 5-Medium
+      "Describe background elements and their arrangement.",
+      # 6-Hard
+      "How do background elements contribute to depth perception?",
+      # 7-Easy
+      "Any vehicles visible?",
+      # 8-Medium
+      "Identify vehicle types, makes, or models if possible.",
+      # 9-Hard
+      "Estimate vehicle positions and directions of movement.",
+      # 10-Easy
+      "Are there animals present?",
+      # 11-Medium
+      "Count and identify different animal species.",
+      # 12-Hard
+      "Describe animal interactions and behaviors observed.",
+      # 13-Easy
+      "What furniture do you see?",
+      # 14-Medium
+      "Categorize and describe each piece of furniture.",
+      # 15-Hard
+      "Analyze the furniture arrangement and interior design style.",
+      # 16-Easy
+      "Identify all visible objects.",
+      # 17-Medium
+      "Categorize objects by type and function.",
+      # 18-Hard
+      "Create a structured inventory with object attributes.",
+      # 19-Easy
+      "What is the largest object?",
+      # 20-Medium
+      "Compare relative sizes of the three largest objects.",
+  ]
+
+  7. VLM_POINT_PROMPTS (20 prompts):
+
+  VLM_POINT_PROMPTS = [
+      # 1-Easy
+      "Where is the main subject?",
+      # 2-Medium
+      "Describe the position of the main subject using directional terms.",
+      # 3-Hard
+      "Provide coordinates or grid position of the main subject.",
+      # 4-Easy
+      "What's in the center?",
+      # 5-Medium
+      "Describe the central focal point and surrounding elements.",
+      # 6-Hard
+      "Analyze compositional balance around the center point.",
+      # 7-Easy
+      "What's in the top-left corner?",
+      # 8-Medium
+      "Describe all elements in the upper-left quadrant.",
+      # 9-Hard
+      "How do top-left elements relate to the overall composition?",
+      # 10-Easy
+      "Where are people located?",
+      # 11-Medium
+      "Map the positions of all people using spatial descriptors.",
+      # 12-Hard
+      "Analyze the spatial distribution and clustering of people.",
+      # 13-Easy
+      "Point to the brightest area.",
+      # 14-Medium
+      "Identify light sources and their effects on the scene.",
+      # 15-Hard
+      "Analyze lighting direction, intensity, and shadow patterns.",
+      # 16-Easy
+      "Where are the largest objects?",
+      # 17-Medium
+      "Describe positions of objects ordered by size.",
+      # 18-Hard
+      "Create a spatial hierarchy map of object positions and sizes.",
+      # 19-Easy
+      "What's on the right side?",
+      # 20-Medium
+      "Comprehensively describe the right half of the image.",
+  ]

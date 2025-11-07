@@ -1,0 +1,121 @@
+# ============================================
+# EKAM - Latest Dependencies (No Version Pinning)
+# ============================================
+# Always installs latest stable versions
+# No version constraints = always current & compatible
+#
+# INSTALLATION ORDER MATTERS:
+# 1. Install torch first (required by gptqmodel)
+# 2. Install other dependencies
+# 3. Platform-specific packages should be installed separately
+
+# ============================================
+# STEP 1: PyTorch (INSTALL FIRST)
+# ============================================
+# Must be installed before gptqmodel and other ML packages
+#
+# CPU-ONLY (default):
+torch
+torchvision
+#
+# GPU/CUDA SUPPORT (NVIDIA GPUs):
+# For CUDA acceleration, uninstall CPU version and install CUDA version:
+#   pip uninstall torch torchvision -y
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# Verify CUDA support: python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+
+# ============================================
+# UI and Core utilities
+# ============================================
+rich
+prompt-toolkit
+pydantic
+httpx
+pillow
+pyyaml
+psutil
+loguru
+python-dotenv
+
+# ============================================
+# Transformers - Latest model architecture support
+# ============================================
+# Automatically handles Qwen 3, LLaMA 3.x, latest VLMs
+transformers
+
+# ============================================
+# GGUF Quantization (Ollama, llama.cpp compatible)
+# ============================================
+llama-cpp-python
+gguf
+
+# ============================================
+# HuggingFace - Latest model management
+# ============================================
+huggingface-hub
+safetensors
+protobuf
+sentencepiece
+
+# ============================================
+# Advanced Quantization - All methods supported
+# ============================================
+# GPTQ, QLoRA, GGUF, bfloat16, fp8, int8
+
+# Core acceleration
+accelerate
+
+# Platform-specific: bitsandbytes (Linux/WSL recommended, experimental on Windows)
+# Uncomment if on Linux/WSL or if you have proper CUDA setup on Windows
+# bitsandbytes
+
+# GPTQ Quantization (high-performance inference)
+# NOTE: gptqmodel requires torch to be installed FIRST
+# Install separately after main installation: pip install gptqmodel
+# WARNING: gptqmodel may have build issues on Windows. If installation fails,
+#          you can still use other quantization methods (GGUF, bitsandbytes)
+# gptqmodel
+
+# QLoRA Fine-tuning support
+peft
+trl
+
+# ============================================
+# Apple Silicon (Mac M1/M2/M3/M4) Optimization
+# ============================================
+# MLX: Native Metal-accelerated ML framework
+# ONLY for macOS with Apple Silicon - DO NOT install on Windows/Linux
+# Install separately on Mac: pip install mlx mlx-lm mlx-vlm
+# mlx
+# mlx-lm
+# mlx-vlm
+
+# ============================================
+# CPU/System Optimization
+# ============================================
+py-cpuinfo
+
+# ============================================
+# Benchmarking & Analysis
+# ============================================
+numpy
+scipy
+pandas
+plotly
+matplotlib
+jinja2
+
+# NLP Quality Metrics
+nltk
+rouge-score
+sentence-transformers
+
+# ============================================
+# Testing & Development
+# ============================================
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+freezegun

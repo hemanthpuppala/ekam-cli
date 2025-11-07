@@ -1,0 +1,24 @@
+providers:
+  ollama:
+    enabled: true
+    host: "http://localhost:11434"
+    timeout_seconds: 120
+
+  huggingface:
+    enabled: true
+    cache_dir: "~/.cache/huggingface/hub/"
+    device_preference: ["cuda", "mps", "cpu"]
+
+  lm_studio:
+    enabled: false
+    host: "http://localhost:1234"
+
+  gguf:
+    enabled: true
+    models_dir: "~/models/gguf/"
+    device_preference: ["cuda", "mps", "cpu"]
+
+system:
+  max_image_dimension: 1920
+  memory_safety_margin_gb: 1.0
+  default_timeout_seconds: 120
