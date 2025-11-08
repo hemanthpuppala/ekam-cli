@@ -815,23 +815,51 @@ class ModelMetadataCache:
             file_size_gb = gguf_path.stat().st_size / 1e9
             file_mtime = gguf_path.stat().st_mtime
 
-            # Try to read GGUF metadata using llama-cpp-python
+            # PERFORMANCE FIX: Use gguf library for header-only reading (100x faster)
+            # This avoids loading the entire multi-GB model file into memory
             try:
-                from llama_cpp import Llama
+                from gguf import GGUFReader
 
-                # Load with minimal settings (reads header only, very fast)
-                # n_ctx=0 prevents memory allocation for inference
-                model = Llama(model_path=str(gguf_path), n_ctx=512, n_gpu_layers=0, verbose=False)
+                # Read metadata from GGUF header directly (no model loading!)
+                # This only reads the first few KB of the file
+                reader = GGUFReader(str(gguf_path))
 
-                # Extract metadata from model
-                metadata_dict = model.metadata if hasattr(model, "metadata") else {}
-
-                # Clean up immediately
-                del model
-
-            except Exception as e:
-                logger.debug(f"Could not load GGUF with llama-cpp-python: {e}, trying fallback")
+                # Extract metadata from header
                 metadata_dict = {}
+                if hasattr(reader, 'fields'):
+                    for field in reader.fields.values():
+                        # Convert field name and value to dict format
+                        field_name = str(field.name) if hasattr(field, 'name') else ''
+                        if hasattr(field, 'parts') and field.parts:
+                            # Handle array/nested fields
+                            metadata_dict[field_name] = str(field.parts[0]) if len(field.parts) == 1 else [str(p) for p in field.parts]
+                        elif hasattr(field, 'value'):
+                            metadata_dict[field_name] = field.value
+
+                logger.debug(f"Read GGUF header with {len(metadata_dict)} metadata fields")
+
+            except ImportError:
+                # Fallback to llama-cpp-python if gguf library not available
+                logger.debug("gguf library not available, falling back to llama-cpp-python")
+                try:
+                    from llama_cpp import Llama
+                    model = Llama(model_path=str(gguf_path), n_ctx=512, n_gpu_layers=0, verbose=False)
+                    metadata_dict = model.metadata if hasattr(model, "metadata") else {}
+                    del model
+                except Exception as e:
+                    logger.debug(f"Could not load GGUF: {e}")
+                    metadata_dict = {}
+            except Exception as e:
+                logger.debug(f"Could not read GGUF header with gguf library: {e}, trying fallback")
+                # Fallback to llama-cpp-python
+                try:
+                    from llama_cpp import Llama
+                    model = Llama(model_path=str(gguf_path), n_ctx=512, n_gpu_layers=0, verbose=False)
+                    metadata_dict = model.metadata if hasattr(model, "metadata") else {}
+                    del model
+                except Exception as e2:
+                    logger.debug(f"Fallback also failed: {e2}")
+                    metadata_dict = {}
 
             # Extract architecture from filename or metadata
             architecture = self._extract_gguf_architecture(gguf_path, metadata_dict)

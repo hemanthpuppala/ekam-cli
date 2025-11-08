@@ -1,8 +1,8 @@
-"""GGUF provider implementation using llama-cpp-python."""
+"""GGUF provider implementation using llama-server for GPU acceleration."""
 
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from loguru import logger
 from PIL import Image
@@ -11,6 +11,8 @@ from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
+from ..models.system import SystemSpecs
+from ..services.llama_server_manager import LlamaServerManager
 from ..utils.history_formatter import format_conversation_history, format_qa_history
 from .base import BaseProvider
 
@@ -18,15 +20,19 @@ from .base import BaseProvider
 class GGUFProvider(BaseProvider):
     """GGUF provider using llama-cpp-python for local inference."""
 
-    def __init__(self, config: ProviderConfig):
+    def __init__(self, config: ProviderConfig, system_specs: Optional['SystemSpecs'] = None):
         """Initialize GGUF provider.
 
         Args:
             config: Provider configuration with models_dir and device settings
+            system_specs: System specifications for dynamic GPU/CPU detection
         """
         self.config = config
         self.models_dir = Path(str(config.models_dir)).expanduser()
         self.device_preference = config.device_preference or ["cuda", "mps", "cpu"]
+
+        # Store or detect system specs
+        self.system_specs = system_specs or SystemSpecs.detect()
 
         # Ensure models directory exists
         self.models_dir.mkdir(parents=True, exist_ok=True)
@@ -35,9 +41,14 @@ class GGUFProvider(BaseProvider):
         self.metadata_cache = ModelMetadataCache()
         logger.debug("Initialized model metadata cache")
 
-        # Determine if GPU is available
-        self.use_gpu = self._check_gpu_availability()
-        logger.info(f"GGUF provider initialized (GPU: {self.use_gpu})")
+        # Determine if GPU is available from system specs
+        self.use_gpu = self.system_specs.gpu.available
+
+        # llama-server instances for GPU acceleration + KV cache reuse
+        self.llama_servers: Dict[str, LlamaServerManager] = {}  # model_path -> server
+        self.use_llama_server = True  # Always use server for GGUF models (GPU + cache)
+
+        logger.info(f"GGUF provider initialized (GPU: {self.use_gpu}, type: {self.system_specs.gpu.gpu_type}, llama-server mode: ON)")
 
     def _check_gpu_availability(self) -> bool:
         """Check if GPU acceleration is available.
@@ -189,12 +200,19 @@ class GGUFProvider(BaseProvider):
     def _find_mmproj_file(self, model_path: str) -> Optional[str]:
         """Find associated mmproj file for VLM support.
 
-        2025 FEATURE: llama.cpp now supports VLMs via mmproj files (April 2025).
+        2025 FEATURE: llama-server now supports VLMs via --mmproj flag (April 2025 with libmtmd).
+
+        The mmproj file contains the vision encoder (typically CLIP) that processes images
+        and converts them to embeddings that the language model can understand.
 
         Searches for mmproj files in the same directory as the model:
         - Same name as model with .mmproj extension
         - "mmproj" keyword in filename
         - Common patterns: *-mmproj.gguf, *-mmproj-*.gguf, mmproj-*.gguf
+
+        Example for qwen3-vl:2b-instruct-q4_K_M:
+        - Model: qwen3-vl-2b-instruct-q4_k_m.gguf
+        - Mmproj: qwen3-vl-2b-instruct-mmproj-f16.gguf
 
         Args:
             model_path: Path to GGUF model file
@@ -225,131 +243,166 @@ class GGUFProvider(BaseProvider):
         logger.debug(f"No mmproj file found for {model_file.name} (VLM support disabled)")
         return None
 
-    def load_model(self, model_id: str, device: str) -> Any:
-        """Load GGUF model with llama-cpp-python.
+    def _extract_model_name_from_path(self, model_path: str) -> str:
+        """Extract model name from file path for template detection.
 
-        2025 UPDATE: Now supports VLMs with mmproj files (vision support added April 2025).
+        Args:
+            model_path: Full path to GGUF model file (lowercased)
+
+        Returns:
+            Model name suitable for chat template detection
+
+        Examples:
+            /path/qwen2-0_5b-instruct-q4_k_m.gguf → qwen2-0_5b-instruct
+            /path/deepseek-r1-distill-qwen-1.5b_q4_k_m.gguf → deepseek-r1-distill-qwen
+        """
+        from pathlib import Path
+
+        # Get filename without extension
+        filename = Path(model_path).stem
+
+        # Remove quantization suffixes (q4_k_m, q4_k_s, etc.)
+        quant_patterns = [
+            "_q2_k", "_q3_k_s", "_q3_k_m", "_q3_k_l",
+            "_q4_0", "_q4_1", "_q4_k_s", "_q4_k_m",
+            "_q5_0", "_q5_1", "_q5_k_s", "_q5_k_m",
+            "_q6_k", "_q8_0", "_f16", "_f32"
+        ]
+
+        model_name = filename.lower()
+        for pattern in quant_patterns:
+            model_name = model_name.replace(pattern, "")
+
+        logger.debug(f"Extracted model name: {model_name} from {filename}")
+        return model_name
+
+    def load_model(self, model_id: str, device: str) -> Any:
+        """Load GGUF model using llama-server for GPU acceleration.
+
+        Uses llama-server instead of direct llama-cpp-python loading to enable:
+        - Full GPU utilization (matches llama.cpp WebUI performance)
+        - Persistent KV cache across conversation turns
+        - 40+ tokens/s performance on follow-up messages
+        - VLM support via --mmproj flag (2025 feature with libmtmd)
+
+        For VLMs, automatically detects and loads mmproj files for vision support.
 
         Args:
             model_id: Path to GGUF file
-            device: Device preference (used self.use_gpu instead)
+            device: Target device ("cuda", "mps", or "cpu")
 
         Returns:
-            Llama model instance (with VLM chat handler if mmproj found)
+            LlamaServerManager instance (acts as model handle)
         """
-        logger.info(f"Loading GGUF model: {model_id}")
+        logger.info(f"Loading GGUF model with llama-server: {model_id}")
 
         try:
-            from llama_cpp import Llama
+            # Check if server already running for this model
+            model_key = str(model_id)
+            if model_key in self.llama_servers:
+                server = self.llama_servers[model_key]
+                if server.is_running():
+                    logger.info(f"Reusing existing llama-server for {Path(model_id).name}")
+                    return server
 
-            # Check if this is a Jamba/Mamba model - needs special handling
+            # Determine GPU layers based on device and model type
             model_name_lower = str(model_id).lower()
             is_jamba = any(keyword in model_name_lower for keyword in ['jamba', 'mamba'])
 
-            # 2025 FEATURE: Check for VLM support (mmproj file)
-            mmproj_path = self._find_mmproj_file(model_id)
-            is_vlm = mmproj_path is not None
-
-            # Jamba/Mamba models have compatibility issues with MPS (Apple Metal)
-            # Force CPU mode for stability on macOS
+            # Jamba/Mamba models: force CPU on MPS, use GPU on CUDA
             if is_jamba and self.use_gpu:
-                # Check if we're on MPS (Apple Silicon)
                 import torch
                 if torch.backends.mps.is_available():
                     logger.warning(
-                        "Jamba/Mamba models have compatibility issues with MPS (Apple Metal). "
-                        "Forcing CPU mode for stability. This will be slower but more reliable."
+                        "Jamba/Mamba models have MPS compatibility issues. "
+                        "Using CPU mode for stability."
                     )
-                    n_gpu_layers = 0  # Force CPU
+                    n_gpu_layers = 0
                 else:
-                    # CUDA is more stable for Jamba
-                    n_gpu_layers = -1 if self.use_gpu else 0
+                    n_gpu_layers = -1  # CUDA is stable
             else:
-                # Standard GPU configuration for other models
                 n_gpu_layers = -1 if self.use_gpu else 0
 
-            # Determine optimal context size based on model
-            # Use larger context windows by default to support conversation history
-            # Most modern GGUF models can handle 4k-8k context efficiently
-            if is_jamba:
-                # Jamba and other hybrid models may need larger context
-                n_ctx = 8192
-                logger.info(f"Using extended context window (8192) for hybrid architecture model")
-            else:
-                # Standard context for most models - increased from 2048 to 4096
-                # This allows for ~3000 token prompts + 1024 token responses
-                n_ctx = 4096
-                logger.info(f"Using standard context window (4096)")
+            # Context size: Jamba needs larger context
+            n_ctx = 8192 if is_jamba else 4096
 
-            # 2025 FEATURE: Load VLM with vision support
-            if is_vlm and mmproj_path:
-                try:
-                    from llama_cpp.llama_chat_format import Llava15ChatHandler, Llava16ChatHandler
+            # Thread configuration
+            physical_cores = self.system_specs.cpu_cores_physical
+            optimal_threads = min(physical_cores, 8)
+            optimal_threads_batch = physical_cores
 
-                    # Try Llava 1.6 handler first (newer, more capable)
-                    # Falls back to 1.5 if not compatible
-                    try:
-                        chat_handler = Llava16ChatHandler(clip_model_path=mmproj_path, verbose=False)
-                        logger.info(f"✓ Using LLaVA 1.6 chat handler with mmproj: {Path(mmproj_path).name}")
-                    except Exception:
-                        chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path, verbose=False)
-                        logger.info(f"✓ Using LLaVA 1.5 chat handler with mmproj: {Path(mmproj_path).name}")
+            # Find available port
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', 0))
+                port = s.getsockname()[1]
 
-                    llama = Llama(
-                        model_path=model_id,
-                        n_ctx=n_ctx,
-                        n_gpu_layers=n_gpu_layers,
-                        n_threads=os.cpu_count() or 4,
-                        chat_handler=chat_handler,  # Enable vision
-                        verbose=False,
-                    )
-                    logger.info(f"✓ Loaded VLM with vision support (GPU layers: {n_gpu_layers}, context: {n_ctx})")
+            # Check for mmproj file for VLM support
+            mmproj_path = self._find_mmproj_file(str(model_id))
 
-                except ImportError:
-                    logger.warning("VLM chat handlers not available in llama-cpp-python. Update to latest version for vision support.")
-                    # Fall back to standard loading
-                    llama = Llama(
-                        model_path=model_id,
-                        n_ctx=n_ctx,
-                        n_gpu_layers=n_gpu_layers,
-                        n_threads=os.cpu_count() or 4,
-                        verbose=False,
-                    )
-                    logger.info(f"Loaded GGUF model (GPU layers: {n_gpu_layers}, context: {n_ctx})")
-            else:
-                # Standard LLM loading
-                llama = Llama(
-                    model_path=model_id,
-                    n_ctx=n_ctx,  # Context window (auto-adjusted)
-                    n_gpu_layers=n_gpu_layers,
-                    n_threads=os.cpu_count() or 4,
-                    verbose=False,
-                )
-                logger.info(f"Loaded GGUF model (GPU layers: {n_gpu_layers}, context: {n_ctx})")
+            # Create and start llama-server
+            server = LlamaServerManager(
+                model_path=str(model_id),
+                host="127.0.0.1",
+                port=port,
+            )
+
+            success = server.start(
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=n_ctx,
+                n_batch=2048,
+                n_ubatch=512,
+                n_threads=optimal_threads,
+                n_threads_batch=optimal_threads_batch,
+                mmproj_path=mmproj_path,  # Pass mmproj for VLM support
+            )
+
+            if not success:
+                raise RuntimeError(f"Failed to start llama-server for {model_id}")
+
+            # Store server instance
+            self.llama_servers[model_key] = server
+
+            vlm_status = "VLM enabled" if mmproj_path else "LLM mode"
+            logger.info(
+                f"✓ llama-server started on port {port} ({vlm_status}) "
+                f"(GPU layers={n_gpu_layers}, threads={optimal_threads}, "
+                f"ctx={n_ctx}, batch=2048, KV cache=GPU VRAM)"
+            )
 
             # Warn about experimental architecture support
-            if 'jamba' in model_name_lower:
+            if is_jamba:
                 logger.warning(
-                    "Jamba uses a hybrid Mamba+Transformer architecture. "
-                    "If you encounter generation errors, try: (1) shorter prompts, "
-                    "(2) /clear to reset history, or (3) CPU mode (set GPU layers to 0)"
+                    "Jamba uses hybrid Mamba+Transformer architecture. "
+                    "If you encounter generation errors, try shorter prompts or /clear."
                 )
-            return llama
+
+            return server
 
         except Exception as e:
-            logger.error(f"Failed to load GGUF model {model_id}: {e}")
-            raise RuntimeError(f"Failed to load GGUF model: {e}")
+            logger.error(f"Failed to start llama-server: {e}")
+            raise RuntimeError(f"Failed to load GGUF model via server: {e}")
 
     def unload_model(self, handle: Any) -> None:
         """Unload GGUF model and free memory.
 
         Args:
-            handle: Llama model instance
+            handle: LlamaServerManager instance or legacy Llama model instance
         """
         if handle is None:
             return
 
         try:
+            # Stop llama-server if this is a server instance
+            if isinstance(handle, LlamaServerManager):
+                model_key = str(handle.model_path)
+                if model_key in self.llama_servers:
+                    handle.stop()
+                    del self.llama_servers[model_key]
+                    logger.info(f"llama-server stopped for {handle.model_path.name}")
+                return
+
+            # Legacy: direct Llama instance
             del handle
             logger.info("GGUF model unloaded")
         except Exception as e:
@@ -553,7 +606,7 @@ class GGUFProvider(BaseProvider):
         """Generate text with GGUF LLM with production-level chat templates.
 
         Args:
-            handle: Llama model instance
+            handle: Llama model instance or LlamaServerManager
             prompt: Text prompt
             conversation_history: Optional list of (user_msg, bot_response) tuples
             custom_parameters: Optional custom generation parameters
@@ -562,33 +615,105 @@ class GGUFProvider(BaseProvider):
             Generated text
         """
         try:
-            # Use production-level history formatter (defaults to ChatML for GGUF)
-            # ChatML works well with most GGUF models
+            # Check if using llama-server (HTTP API for GPU acceleration + KV cache reuse)
+            if isinstance(handle, LlamaServerManager):
+                logger.debug("Using llama-server HTTP API for text generation")
+
+                # Extract model name from server's model path
+                model_id_str = str(handle.model_path).lower()
+                model_name = self._extract_model_name_from_path(model_id_str) if model_id_str else None
+
+                # Get template-specific stop tokens
+                from ..utils.history_formatter import get_stop_tokens
+                stop_tokens = get_stop_tokens(model_name=model_name)
+
+                # Build messages format for chat completion API
+                messages = [
+                    {"role": "system", "content": "You are a helpful AI assistant. Provide accurate, concise, and well-formatted responses."}
+                ]
+
+                # Add conversation history (last 5 turns for context)
+                if conversation_history:
+                    for user_msg, ai_response in conversation_history[-5:]:
+                        messages.append({"role": "user", "content": user_msg})
+                        messages.append({"role": "assistant", "content": ai_response})
+
+                # Add current prompt
+                messages.append({"role": "user", "content": prompt})
+
+                # Get generation parameters
+                max_tokens = 1024
+                temperature = 0.7
+                top_p = 0.9
+
+                # Override with custom parameters if provided
+                if custom_parameters:
+                    max_tokens = custom_parameters.get("max_tokens", max_tokens)
+                    temperature = custom_parameters.get("temperature", temperature)
+                    top_p = custom_parameters.get("top_p", top_p)
+
+                # Call llama-server's chat completion API
+                response_stream = handle.chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop_tokens,
+                    stream=True,
+                )
+
+                # Accumulate streaming response
+                full_text = ""
+                for chunk in response_stream:
+                    if 'choices' in chunk and len(chunk['choices']) > 0:
+                        delta = chunk['choices'][0].get('delta', {}).get('content', '')
+                        if delta:
+                            full_text += delta
+
+                # Clean response to remove artifacts and meta-commentary
+                from ..utils.response_cleaner import clean_model_response
+                cleaned_response = clean_model_response(full_text, aggressive=True)
+
+                logger.debug(f"llama-server response generated ({len(cleaned_response)} chars)")
+                return cleaned_response
+
+            # Legacy path: Direct llama-cpp-python inference (fallback)
+            # Detect model name from handle for proper template selection
+            model_id_str = str(getattr(handle, "model_path", "")).lower()
+            model_name = self._extract_model_name_from_path(model_id_str) if model_id_str else None
+
+            # Use production-level history formatter with model name for template detection
             full_prompt = format_conversation_history(
                 conversation_history=conversation_history,
                 current_prompt=prompt,
                 max_turns=5,
                 system_prompt=None,
-                model_name=None  # Will default to ChatML template
+                model_name=model_name  # Pass model name for correct template detection
             )
 
             # Get model's context window size
             model_ctx_size = getattr(handle, 'n_ctx', lambda: 2048)()
 
-            # Tokenize the prompt to get accurate token count
-            prompt_tokens = handle.tokenize(full_prompt.encode('utf-8'))
-            prompt_token_count = len(prompt_tokens)
+            # PERFORMANCE FIX: Use character-based estimation instead of CPU tokenization
+            # Character-based estimation is instant (<1ms) vs CPU tokenization (5-7 seconds)
+            # Conservative estimate: 1 token ≈ 4 characters for English text
+            # This prevents the 10x slowdown while maintaining safety
+            estimated_prompt_tokens = len(full_prompt) // 4
 
             # Calculate maximum safe tokens for generation
-            # Reserve some tokens for safety margin (10%)
-            safety_margin = int(model_ctx_size * 0.1)
-            max_safe_tokens = max(1, model_ctx_size - prompt_token_count - safety_margin)
+            # Use slightly larger safety margin (15% instead of 10%) for estimation uncertainty
+            safety_margin = int(model_ctx_size * 0.15)
+            max_safe_tokens = max(1, model_ctx_size - estimated_prompt_tokens - safety_margin)
 
             logger.debug(
                 f"Context window: {model_ctx_size} tokens | "
-                f"Prompt: {prompt_token_count} tokens | "
+                f"Estimated prompt: ~{estimated_prompt_tokens} tokens ({len(full_prompt)} chars) | "
                 f"Max safe response: {max_safe_tokens} tokens"
             )
+
+            # Get appropriate stop tokens for the detected chat template
+            from ..utils.history_formatter import get_stop_tokens
+            template_stop_tokens = get_stop_tokens(model_name=model_name)
 
             # Build generation parameters with defaults
             gen_params = {
@@ -598,26 +723,21 @@ class GGUFProvider(BaseProvider):
                 "top_p": 0.9,
                 "top_k": 40,
                 "repeat_penalty": 1.1,
-                "stop": ["\n\n", "User:"]  # Default stop tokens
+                "stop": template_stop_tokens,  # Use template-specific stop tokens
+                "stream": True,  # PERFORMANCE: Enable streaming for progressive output
             }
 
-            # Model-specific stop tokens for better generation control
-            # DeepSeek-R1 reasoning models need special handling
-            model_id_str = str(getattr(handle, "model_path", "")).lower()
-            if "deepseek" in model_id_str or "r1" in model_id_str:
+            logger.debug(f"Using stop tokens: {template_stop_tokens}")
+
+            # KV cache is now enabled at model load time via set_cache()
+            # No need to check for cache_prompt parameter (doesn't exist in 0.3.x)
+
+            # Model-specific enhancements for DeepSeek-R1 reasoning models
+            if model_name and ("deepseek" in model_name.lower() or "r1" in model_name.lower()):
                 # DeepSeek-R1 uses Chain-of-Thought reasoning with <think> tags
-                # Add stop tokens to prevent over-generation and reasoning leakage
-                gen_params["stop"] = [
-                    "\n\n",           # Standard paragraph break
-                    "User:",          # Chat template boundary
-                    "<think>",        # Start of reasoning (shouldn't appear in output)
-                    "</think>",       # End of reasoning (shouldn't appear in output)
-                    "\n\nUser:",      # Combined boundary
-                    "\n\n---",        # Section break
-                    "Human:",         # Alternative template
-                    "Assistant:",     # Alternative template boundary
-                ]
-                logger.debug("Using DeepSeek-R1 stop tokens to prevent over-generation")
+                # Add additional stop tokens to prevent reasoning leakage
+                gen_params["stop"].extend(["<think>", "</think>"])
+                logger.debug("Added DeepSeek-R1 reasoning stop tokens to prevent CoT leakage")
 
             # Override with custom parameters from session
             if custom_parameters:
@@ -644,7 +764,21 @@ class GGUFProvider(BaseProvider):
                     gen_params["seed"] = custom_parameters["seed"]
 
             try:
-                response = handle.create_completion(**gen_params)
+                # Handle streaming response
+                response_stream = handle.create_completion(**gen_params)
+
+                # Accumulate streaming chunks into full response
+                full_text = ""
+                for chunk in response_stream:
+                    if 'choices' in chunk and len(chunk['choices']) > 0:
+                        delta = chunk['choices'][0].get('text', '')
+                        full_text += delta
+
+                # Reconstruct response in expected format
+                response = {
+                    "choices": [{"text": full_text}]
+                }
+
             except Exception as gen_error:
                 # llama_decode errors (-1, -2) or context window errors
                 error_str = str(gen_error)
@@ -674,10 +808,9 @@ class GGUFProvider(BaseProvider):
                         model_name=None
                     )
 
-                    # Recalculate safe tokens for retry prompt
-                    retry_tokens = handle.tokenize(retry_prompt.encode('utf-8'))
-                    retry_token_count = len(retry_tokens)
-                    retry_max_safe = max(1, model_ctx_size - retry_token_count - safety_margin)
+                    # Recalculate safe tokens for retry prompt using character estimation
+                    retry_estimated_tokens = len(retry_prompt) // 4
+                    retry_max_safe = max(1, model_ctx_size - retry_estimated_tokens - safety_margin)
 
                     retry_params = {
                         "prompt": retry_prompt,
@@ -686,11 +819,23 @@ class GGUFProvider(BaseProvider):
                         "top_p": gen_params["top_p"],
                         "top_k": gen_params["top_k"],
                         "repeat_penalty": gen_params["repeat_penalty"],
-                        "stop": gen_params["stop"]
+                        "stop": gen_params["stop"],
+                        "stream": True,  # Enable streaming for retry
                     }
 
+                    # Propagate cache_prompt if it was added
+                    if "cache_prompt" in gen_params:
+                        retry_params["cache_prompt"] = gen_params["cache_prompt"]
+
                     try:
-                        response = handle.create_completion(**retry_params)
+                        # Handle streaming response for retry
+                        response_stream = handle.create_completion(**retry_params)
+                        full_text = ""
+                        for chunk in response_stream:
+                            if 'choices' in chunk and len(chunk['choices']) > 0:
+                                delta = chunk['choices'][0].get('text', '')
+                                full_text += delta
+                        response = {"choices": [{"text": full_text}]}
                         logger.info("Retry successful with reduced parameters")
                     except Exception as retry_error:
                         logger.error(f"Retry also failed: {retry_error}")

@@ -328,6 +328,12 @@ def _run_foreground_benchmark(runner: "BenchmarkRunner", config: "BenchmarkConfi
     # Clear screen completely - no previous steps visible
     tui.clear_screen()
 
+    # Get terminal width for separator lines
+    terminal_width = tui.console.width
+
+    # Import display name helper
+    from ..benchmarking.cli.benchmark_screens import _extract_model_display_name
+
     # Show concise configuration summary at the top
     tui.show_step_heading("Running Benchmark")
 
@@ -339,7 +345,7 @@ def _run_foreground_benchmark(runner: "BenchmarkRunner", config: "BenchmarkConfi
     summary_table.add_row("Suite:", config.suite_type.display_name())
     summary_table.add_row("Model Type:", config.model_type.value.upper())
     summary_table.add_row("Models:", f"{len(config.models)} model(s)")
-    summary_table.add_row("Models List:", ", ".join([m[:30] + "..." if len(m) > 30 else m for m in config.models]))
+    summary_table.add_row("Models List:", ", ".join([_extract_model_display_name(m)[:30] + "..." if len(_extract_model_display_name(m)) > 30 else _extract_model_display_name(m) for m in config.models]))
     summary_table.add_row("Runs per model:", f"{config.num_runs} ({config.num_warmup} warmup)")
     summary_table.add_row("Export formats:", ", ".join(config.export_formats))
 
@@ -405,7 +411,8 @@ def _run_foreground_benchmark(runner: "BenchmarkRunner", config: "BenchmarkConfi
             run_tracker["warmup_runs"] = 0
 
             tui.console.print()
-            tui.console.print(f"[bold magenta]📊 Model:[/bold magenta] [cyan]{model_name}[/cyan]")
+            display_name = _extract_model_display_name(model_name)
+            tui.console.print(f"[bold magenta]📊 Model:[/bold magenta] [cyan]{display_name}[/cyan]")
 
         # Check for warmup start
         elif "warmup runs" in message.lower() and "Running" in message:

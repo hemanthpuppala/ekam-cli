@@ -51,9 +51,9 @@ class ArchitectureRegistry:
         # Windows-specific issues
         "bitsandbytes": {
             "requires": [],
-            "incompatible_with": ["windows"],  # No official Windows support
+            "incompatible_with": ["windows_cpu"],  # Experimental Windows support with CUDA
             "optional": True,
-            "fallback_message": "Quantization unavailable on Windows"
+            "fallback_message": "Quantization requires CUDA GPU on Windows"
         },
     }
 

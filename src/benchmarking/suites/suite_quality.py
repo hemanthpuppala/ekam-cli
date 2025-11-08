@@ -149,14 +149,21 @@ class QualitySuite(BaseSuite):
                     for endpoint in config.endpoints.get(model_id, []):
                         logger.info(f"  Endpoint: {endpoint}")
 
-                        # For quality, we run the same prompt multiple times
+                        # For quality, we run the same prompt multiple times (outputs_per_prompt)
+                        # 1 prompt = multiple runs for consistency testing
                         for prompt_idx, prompt in enumerate(test_prompts):
                             logger.info(f"  Testing prompt {prompt_idx + 1}/{len(test_prompts)}: '{prompt[:50]}...'")
 
-                            # Get image path for VLMs (use first image for consistency testing)
+                            # Get image path for VLMs - 1:1 mapping with prompts
                             if config.model_type == ModelType.VLM:
                                 images = config.test_data.get("images", [])
-                                image_path = images[prompt_idx % len(images)] if images else "-"
+                                if images and prompt_idx < len(images):
+                                    image_path = images[prompt_idx]
+                                elif images:
+                                    # Fallback to cycling if more prompts than images
+                                    image_path = images[prompt_idx % len(images)]
+                                else:
+                                    image_path = "-"
                             else:
                                 image_path = "-"
 
@@ -319,7 +326,10 @@ class QualitySuite(BaseSuite):
                     "image_path": input_image_path
                 }
 
-            # Execute inference
+            # Execute inference with latency tracking
+            import time
+            start_time = time.perf_counter()
+
             result = self.executor.execute(
                 model_type=config.model_type,
                 model_id=model_id,
@@ -328,6 +338,10 @@ class QualitySuite(BaseSuite):
                 parameters=config.parameters,
                 timeout=suite_config.timeout_seconds
             )
+
+            # Calculate latency
+            end_time = time.perf_counter()
+            latency_ms = (end_time - start_time) * 1000
 
             # Post-run cleanup
             MemoryOptimizer.aggressive_cleanup()
@@ -341,6 +355,18 @@ class QualitySuite(BaseSuite):
                 "input_image_path": input_image_path,
                 "raw_response": output
             }
+
+            # Record inference latency (consistent with other suites)
+            self._record_metric(
+                name="latency_ms",
+                value=latency_ms,
+                unit=MetricUnit.MILLISECONDS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup,
+                metadata=run_metadata
+            )
 
             # Record output length for reference
             output_length = len(output)

@@ -3,7 +3,7 @@
 import gc
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from loguru import logger
 
@@ -12,6 +12,7 @@ from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..models.system import SystemSpecs
+from ..services.llama_server_manager import LlamaServerManager
 from .base import BaseProvider
 
 
@@ -38,7 +39,11 @@ class QuantizedProvider(BaseProvider):
         self.metadata_cache = ModelMetadataCache()
         logger.debug("Initialized model metadata cache")
 
-        logger.info(f"QuantizedProvider initialized: {self.quantized_dir}")
+        # llama-server instances for GGUF models (enables GPU acceleration + KV cache reuse)
+        self.llama_servers: Dict[str, Any] = {}  # model_path -> LlamaServerManager
+        self.use_llama_server = True  # Always use server for GGUF models (GPU + cache)
+
+        logger.info(f"QuantizedProvider initialized: {self.quantized_dir} (llama-server mode: ON)")
 
     def _cleanup_memory(self, device: str):
         """Clean up memory before CPU fallback to maximize available RAM.
@@ -595,35 +600,77 @@ class QuantizedProvider(BaseProvider):
             raise ValueError(f"Unknown quantized model format: {model_format}")
 
     def _load_gguf_model(self, model_path: Path, device: str) -> Any:
-        """Load GGUF quantized model using llama-cpp-python.
+        """Load GGUF quantized model using llama-server for GPU acceleration.
+
+        Uses llama-server instead of direct llama-cpp-python loading to enable:
+        - Full GPU utilization (matches llama.cpp WebUI performance)
+        - Persistent KV cache across conversation turns
+        - 40+ tokens/s performance on follow-up messages
 
         Args:
             model_path: Path to .gguf file
             device: Target device ("cuda", "mps", or "cpu")
 
         Returns:
-            Llama model instance
+            LlamaServerManager instance (acts as model handle)
         """
         try:
-            from llama_cpp import Llama
+            logger.info(f"Loading GGUF model with llama-server: {model_path}")
 
-            logger.info(f"Loading GGUF model: {model_path}")
+            # Check if server already running for this model
+            model_key = str(model_path)
+            if model_key in self.llama_servers:
+                server = self.llama_servers[model_key]
+                if server.is_running():
+                    logger.info(f"Reusing existing llama-server for {model_path.name}")
+                    return server
 
             # Determine GPU layers based on device
             n_gpu_layers = -1 if device in ["cuda", "mps"] else 0
 
-            model = Llama(
+            # PERFORMANCE: Use optimized thread count (physical cores, capped at 8)
+            physical_cores = self.system_specs.cpu_cores_physical
+            optimal_threads = min(physical_cores, 8)
+            optimal_threads_batch = self.system_specs.cpu_cores_physical
+
+            # Find available port
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', 0))
+                port = s.getsockname()[1]
+
+            # Create and start llama-server
+            server = LlamaServerManager(
                 model_path=str(model_path),
-                n_gpu_layers=n_gpu_layers,
-                n_ctx=2048,
-                verbose=False,
+                host="127.0.0.1",
+                port=port,
             )
 
-            logger.info(f"GGUF model loaded successfully on {device}")
-            return model
+            success = server.start(
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=4096,
+                n_batch=2048,
+                n_ubatch=512,
+                n_threads=optimal_threads,
+                n_threads_batch=optimal_threads_batch,
+            )
 
-        except ImportError:
-            raise ImportError("llama-cpp-python not installed. Run: pip install llama-cpp-python")
+            if not success:
+                raise RuntimeError(f"Failed to start llama-server for {model_path}")
+
+            # Store server instance
+            self.llama_servers[model_key] = server
+
+            logger.info(
+                f"✓ llama-server started on port {port} "
+                f"(GPU layers={n_gpu_layers}, threads={optimal_threads}, "
+                f"ctx=4096, batch=2048, KV cache=GPU VRAM)"
+            )
+            return server
+
+        except Exception as e:
+            logger.error(f"Failed to start llama-server: {e}")
+            raise RuntimeError(f"Failed to load GGUF model via server: {e}")
 
     def _load_hf_model(self, model_path: Path, device: str) -> Any:
         """Load HuggingFace format quantized model (LLM or VLM).
@@ -637,9 +684,10 @@ class QuantizedProvider(BaseProvider):
         Returns:
             Tuple of (model, processor/tokenizer, metadata) where metadata contains model type info
         """
-        # Check if this is an MLX-quantized model
+        # DYNAMIC ROUTING: Read quantization metadata to determine inference method
         metadata_file = model_path / "quantization_metadata.json"
-        is_mlx = False
+        module = None
+        quant_type = None
         is_vlm = False
 
         if metadata_file.exists():
@@ -647,25 +695,46 @@ class QuantizedProvider(BaseProvider):
                 import json
                 with open(metadata_file) as f:
                     metadata = json.load(f)
-                    module = metadata.get("module", "")
+                    module = metadata.get("module", "").lower()
+                    quant_type = metadata.get("quant_type", "unknown")
+                    original_model = metadata.get("original_model", "unknown")
 
-                    if module == "mlx":
-                        is_mlx = True
-                        original_model = metadata.get("original_model", "unknown")
-                        # Detect VLM from original model name or provider info
-                        is_vlm = "VL" in original_model or "vision" in original_model.lower()
+                    # Detect VLM from original model name or provider info
+                    is_vlm = "VL" in original_model or "vision" in original_model.lower()
 
-                        logger.info(f"Detected MLX {'VLM' if is_vlm else 'LLM'} model: {model_path.name}")
+                    logger.info(
+                        f"Quantization metadata: module={module}, "
+                        f"quant_type={quant_type}, is_vlm={is_vlm}"
+                    )
 
             except json.JSONDecodeError as e:
                 logger.warning(f"Could not parse quantization metadata: {e}")
             except Exception as e:
-                logger.debug(f"Error checking quantization metadata: {e}")
-
-        # Route to appropriate loader
-        if is_mlx:
-            return self._load_mlx_model(model_path, is_vlm, device)
+                logger.debug(f"Error reading quantization metadata: {e}")
         else:
+            logger.warning(f"No quantization_metadata.json found for {model_path.name}")
+            logger.info("Will attempt to detect inference method from config.json")
+
+        # Route based on module (dynamic dispatch)
+        if module == "mlx":
+            logger.info(f"Routing to MLX inference for {quant_type} model")
+            return self._load_mlx_model(model_path, is_vlm, device)
+        elif module in ["bnb", "bitsandbytes"]:
+            logger.info(f"Routing to HuggingFace transformers (BitsAndBytes {quant_type})")
+            return self._load_transformers_model(model_path, device)
+        elif module == "gptq":
+            logger.info(f"Routing to HuggingFace transformers (GPTQ {quant_type})")
+            return self._load_transformers_model(model_path, device)
+        elif module == "awq":
+            logger.info(f"Routing to HuggingFace transformers (AWQ {quant_type})")
+            return self._load_transformers_model(model_path, device)
+        elif module in ["generic", "transformers"]:
+            logger.info(f"Routing to HuggingFace transformers (Generic {quant_type})")
+            return self._load_transformers_model(model_path, device)
+        else:
+            # Fallback: No metadata or unknown module
+            logger.info(f"Unknown/missing module ({module}), defaulting to HuggingFace transformers")
+            logger.info("Transformers will auto-detect quantization from config.json")
             return self._load_transformers_model(model_path, device)
 
     def _load_mlx_model(self, model_path: Path, is_vlm: bool, device: str) -> Any:
@@ -1382,11 +1451,18 @@ class QuantizedProvider(BaseProvider):
         """Unload model and free resources.
 
         Args:
-            model_handle: Model instance (can be tuple of (model, processor) or single model)
+            model_handle: Model instance (LlamaServerManager, tuple of (model, processor), or single model)
         """
-        # GGUF models (llama-cpp-python) handle cleanup automatically
-        # HF models need manual cleanup
         try:
+            # Stop llama-server if this is a server instance
+            if isinstance(model_handle, LlamaServerManager):
+                model_key = str(model_handle.model_path)
+                if model_key in self.llama_servers:
+                    model_handle.stop()
+                    del self.llama_servers[model_key]
+                    logger.info(f"llama-server stopped for {model_handle.model_path.name}")
+                return
+
             # Handle tuple (model, processor/tokenizer)
             if isinstance(model_handle, tuple):
                 model, _ = model_handle
@@ -1398,14 +1474,14 @@ class QuantizedProvider(BaseProvider):
                 if hasattr(model_handle, "cpu"):
                     model_handle.cpu()
                 del model_handle
-            
+
             # Clear GPU cache if available
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             elif torch.backends.mps.is_available():
                 torch.mps.empty_cache()
-            
+
             logger.info("Quantized model unloaded")
         except Exception as e:
             logger.warning(f"Error during model unload: {e}")
@@ -1916,7 +1992,8 @@ class QuantizedProvider(BaseProvider):
         max_tokens: int,
         temperature: float,
         top_p: float,
-        repetition_penalty: float
+        repetition_penalty: float,
+        stream_callback: Optional[callable] = None
     ) -> str:
         """Run text generation using HuggingFace transformers.
 
@@ -1929,6 +2006,7 @@ class QuantizedProvider(BaseProvider):
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
             repetition_penalty: Repetition penalty
+            stream_callback: Optional callback for streaming tokens (for timing metrics)
 
         Returns:
             Generated text
@@ -2018,27 +2096,50 @@ class QuantizedProvider(BaseProvider):
         logger.debug(f"Generation kwargs: {gen_kwargs}")
 
         try:
-            with torch.no_grad():
-                outputs = model.generate(**inputs, **gen_kwargs)
+            # Use streaming if callback is provided (for timing metrics)
+            if stream_callback:
+                from transformers import TextIteratorStreamer
+                from threading import Thread
 
-            logger.debug(f"Generation complete. Output shape: {outputs.shape if outputs is not None else 'None'}")
+                streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True)
+                gen_kwargs["streamer"] = streamer
 
-            if outputs is None:
-                raise RuntimeError("model.generate() returned None")
+                # Run generation in background thread
+                generation_thread = Thread(target=model.generate, kwargs={**inputs, **gen_kwargs})
+                generation_thread.start()
+
+                # Stream tokens and invoke callback
+                response = ""
+                is_first_token = True
+                for new_text in streamer:
+                    response += new_text
+                    stream_callback(new_text, is_first=is_first_token)
+                    is_first_token = False
+
+                generation_thread.join()
+            else:
+                # Non-streaming generation
+                with torch.no_grad():
+                    outputs = model.generate(**inputs, **gen_kwargs)
+
+                logger.debug(f"Generation complete. Output shape: {outputs.shape if outputs is not None else 'None'}")
+
+                if outputs is None:
+                    raise RuntimeError("model.generate() returned None")
+
+                # Decode only new tokens
+                input_length = inputs["input_ids"].shape[1]
+                generated_tokens = outputs[0][input_length:]
+
+                if generated_tokens is None or len(generated_tokens) == 0:
+                    logger.warning("No tokens were generated")
+                    return "I don't have a response."
+
+                response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
         except Exception as gen_error:
             logger.error(f"Generation failed: {gen_error}", exc_info=True)
             raise RuntimeError(f"Model generation failed: {gen_error}")
-
-        # Decode only new tokens
-        input_length = inputs["input_ids"].shape[1]
-        generated_tokens = outputs[0][input_length:]
-
-        if generated_tokens is None or len(generated_tokens) == 0:
-            logger.warning("No tokens were generated")
-            return "I don't have a response."
-
-        response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
         # Clean response
         from ..utils.response_cleaner import clean_model_response
@@ -2175,6 +2276,8 @@ class QuantizedProvider(BaseProvider):
         frequency_penalty = 0.0
         presence_penalty = 0.0
 
+        # Extract streaming callback for timing metrics (if provided by benchmark suite)
+        stream_callback = None
         if custom_parameters:
             max_tokens = custom_parameters.get("max_tokens", max_tokens)
             temperature = custom_parameters.get("temperature", temperature)
@@ -2182,6 +2285,7 @@ class QuantizedProvider(BaseProvider):
             repetition_penalty = custom_parameters.get("repetition_penalty", repetition_penalty)
             frequency_penalty = custom_parameters.get("frequency_penalty", frequency_penalty)
             presence_penalty = custom_parameters.get("presence_penalty", presence_penalty)
+            stream_callback = custom_parameters.get("_stream_callback")
 
         # Check if this is a 3-tuple (new format with metadata)
         if isinstance(model_handle, tuple) and len(model_handle) == 3:
@@ -2197,7 +2301,8 @@ class QuantizedProvider(BaseProvider):
             else:
                 return self._run_text_transformers(
                     model, tokenizer, prompt, conversation_history,
-                    max_tokens, temperature, top_p, repetition_penalty
+                    max_tokens, temperature, top_p, repetition_penalty,
+                    stream_callback
                 )
 
         # Backward compatibility: 2-tuple format (legacy)
@@ -2318,42 +2423,49 @@ class QuantizedProvider(BaseProvider):
             
             return response if response else "I don't have a response."
         
-        elif hasattr(model_handle, "__call__"):
-            # llama-cpp-python Llama model (GGUF)
-            # Format conversation history if provided
-            if conversation_history:
-                # Use SIMPLE template with explicit system prompt for conversation context
-                from ..utils.history_formatter import format_conversation_history, ChatTemplate
+        elif isinstance(model_handle, LlamaServerManager):
+            # llama-server (GGUF via HTTP API for GPU acceleration + KV cache reuse)
+            # Extract model name from server's model path
+            model_path_str = str(model_handle.model_path).lower()
 
-                # Add system prompt - clear and balanced for all model types
-                system_prompt = (
-                    "You are a helpful AI assistant. Provide clear, direct answers to the user's questions. "
-                    "Keep responses focused and relevant to what was asked."
-                )
-
-                formatted_prompt = format_conversation_history(
-                    conversation_history,
-                    prompt,
-                    max_turns=5,
-                    system_prompt=system_prompt,
-                    template=ChatTemplate.SIMPLE
-                )
-            else:
-                # For simple prompts without history, use clear instruction format
-                formatted_prompt = (
-                    "You are a helpful AI assistant. Provide clear, direct answers.\n\n"
-                    f"User: {prompt}\nAssistant:"
-                )
-
-            # Define stop tokens to prevent template leakage and repetition
-            # Be careful not to interfere with ongoing generation
-            stop_tokens = [
-                "\n\nUser:",          # Stop before next user turn (with double newline)
-                "\n\nHuman:",         # Alternative role marker
-                "\n### Instruction:", # Stop at new instruction blocks
-                "<|im_end|>",        # ChatML end token
-                "<|endoftext|>",     # Common end token
+            # Extract model name from path for template detection
+            from pathlib import Path
+            filename = Path(model_path_str).stem
+            # Remove quantization suffixes
+            quant_patterns = [
+                "_q2_k", "_q3_k_s", "_q3_k_m", "_q3_k_l",
+                "_q4_0", "_q4_1", "_q4_k_s", "_q4_k_m",
+                "_q5_0", "_q5_1", "_q5_k_s", "_q5_k_m",
+                "_q6_k", "_q8_0", "_f16", "_f32"
             ]
+            model_name = filename.lower()
+            for pattern in quant_patterns:
+                model_name = model_name.replace(pattern, "")
+            logger.debug(f"Extracted model name for template detection: {model_name}")
+
+            # Convert conversation history to messages format
+            messages = []
+
+            # System message
+            messages.append({
+                "role": "system",
+                "content": "You are a helpful AI assistant. Provide clear, accurate, and concise responses."
+            })
+
+            # Add conversation history
+            if conversation_history:
+                recent_history = conversation_history[-5:]  # Last 5 turns
+                for user_msg, ai_response in recent_history:
+                    messages.append({"role": "user", "content": user_msg})
+                    messages.append({"role": "assistant", "content": ai_response})
+
+            # Add current user message
+            messages.append({"role": "user", "content": prompt})
+
+            # Use template-specific stop tokens
+            from ..utils.history_formatter import get_stop_tokens
+            stop_tokens = get_stop_tokens(model_name=model_name)
+            logger.debug(f"Using template-specific stop tokens for GGUF server: {stop_tokens}")
 
             # Allow custom stop tokens from parameters
             if custom_parameters and "stop" in custom_parameters:
@@ -2363,17 +2475,50 @@ class QuantizedProvider(BaseProvider):
                 elif isinstance(custom_stop, str):
                     stop_tokens.append(custom_stop)
 
-            response = model_handle(
-                formatted_prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repeat_penalty=repetition_penalty,
-                frequency_penalty=frequency_penalty,
-                presence_penalty=presence_penalty,
-                stop=stop_tokens,
-                echo=False,
-            )
+            try:
+                # Use llama-server's chat completion API (GPU + KV cache reuse!)
+                response_stream = model_handle.chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=stop_tokens,
+                    stream=True,
+                )
+
+                # Accumulate streaming chunks into full response
+                full_text = ""
+                is_first_token = True
+                for chunk in response_stream:
+                    if 'choices' in chunk and len(chunk['choices']) > 0:
+                        delta_obj = chunk['choices'][0].get('delta', {})
+                        delta = delta_obj.get('content', '')
+                        if delta:
+                            full_text += delta
+                            # Invoke streaming callback for timing metrics (TTFT, ITL)
+                            if stream_callback:
+                                stream_callback(delta, is_first=is_first_token)
+                                is_first_token = False
+
+                response = {"choices": [{"text": full_text}]}
+
+            except Exception as gen_error:
+                logger.error(f"llama-server streaming failed: {gen_error}")
+                # Fallback to non-streaming
+                try:
+                    response_data = model_handle.chat_completion(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop_tokens,
+                        stream=False,
+                    )
+                    message = response_data['choices'][0].get('message', {})
+                    response = {"choices": [{"text": message.get('content', '')}]}
+                except Exception as e:
+                    logger.error(f"llama-server inference failed: {e}")
+                    raise
 
             # Extract and clean the response text using shared utility
             from ..utils.response_cleaner import clean_model_response

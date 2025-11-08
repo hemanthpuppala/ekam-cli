@@ -121,37 +121,38 @@ class ResourcesSuite(BaseSuite):
                     for endpoint in config.endpoints.get(model_id, []):
                         logger.info(f"  Endpoint: {endpoint}")
 
-                        # Warmup runs
+                        # Warmup runs - always use first prompt
                         if suite_config.num_warmup > 0:
                             logger.info(f"  Running {suite_config.num_warmup} warmup runs...")
                             self._emit_progress(f"Running {suite_config.num_warmup} warmup runs...")
                             self._progress_update_phase(ProgressPhase.WARMUP)
+                            warmup_prompt = test_prompts[0]  # Always use first prompt for warmup
                             for warmup_num in range(1, suite_config.num_warmup + 1):
                                 self._progress_update_run(warmup_num, is_warmup=True)
-                                prompt = test_prompts[warmup_num % len(test_prompts)]
                                 self._execute_resource_run(
                                     model_id=model_id,
                                     endpoint=endpoint,
-                                    prompt=prompt,
+                                    prompt=warmup_prompt,
                                     run_number=warmup_num,
                                     is_warmup=True,
                                     config=config,
                                     suite_config=suite_config
                                 )
 
-                        # Counted runs
-                        logger.info(f"  Running {suite_config.num_runs} benchmark runs...")
+                        # Counted runs - 1 prompt = 1 run paradigm
+                        # Each prompt is run exactly once (no cycling)
+                        num_prompts = len(test_prompts)
+                        logger.info(f"  Running {num_prompts} benchmark runs (1 prompt = 1 run)...")
                         self._progress_update_phase(ProgressPhase.RUNNING)
-                        for run_num in range(1, suite_config.num_runs + 1):
+                        for prompt_idx, prompt in enumerate(test_prompts, 1):
                             total_runs_attempted += 1
-                            self._progress_update_run(run_num, is_warmup=False)
-                            prompt = test_prompts[run_num % len(test_prompts)]
+                            self._progress_update_run(prompt_idx, is_warmup=False)
 
                             success = self._execute_resource_run(
                                 model_id=model_id,
                                 endpoint=endpoint,
                                 prompt=prompt,
-                                run_number=run_num,
+                                run_number=prompt_idx,
                                 is_warmup=False,
                                 config=config,
                                 suite_config=suite_config
@@ -276,14 +277,24 @@ class ResourcesSuite(BaseSuite):
                     logger.warning("No images provided for VLM benchmark")
                     return False
 
-                input_image_path = images[run_number % len(images)]
+                # 1 prompt = 1 run paradigm: use corresponding image (no cycling)
+                image_idx = run_number - 1
+                if image_idx < len(images):
+                    input_image_path = images[image_idx]
+                else:
+                    # Fallback if more runs than images
+                    input_image_path = images[image_idx % len(images)]
+
                 input_data = {
                     "prompt": prompt,
                     "image_path": input_image_path
                 }
 
-            # Execute with system monitoring
+            # Execute with system monitoring and latency tracking
             # The system monitor wrapper automatically records resource metrics
+            import time
+            start_time = time.perf_counter()
+
             with self.system_monitor.track_inference(
                 model_id=model_id,
                 endpoint=endpoint,
@@ -299,6 +310,10 @@ class ResourcesSuite(BaseSuite):
                     timeout=suite_config.timeout_seconds
                 )
 
+            # Calculate and record latency
+            end_time = time.perf_counter()
+            latency_ms = (end_time - start_time) * 1000
+
             # Post-run cleanup
             MemoryOptimizer.aggressive_cleanup()
 
@@ -311,6 +326,18 @@ class ResourcesSuite(BaseSuite):
                 "input_image_path": input_image_path,
                 "raw_response": raw_response
             }
+
+            # Record latency metric per run
+            self._record_metric(
+                name="latency_ms",
+                value=latency_ms,
+                unit=MetricUnit.MILLISECONDS,
+                run_number=run_number,
+                model_id=model_id,
+                endpoint=endpoint,
+                is_warmup=is_warmup,
+                metadata=run_metadata
+            )
 
             # System metrics are automatically recorded by the monitor
             # Additional metrics can be recorded here if needed

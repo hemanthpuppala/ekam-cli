@@ -91,18 +91,19 @@ class SpeedSuite(BaseSuite):
                         logger.info(f"  Endpoint: {endpoint}")
 
                         # Warmup runs - critical for discovering working inference methods
+                        # Always use the first prompt for warmup
                         warmup_success = True
                         if suite_config.num_warmup > 0:
                             logger.info(f"  Running {suite_config.num_warmup} warmup runs...")
                             self._emit_progress(f"Running {suite_config.num_warmup} warmup runs...")
                             warmup_failures = 0
 
+                            warmup_prompt = test_prompts[0]  # Always use first prompt for warmup
                             for warmup_num in range(1, suite_config.num_warmup + 1):
-                                prompt = test_prompts[warmup_num % len(test_prompts)]
                                 success, latency_ms = self._execute_speed_run(
                                     model_id=model_id,
                                     endpoint=endpoint,
-                                    prompt=prompt,
+                                    prompt=warmup_prompt,
                                     run_number=warmup_num,
                                     is_warmup=True,
                                     config=config,
@@ -135,17 +136,18 @@ class SpeedSuite(BaseSuite):
                             logger.warning(f"Skipping benchmark runs for {model_id}:{endpoint} due to warmup failure")
                             continue
 
-                        # Counted runs
-                        logger.info(f"  Running {suite_config.num_runs} benchmark runs...")
-                        for run_num in range(1, suite_config.num_runs + 1):
+                        # Counted runs - 1 prompt = 1 run paradigm
+                        # Each prompt is run exactly once (no cycling)
+                        num_prompts = len(test_prompts)
+                        logger.info(f"  Running {num_prompts} benchmark runs (1 prompt = 1 run)...")
+                        for prompt_idx, prompt in enumerate(test_prompts, 1):
                             total_runs_attempted += 1
-                            prompt = test_prompts[run_num % len(test_prompts)]
 
                             success, latency_ms = self._execute_speed_run(
                                 model_id=model_id,
                                 endpoint=endpoint,
                                 prompt=prompt,
-                                run_number=run_num,
+                                run_number=prompt_idx,
                                 is_warmup=False,
                                 config=config,
                                 suite_config=suite_config
@@ -154,7 +156,7 @@ class SpeedSuite(BaseSuite):
                             if success:
                                 total_runs_successful += 1
                                 # Emit progress with latency for each completed run
-                                self._emit_progress(f"Run {run_num}/{suite_config.num_runs} completed in {latency_ms:.2f}ms")
+                                self._emit_progress(f"Run {prompt_idx}/{num_prompts} completed in {latency_ms:.2f}ms")
 
                 finally:
                     # Unload model after all runs complete to free memory

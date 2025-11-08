@@ -1248,9 +1248,9 @@ def ask_background_mode() -> bool:
     Raises:
         UserExitException: If user wants to exit
     """
-    from src.cli.text_input import TextInput
+    from src.cli.text_input import ProfessionalPrompt
 
-    professional_prompt = TextInput()
+    professional_prompt = ProfessionalPrompt()
 
     options = [
         (False, "[green]Live Monitoring[/green]", "Watch real-time • Detailed output • Blocks operations"),

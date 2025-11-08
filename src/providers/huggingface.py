@@ -14,6 +14,7 @@ from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
+from ..models.system import SystemSpecs
 from ..utils.architecture_registry import get_architecture_registry
 from ..utils.history_formatter import format_conversation_history, format_qa_history
 from ..utils.model_method_adapter import ModelMethodAdapter
@@ -23,15 +24,19 @@ from .base import BaseProvider
 class HuggingFaceProvider(BaseProvider):
     """HuggingFace provider using transformers library."""
 
-    def __init__(self, config: ProviderConfig):
+    def __init__(self, config: ProviderConfig, system_specs: Optional['SystemSpecs'] = None):
         """Initialize HuggingFace provider.
 
         Args:
             config: Provider configuration with cache_dir and device settings
+            system_specs: System specifications for dynamic GPU/CPU detection
         """
         self.config = config
         self.cache_dir = Path(str(config.cache_dir)).expanduser()
         self.device_preference = config.device_preference or ["cuda", "mps", "cpu"]
+
+        # Store or detect system specs
+        self.system_specs = system_specs or SystemSpecs.detect()
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -47,8 +52,8 @@ class HuggingFaceProvider(BaseProvider):
         # Initialize HuggingFace authentication
         self.hf_token = self._setup_authentication()
 
-        # Determine best available device
-        self.device = self._get_best_device()
+        # Determine best available device from system specs
+        self.device = self._get_best_device_from_specs()
         logger.info(f"HuggingFace provider initialized on device: {self.device}")
 
         # Store current model reference for cleanup
@@ -100,6 +105,93 @@ class HuggingFaceProvider(BaseProvider):
                     logger.debug("Cleared MPS cache")
         except Exception as e:
             logger.debug(f"Error during model cleanup: {e}")
+
+    def _detect_quantization_from_config(self, model_path: Path) -> Optional[Any]:
+        """Detect quantization config from model's config.json.
+
+        This enables loading pre-quantized models (BNB, GPTQ, AWQ) with proper quantization support.
+
+        Args:
+            model_path: Path to model directory containing config.json
+
+        Returns:
+            Quantization config object (BitsAndBytesConfig, GPTQConfig, AwqConfig) or None
+        """
+        try:
+            config_file = model_path / "config.json"
+            if not config_file.exists():
+                return None
+
+            import json
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+
+            # Check for quantization_config in config.json
+            quant_config = config.get("quantization_config")
+            if not quant_config:
+                return None
+
+            quant_method = quant_config.get("quant_method", "").lower()
+            logger.info(f"Detected quantized model: {quant_method}")
+
+            # BitsAndBytes quantization
+            if quant_method == "bitsandbytes":
+                from transformers import BitsAndBytesConfig
+                import torch
+
+                load_in_8bit = quant_config.get("load_in_8bit", False)
+                load_in_4bit = quant_config.get("load_in_4bit", False)
+
+                if load_in_4bit:
+                    logger.info("Loading BitsAndBytes 4-bit quantized model")
+                    return BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type=quant_config.get("bnb_4bit_quant_type", "nf4"),
+                        bnb_4bit_use_double_quant=quant_config.get("bnb_4bit_use_double_quant", True),
+                        bnb_4bit_compute_dtype=torch.float16,
+                    )
+                elif load_in_8bit:
+                    logger.info("Loading BitsAndBytes 8-bit quantized model")
+                    return BitsAndBytesConfig(
+                        load_in_8bit=True,
+                        llm_int8_threshold=quant_config.get("llm_int8_threshold", 6.0),
+                        llm_int8_has_fp16_weight=quant_config.get("llm_int8_has_fp16_weight", False),
+                    )
+
+            # GPTQ quantization
+            elif quant_method == "gptq":
+                try:
+                    from transformers import GPTQConfig
+                    logger.info("Loading GPTQ quantized model")
+                    return GPTQConfig(
+                        bits=quant_config.get("bits", 4),
+                        group_size=quant_config.get("group_size", 128),
+                        desc_act=quant_config.get("desc_act", False),
+                    )
+                except ImportError:
+                    logger.warning("GPTQConfig not available, model will load without quantization")
+                    return None
+
+            # AWQ quantization
+            elif quant_method == "awq":
+                try:
+                    from transformers import AwqConfig
+                    logger.info("Loading AWQ quantized model")
+                    return AwqConfig(
+                        bits=quant_config.get("bits", 4),
+                        group_size=quant_config.get("group_size", 128),
+                        zero_point=quant_config.get("zero_point", True),
+                        version=quant_config.get("version", "gemm"),
+                    )
+                except ImportError:
+                    logger.warning("AwqConfig not available, model will load without quantization")
+                    return None
+
+        except Exception as e:
+            logger.debug(f"Could not detect quantization from config: {e}")
+            return None
+
+        return None
 
     def _move_model_to_device(self, model: Any, target_device: str) -> str:
         """Move model to target device with fallback to CPU on OOM.
@@ -319,6 +411,8 @@ class HuggingFaceProvider(BaseProvider):
     def _get_best_device(self) -> str:
         """Determine best available device from preferences.
 
+        DEPRECATED: Use _get_best_device_from_specs() instead.
+
         Returns:
             Device string ("cuda", "mps", or "cpu")
         """
@@ -327,6 +421,25 @@ class HuggingFaceProvider(BaseProvider):
                 return "cuda"
             elif device == "mps" and torch.backends.mps.is_available():
                 return "mps"
+        return "cpu"
+
+    def _get_best_device_from_specs(self) -> str:
+        """Determine best available device from system specs.
+
+        Uses cached system specifications instead of runtime checks for consistency.
+
+        Returns:
+            Device string ("cuda", "mps", or "cpu")
+        """
+        if not self.system_specs.gpu.available:
+            return "cpu"
+
+        gpu_type = self.system_specs.gpu.gpu_type
+        for device in self.device_preference:
+            if device == gpu_type:
+                return device
+
+        # Fallback to CPU if preferred device not available
         return "cpu"
 
     def discover_models(self) -> list[ModelInfo]:
@@ -885,6 +998,20 @@ class HuggingFaceProvider(BaseProvider):
                             **token_kwarg,  # Add token for private model access
                         }
 
+                        # QUANTIZATION FIX: Detect if this is a quantized model (BNB, GPTQ, AWQ)
+                        # Check if model_id is a local path to quantized model
+                        model_path = Path(model_id) if "/" not in model_id or Path(model_id).exists() else None
+                        if model_path and model_path.exists():
+                            quant_config = self._detect_quantization_from_config(model_path)
+                            if quant_config:
+                                vlm_load_kwargs["quantization_config"] = quant_config
+                                logger.info("Will load VLM with detected quantization config")
+
+                        # PERFORMANCE: Add device_map="auto" for VLMs on CUDA
+                        if self.system_specs.gpu.available and self.system_specs.gpu.gpu_type == "cuda":
+                            vlm_load_kwargs["device_map"] = "auto"
+                            logger.debug("Using device_map='auto' for VLM automatic sharding")
+
                         # 2025 OPTIMIZATION: Flash Attention 2/3 support for faster inference
                         # Reduces memory usage and improves speed (requires flash-attn package)
                         try:
@@ -927,18 +1054,24 @@ class HuggingFaceProvider(BaseProvider):
                                 error_msg += f"Last error: {str(last_error)[:300]}"
                             raise RuntimeError(error_msg)
 
-                    # Determine target device - some models have MPS compatibility issues
-                    target_device = self.device
-                    if "qwen3" in model_id.lower() and self.device == "mps":
-                        target_device = "cpu"
-                        logger.warning(
-                            f"Qwen3 has MPS compatibility issues. Using CPU instead. "
-                            f"This may be slower but will work correctly."
-                        )
+                    # Only move model to device if device_map was NOT used
+                    if "device_map" not in vlm_load_kwargs:
+                        # Determine target device - some models have MPS compatibility issues
+                        target_device = self.device
+                        if "qwen3" in model_id.lower() and self.device == "mps":
+                            target_device = "cpu"
+                            logger.warning(
+                                f"Qwen3 has MPS compatibility issues. Using CPU instead. "
+                                f"This may be slower but will work correctly."
+                            )
 
-                    # Move model to device with OOM fallback
-                    actual_device = self._move_model_to_device(model, target_device)
-                    logger.info(f"Loaded VLM model {model_id} on {actual_device}")
+                        # Move model to device with OOM fallback
+                        actual_device = self._move_model_to_device(model, target_device)
+                        logger.info(f"Loaded VLM model {model_id} on {actual_device}")
+                    else:
+                        logger.info(f"Loaded VLM model {model_id} with device_map='auto'")
+                        actual_device = "auto"
+
                     return (model, processor)
                 except Exception as e:
                     logger.warning(f"Failed to load as VLM: {e}, trying as LLM...")
@@ -1017,6 +1150,24 @@ class HuggingFaceProvider(BaseProvider):
                     **token_kwarg,  # Add token for private model access
                 }
 
+                # QUANTIZATION FIX: Detect if this is a quantized model (BNB, GPTQ, AWQ)
+                # Check if model_id is a local path to quantized model
+                model_path = Path(model_id) if "/" not in model_id or Path(model_id).exists() else None
+                if model_path and model_path.exists():
+                    quant_config = self._detect_quantization_from_config(model_path)
+                    if quant_config:
+                        load_kwargs["quantization_config"] = quant_config
+                        logger.info("Will load LLM with detected quantization config")
+
+                # PERFORMANCE: Add device_map="auto" for automatic model sharding
+                # This allows large models to be split across GPU+CPU memory efficiently
+                # Only use on CUDA (not MPS or CPU) where it's most beneficial
+                if self.system_specs.gpu.available and self.system_specs.gpu.gpu_type == "cuda":
+                    # Use device_map="auto" to automatically split model across available devices
+                    # This prevents OOM and optimizes memory usage
+                    load_kwargs["device_map"] = "auto"
+                    logger.debug("Using device_map='auto' for automatic model sharding")
+
                 # Use 'dtype' instead of deprecated 'torch_dtype'
                 if self.device == "cuda":
                     load_kwargs["torch_dtype"] = torch.float16
@@ -1064,21 +1215,28 @@ class HuggingFaceProvider(BaseProvider):
                         error_msg += f"Last error: {str(last_error)[:300]}"
                     raise RuntimeError(error_msg)
 
-            # Determine target device - some models have MPS compatibility issues
-            target_device = self.device
+            # Only move model to device if device_map was NOT used
+            # device_map="auto" already handles device placement
+            if "device_map" not in load_kwargs:
+                # Determine target device - some models have MPS compatibility issues
+                target_device = self.device
 
-            # Qwen3 has known MPS compatibility issues with torch 2.5.1
-            # Force CPU for Qwen3 on MPS devices to avoid matrix dimension errors
-            if "qwen3" in model_id.lower() and self.device == "mps":
-                target_device = "cpu"
-                logger.warning(
-                    f"Qwen3 has MPS compatibility issues. Using CPU instead. "
-                    f"This may be slower but will work correctly."
-                )
+                # Qwen3 has known MPS compatibility issues with torch 2.5.1
+                # Force CPU for Qwen3 on MPS devices to avoid matrix dimension errors
+                if "qwen3" in model_id.lower() and self.device == "mps":
+                    target_device = "cpu"
+                    logger.warning(
+                        f"Qwen3 has MPS compatibility issues. Using CPU instead. "
+                        f"This may be slower but will work correctly."
+                    )
 
-            # Move model to device with OOM fallback
-            actual_device = self._move_model_to_device(model, target_device)
-            logger.info(f"Loaded LLM model {model_id} on {actual_device}")
+                # Move model to device with OOM fallback
+                actual_device = self._move_model_to_device(model, target_device)
+                logger.info(f"Loaded LLM model {model_id} on {actual_device}")
+            else:
+                logger.info(f"Loaded LLM model {model_id} with device_map='auto'")
+                actual_device = "auto"
+
             return (model, tokenizer)
 
         except Exception as e:
@@ -1796,22 +1954,50 @@ class HuggingFaceProvider(BaseProvider):
                 logger.debug(f"  {key}: shape={tensor.shape if tensor is not None else 'None'}, "
                            f"dtype={tensor.dtype if tensor is not None else 'None'}")
 
-            # Generate with parameters
-            with torch.no_grad():
-                try:
-                    output = model.generate(**inputs, **gen_params)
-                except Exception as gen_error:
-                    logger.error(f"model.generate() failed with inputs: {list(inputs.keys())}")
-                    logger.error(f"Generation params: {list(gen_params.keys())}")
-                    import traceback
-                    logger.error(f"Full traceback:\n{traceback.format_exc()}")
-                    raise
+            # PERFORMANCE: Use streaming generation for lower latency
+            # Generate with parameters using TextIteratorStreamer
+            try:
+                from transformers import TextIteratorStreamer
+                from threading import Thread
 
-            # Decode only the new tokens (exclude input prompt)
-            input_length = inputs["input_ids"].shape[1]
-            generated_tokens = output[0][input_length:]
+                # Create streamer
+                streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
 
-            response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+                # Add streamer to generation params
+                generation_kwargs = {**inputs, **gen_params, "streamer": streamer}
+
+                # Start generation in separate thread
+                thread = Thread(target=model.generate, kwargs=generation_kwargs)
+                thread.start()
+
+                # Accumulate streamed tokens
+                response = ""
+                with torch.no_grad():
+                    for text in streamer:
+                        response += text
+
+                # Wait for thread to complete
+                thread.join()
+
+                response = response.strip()
+
+            except ImportError:
+                # Fallback to non-streaming if TextIteratorStreamer not available
+                logger.debug("TextIteratorStreamer not available, using non-streaming generation")
+                with torch.no_grad():
+                    try:
+                        output = model.generate(**inputs, **gen_params)
+                    except Exception as gen_error:
+                        logger.error(f"model.generate() failed with inputs: {list(inputs.keys())}")
+                        logger.error(f"Generation params: {list(gen_params.keys())}")
+                        import traceback
+                        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+                        raise
+
+                # Decode only the new tokens (exclude input prompt)
+                input_length = inputs["input_ids"].shape[1]
+                generated_tokens = output[0][input_length:]
+                response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
             # Clean up response - remove any remaining EOS tokens or extra whitespace
             if tokenizer.eos_token:

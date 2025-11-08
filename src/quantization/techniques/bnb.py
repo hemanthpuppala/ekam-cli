@@ -211,6 +211,50 @@ class BitsAndBytesQuantizer(BaseQuantizer):
             else:
                 raise ValueError(f"Unsupported BitsAndBytes quantization type: {task.quant_type}")
 
+            # Check memory availability (GPU + CPU offloading support)
+            if torch.cuda.is_available():
+                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                model_size_gb = task.model_info.size_gb if hasattr(task.model_info, 'size_gb') and task.model_info.size_gb else 0
+
+                # BitsAndBytes loading requires ~1.2x model size temporarily (even with 4-bit)
+                # Add 20% safety margin for loading overhead
+                required_vram_gb = model_size_gb * 1.2
+
+                # Check if CPU RAM is available for offloading when GPU VRAM is insufficient
+                if model_size_gb > 0 and required_vram_gb > gpu_memory_gb:
+                    # Get available system RAM for CPU offloading
+                    try:
+                        import psutil
+                        available_ram_gb = psutil.virtual_memory().available / (1024**3)
+
+                        # Check if we can offload to CPU (need at least the model size + 2GB buffer)
+                        if available_ram_gb >= (model_size_gb + 2.0):
+                            logger.warning(
+                                f"GPU VRAM insufficient ({gpu_memory_gb:.1f}GB < {required_vram_gb:.1f}GB needed), "
+                                f"but will use CPU offloading (Available RAM: {available_ram_gb:.1f}GB)"
+                            )
+                            logger.info("Using device_map='auto' to automatically offload layers to CPU/disk")
+                        else:
+                            error_msg = (
+                                f"Insufficient memory for BitsAndBytes quantization.\n\n"
+                                f"Model size: {model_size_gb:.1f}GB\n"
+                                f"GPU VRAM: {gpu_memory_gb:.1f}GB\n"
+                                f"Available RAM: {available_ram_gb:.1f}GB\n"
+                                f"Required: {required_vram_gb:.1f}GB (GPU) OR {model_size_gb + 2.0:.1f}GB (CPU)\n\n"
+                                f"Solutions:\n"
+                                f"1. Free up RAM (close other applications)\n"
+                                f"2. Use GGUF quantization instead (more memory efficient)\n"
+                                f"3. Use a smaller model (try models under {available_ram_gb - 2.0:.1f}GB)"
+                            )
+                            logger.error(error_msg)
+                            task.status = TaskStatus.FAILED
+                            task.error = error_msg
+                            return False
+                    except ImportError:
+                        logger.warning("psutil not available, skipping RAM check. Will attempt quantization with CPU offloading.")
+                else:
+                    logger.info(f"GPU memory check passed: {gpu_memory_gb:.1f}GB available, ~{required_vram_gb:.1f}GB needed")
+
             # Load model with quantization (suppress transformers output)
             logger.info("Loading model with BitsAndBytes quantization config...")
             if progress_callback:

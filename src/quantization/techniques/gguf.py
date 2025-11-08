@@ -57,19 +57,42 @@ class GGUFQuantizer(BaseQuantizer):
         # Check for llama.cpp CLI tools (required for HF→GGUF conversion)
         # Look for llama-quantize and convert script
         possible_quantize_paths = [
+            # macOS paths
             Path("/opt/homebrew/bin/llama-quantize"),
-            Path("/usr/local/bin/llama-quantize"),
             Path("/opt/homebrew/Cellar/llama.cpp/6730/bin/llama-quantize"),
+            Path("/usr/local/bin/llama-quantize"),
+            # Linux paths
+            Path("/usr/bin/llama-quantize"),
+            Path("/usr/local/bin/llama-quantize"),
+            # Build output directories (common for source builds)
+            Path("./llama.cpp/llama-quantize"),
+            Path("./llama.cpp/build/bin/llama-quantize"),
+            Path("./llama.cpp/build/llama-quantize"),
+            Path("./llama.cpp/bin/llama-quantize"),
+            # User home directory
             Path.home() / ".llama.cpp" / "quantize",
+            Path.home() / ".llama.cpp" / "llama-quantize",
+            Path.home() / "llama.cpp" / "llama-quantize",
+            Path.home() / "llama.cpp" / "build" / "bin" / "llama-quantize",
+            # Alternative names
             Path("./llama.cpp/quantize"),
         ]
 
         possible_convert_paths = [
+            # macOS paths
             Path("/opt/homebrew/bin/convert_hf_to_gguf.py"),
             Path("/opt/homebrew/Cellar/llama.cpp/6730/bin/convert_hf_to_gguf.py"),
             Path("/usr/local/bin/convert_hf_to_gguf.py"),
+            # Linux paths
+            Path("/usr/bin/convert_hf_to_gguf.py"),
+            Path("/usr/local/bin/convert_hf_to_gguf.py"),
+            # Build/source directories
             Path("./llama.cpp/convert_hf_to_gguf.py"),
             Path("./llama.cpp/convert-hf-to-gguf.py"),
+            Path("./llama.cpp/convert.py"),
+            # User home directory
+            Path.home() / "llama.cpp" / "convert_hf_to_gguf.py",
+            Path.home() / "llama.cpp" / "convert-hf-to-gguf.py",
         ]
 
         # Find llama-quantize
@@ -79,20 +102,27 @@ class GGUFQuantizer(BaseQuantizer):
                 logger.info(f"Found llama-quantize at {path}")
                 break
 
-        # Try to find in PATH
+        # Try to find in PATH using shutil.which (cross-platform)
         if not self.quantize_binary:
-            try:
-                result = subprocess.run(
-                    ["which", "llama-quantize"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    self.quantize_binary = Path(result.stdout.strip())
-                    logger.info(f"Found llama-quantize in PATH: {self.quantize_binary}")
-            except Exception as e:
-                logger.debug(f"Error checking for llama-quantize: {e}")
+            import shutil
+            quantize_path = shutil.which("llama-quantize")
+            if quantize_path:
+                self.quantize_binary = Path(quantize_path)
+                logger.info(f"Found llama-quantize in PATH: {self.quantize_binary}")
+            else:
+                # Fallback to 'which' command for Unix systems
+                try:
+                    result = subprocess.run(
+                        ["which", "llama-quantize"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        self.quantize_binary = Path(result.stdout.strip())
+                        logger.info(f"Found llama-quantize in PATH: {self.quantize_binary}")
+                except Exception as e:
+                    logger.debug(f"Error checking for llama-quantize: {e}")
 
         # Find convert_hf_to_gguf.py
         for path in possible_convert_paths:
@@ -101,18 +131,36 @@ class GGUFQuantizer(BaseQuantizer):
                 logger.info(f"Found convert_hf_to_gguf.py at {path}")
                 break
 
+        # Log what we found for debugging
+        logger.debug(f"llama-quantize binary: {self.quantize_binary if self.quantize_binary else 'NOT FOUND'}")
+        logger.debug(f"convert_hf_to_gguf.py script: {self.convert_script if self.convert_script else 'NOT FOUND'}")
+
         # If we have llama-quantize and convert script, we can do full workflow
         if self.quantize_binary and self.convert_script:
+            logger.info(f"✓ Full GGUF workflow available (quantize: {self.quantize_binary}, convert: {self.convert_script})")
             return True, f"Using llama.cpp tools (full HF→GGUF workflow)"
         elif self.quantize_binary:
+            logger.warning(f"⚠ Only llama-quantize found (no convert script) - can only quantize existing GGUF files")
             return True, f"Using llama-quantize (GGUF→GGUF quantization only)"
 
-        # Tools not found - provide helpful error message
+        # Tools not found - provide helpful error message with specific diagnostics
+        missing_tools = []
+        if not self.quantize_binary:
+            missing_tools.append("llama-quantize binary")
+        if not self.convert_script:
+            missing_tools.append("convert_hf_to_gguf.py script")
+
+        logger.error(f"Missing required tools: {', '.join(missing_tools)}")
+
         error_msg = (
-            "GGUF quantization requires llama.cpp tools.\n\n"
+            f"GGUF quantization requires llama.cpp tools.\n\n"
+            f"❌ Missing: {', '.join(missing_tools)}\n\n"
             "📦 Install llama.cpp:\n"
             "  macOS:  brew install llama.cpp\n"
-            "  Linux:  Build from source (https://github.com/ggml-org/llama.cpp)\n\n"
+            "  Linux:  Build from source (https://github.com/ggml-org/llama.cpp)\n"
+            "         Make sure to run 'make llama-quantize' after building\n\n"
+            "🔍 Or add llama.cpp to your PATH:\n"
+            "  export PATH=$PATH:/path/to/llama.cpp/build/bin\n\n"
             "💡 Alternative: Use Generic quantization (FP16/INT8/INT4)\n"
             "   - Works without additional tools\n"
             "   - Produces .safetensors output\n\n"

@@ -15,20 +15,91 @@ from loguru import logger
 # ============================================
 
 DEFAULT_LLM_PROMPTS: List[str] = [
-    "What is artificial intelligence?",
-    "Explain the concept of machine learning in simple terms.",
-    "Write a Python function to calculate the nth Fibonacci number.",
-    "What are the main differences between SQL and NoSQL databases?",
-    "Describe three benefits of cloud computing.",
+    # Complexity Pattern: Easy, Medium, Hard, cycling
+    # 1-Easy
+    "What is Python?",
+    # 2-Medium
+    "Explain the difference between lists and tuples in Python.",
+    # 3-Hard
+    "How does Python's Global Interpreter Lock (GIL) affect multi-threaded performance?",
+    # 4-Easy
+    "What is an API?",
+    # 5-Medium
+    "Describe how REST APIs differ from GraphQL APIs.",
+    # 6-Hard
+    "Explain the CAP theorem and its implications for distributed systems.",
+    # 7-Easy
+    "Define machine learning.",
+    # 8-Medium
+    "What are the key differences between supervised and unsupervised learning?",
+    # 9-Hard
+    "Explain the mathematical foundation of backpropagation in neural networks.",
+    # 10-Easy
+    "What is a database?",
+    # 11-Medium
+    "Compare SQL and NoSQL databases in terms of use cases.",
+    # 12-Hard
+    "Describe database normalization and denormalization trade-offs in OLTP vs OLAP systems.",
+    # 13-Easy
+    "What is cloud computing?",
+    # 14-Medium
+    "Explain the differences between IaaS, PaaS, and SaaS.",
+    # 15-Hard
+    "How do microservices architectures handle distributed transactions and eventual consistency?",
+    # 16-Easy
+    "What is version control?",
+    # 17-Medium
+    "Explain git branching strategies for team collaboration.",
+    # 18-Hard
+    "Describe the internals of git's object storage and how it achieves deduplication.",
+    # 19-Easy
+    "What is cybersecurity?",
+    # 20-Medium
+    "Explain common web vulnerabilities like XSS and SQL injection.",
 ]
 
-# Short prompts for speed testing
+# Short prompts for speed testing (Easy/Medium/Hard pattern)
 SPEED_TEST_PROMPTS: List[str] = [
-    "What is Python?",
-    "Define recursion.",
-    "Explain HTTP.",
+    # 1-Easy
+    "Define AI.",
+    # 2-Medium
+    "Explain recursion briefly.",
+    # 3-Hard
+    "What is P vs NP?",
+    # 4-Easy
+    "What is HTTP?",
+    # 5-Medium
+    "Difference between HTTP and HTTPS?",
+    # 6-Hard
+    "How does TLS handshake work?",
+    # 7-Easy
+    "What is RAM?",
+    # 8-Medium
+    "Explain virtual memory.",
+    # 9-Hard
+    "Describe cache coherence protocols.",
+    # 10-Easy
     "What is JSON?",
-    "Define API.",
+    # 11-Medium
+    "JSON vs XML comparison.",
+    # 12-Hard
+    "Explain JSON Schema validation.",
+    # 13-Easy
+    "Define algorithm.",
+    # 14-Medium
+    "What is Big O notation?",
+    # 15-Hard
+    "Analyze quicksort time complexity.",
+    # 16-Easy
+    "What is a function?",
+    # 17-Medium
+    "Explain higher-order functions.",
+    # 18-Hard
+    "Describe function currying benefits.",
+    # 19-Easy
+    "What is encryption?",
+    # 20-Medium
+    "Symmetric vs asymmetric encryption?",
 ]
 
 # Long prompts for stress testing
@@ -46,13 +117,48 @@ STRESS_TEST_PROMPTS: List[str] = [
     "incorporate lessons from their predecessors.",
 ]
 
-# Quality test prompts (deterministic answers)
+# Quality test prompts (deterministic answers - Easy/Medium/Hard pattern)
 QUALITY_TEST_PROMPTS: List[str] = [
-    "What is 2 + 2?",
+    # 1-Easy
+    "What is 5 + 7?",
+    # 2-Medium
+    "Calculate 15 percent of 200.",
+    # 3-Hard
+    "What is the square root of 144?",
+    # 4-Easy
     "What is the capital of France?",
-    "How many days are in a week?",
-    "What is the boiling point of water in Celsius?",
-    "What year did World War II end?",
+    # 5-Medium
+    "Name the largest ocean on Earth.",
+    # 6-Hard
+    "What year did the first human land on the moon?",
+    # 7-Easy
+    "How many hours in a day?",
+    # 8-Medium
+    "How many weeks in a year?",
+    # 9-Hard
+    "How many seconds in a week?",
+    # 10-Easy
+    "What is H2O?",
+    # 11-Medium
+    "What is the atomic number of carbon?",
+    # 12-Hard
+    "What is Avogadro's number?",
+    # 13-Easy
+    "Spell 'necessary'.",
+    # 14-Medium
+    "What is the past tense of 'go'?",
+    # 15-Hard
+    "Define 'onomatopoeia'.",
+    # 16-Easy
+    "What color is the sky?",
+    # 17-Medium
+    "Name the primary colors.",
+    # 18-Hard
+    "Explain RGB color model.",
+    # 19-Easy
+    "How many continents exist?",
+    # 20-Medium
+    "Name the smallest country by area.",
 ]
 
 
@@ -60,49 +166,183 @@ QUALITY_TEST_PROMPTS: List[str] = [
 # VLM Default Prompts - By Endpoint
 # ============================================
 
-# Visual Q&A Endpoint Prompts
+# Visual Q&A Endpoint Prompts (Easy/Medium/Hard pattern)
 VLM_VISION_QA_PROMPTS: List[str] = [
-    "Describe this image in detail.",
-    "What objects can you see in this image?",
-    "What animals are in this image, and what each animal is doing?",
-    "What colors are prominent in this image?",
-    "What activity or scene is depicted in this image?",
-    "Count how many people are in this image.",
-    "Describe the setting or location shown.",
-    "What is the mood or atmosphere of this image?",
-    "Identify any brands or logos visible.",
+    # 1-Easy
+    "What is the main object in this image?",
+    # 2-Medium
+    "Describe the setting and location shown in the image.",
+    # 3-Hard
+    "Analyze the composition and visual hierarchy of elements in this image.",
+    # 4-Easy
+    "What colors are most prominent?",
+    # 5-Medium
+    "Identify the mood or atmosphere conveyed by this image.",
+    # 6-Hard
+    "What cultural or historical context can you infer from the visual elements?",
+    # 7-Easy
+    "Are there any people in this image?",
+    # 8-Medium
+    "Describe what the people in this image are doing.",
+    # 9-Hard
+    "Analyze the body language and interactions between people in this image.",
+    # 10-Easy
+    "What animals can you see?",
+    # 11-Medium
+    "Identify the species and behavior of animals present.",
+    # 12-Hard
+    "What can you deduce about the animals' habitat or environment?",
+    # 13-Easy
+    "Is this indoors or outdoors?",
+    # 14-Medium
+    "What time of day does this appear to be taken?",
+    # 15-Hard
+    "Estimate the season and weather conditions based on visual cues.",
+    # 16-Easy
+    "What text is visible?",
+    # 17-Medium
+    "Read and interpret any signs, labels, or written content.",
+    # 18-Hard
+    "What language is the text in, and what does it communicate?",
+    # 19-Easy
+    "Count how many objects are present.",
+    # 20-Medium
+    "Identify and categorize the different types of objects.",
 ]
 
 # Image Captioning Endpoint Prompts
 VLM_CAPTION_PROMPTS: List[str] = [
-    "Provide a brief caption for this image.",
-    "Write a one-sentence description of what's in this image.",
-    "Summarize the main content of this image in a few words.",
-    "Create a descriptive title for this image.",
-    "Describe the primary subject in a concise way.",
-    "What would be a good caption for this social media post?",
-    "Write a news headline for this image.",
+    # Complexity Pattern: Easy, Medium, Hard, cycling
+    # 1-Easy
+    "Describe this image.",
+    # 2-Medium
+    "Write a detailed caption explaining the scene and context.",
+    # 3-Hard
+    "Create a caption that describes the image composition, lighting, mood, and any symbolic elements.",
+    # 4-Easy
+    "What do you see?",
+    # 5-Medium
+    "Generate a social media caption with hashtags for this image.",
+    # 6-Hard
+    "Provide a professional photography critique describing technique, subject matter, and artistic choices.",
+    # 7-Easy
+    "Caption this photo.",
+    # 8-Medium
+    "Write a news headline and brief description for this image.",
+    # 9-Hard
+    "Describe the image in a way that would help a blind person understand the visual elements, spatial relationships, and atmosphere.",
+    # 10-Easy
+    "What is happening here?",
+    # 11-Medium
+    "Create an engaging caption for this image targeting a specific audience.",
+    # 12-Hard
+    "Analyze the image composition using the rule of thirds, leading lines, and color theory, then provide a caption.",
+    # 13-Easy
+    "Summarize this image.",
+    # 14-Medium
+    "Write a caption that tells a story about what might have happened before or after this moment.",
+    # 15-Hard
+    "Provide a technical description including camera settings, perspective, depth of field, and post-processing effects visible in the image.",
+    # 16-Easy
+    "Describe the scene.",
+    # 17-Medium
+    "Create a poetic caption that captures the emotion and atmosphere of this image.",
+    # 18-Hard
+    "Write a comprehensive caption analyzing the cultural context, symbolism, and potential interpretations of this image.",
+    # 19-Easy
+    "What's in this picture?",
+    # 20-Medium
+    "Generate an SEO-optimized caption with relevant keywords for this image.",
 ]
 
 # Object Detection Endpoint Prompts
 VLM_DETECT_PROMPTS: List[str] = [
-    "What objects are in the foreground?",
-    "What objects are in the background?",
-    "Identify any vehicles in the image.",
-    "Are there any animals in this image? If so, how many?",
-    "What furniture can you see?",
-    "List all the distinct objects you can identify.",
-    "What is the largest object in this image?",
+    # Complexity Pattern: Easy, Medium, Hard, cycling
+    # 1-Easy
+    "What objects do you see?",
+    # 2-Medium
+    "List all objects in the foreground and background separately.",
+    # 3-Hard
+    "Identify all objects with their positions, sizes, and spatial relationships to each other.",
+    # 4-Easy
+    "Are there any people?",
+    # 5-Medium
+    "Count and categorize all living things (people, animals, plants) in the image.",
+    # 6-Hard
+    "Detect all objects and classify them by material composition (metal, wood, fabric, etc.) and purpose.",
+    # 7-Easy
+    "What vehicles can you see?",
+    # 8-Medium
+    "Identify all transportation-related objects and their states (moving, parked, etc.).",
+    # 9-Hard
+    "Detect all mechanical and electronic devices, estimate their models, and describe their condition.",
+    # 10-Easy
+    "Is there any furniture?",
+    # 11-Medium
+    "List all furniture items with their approximate styles and materials.",
+    # 12-Hard
+    "Identify all architectural elements, furniture, and fixtures with their historical period and design influences.",
+    # 13-Easy
+    "What animals are present?",
+    # 14-Medium
+    "Detect and count all animals, identifying species and their activities.",
+    # 15-Hard
+    "Identify all biological entities with taxonomic classification, estimated age, and behavioral analysis.",
+    # 16-Easy
+    "What colors are dominant?",
+    # 17-Medium
+    "List all distinct objects with their primary and secondary colors.",
+    # 18-Hard
+    "Detect all objects, provide color palettes in hex codes, and analyze color relationships and harmony.",
+    # 19-Easy
+    "What's the main object?",
+    # 20-Medium
+    "Identify the focal point object and all supporting elements in the composition.",
 ]
 
 # Object Pointing Endpoint Prompts
 VLM_POINT_PROMPTS: List[str] = [
-    "Where is the main subject located in this image?",
-    "Point to the center of the image and describe what's there.",
-    "What is positioned in the top-left corner?",
-    "Identify the location of any people in this image.",
-    "Where are the largest objects positioned?",
-    "Describe the spatial layout of objects in this image.",
+    # Complexity Pattern: Easy, Medium, Hard, cycling
+    # 1-Easy
+    "Where is the main object?",
+    # 2-Medium
+    "Identify the coordinates and size of all people in the image.",
+    # 3-Hard
+    "Provide bounding box coordinates for all objects with their relative positions using a grid system.",
+    # 4-Easy
+    "What's in the center?",
+    # 5-Medium
+    "Locate all text elements and describe their positions relative to image quadrants.",
+    # 6-Hard
+    "Map the spatial distribution of all elements using percentage-based coordinates from top-left origin.",
+    # 7-Easy
+    "Where are the people?",
+    # 8-Medium
+    "Identify the location and orientation of all faces in the image.",
+    # 9-Hard
+    "Provide precise landmark points for all human figures including head, shoulders, hands, and feet positions.",
+    # 10-Easy
+    "What's in the corner?",
+    # 11-Medium
+    "Describe the z-depth ordering of objects from foreground to background.",
+    # 12-Hard
+    "Create a spatial map showing relative distances between all objects using proportional measurements.",
+    # 13-Easy
+    "Where is the vehicle?",
+    # 14-Medium
+    "Point to all interactive elements (buttons, signs, controls) and describe their accessibility.",
+    # 15-Hard
+    "Provide a complete spatial scene graph with object relationships, proximities, and directional vectors.",
+    # 16-Easy
+    "What's at the top?",
+    # 17-Medium
+    "Identify the vanishing points and describe the perspective geometry of the scene.",
+    # 18-Hard
+    "Calculate the optical center, rule-of-thirds intersections, and golden ratio points in the composition.",
+    # 19-Easy
+    "Where's the animal?",
+    # 20-Medium
+    "Map all regions of interest using attention heatmap coordinates.",
 ]
 
 # Generic VLM prompts (fallback)
@@ -273,6 +513,30 @@ def get_prompts_for_suite(suite_type: str, model_type: str = "llm", endpoint: st
             return DEFAULT_VLM_PROMPTS
         else:
             return DEFAULT_VLM_PROMPTS
+
+
+def get_default_prompts_for_suite(suite_name: str, model_type, count: int = 20) -> List[str]:
+    """
+    Get a specific number of default prompts for a suite.
+
+    Args:
+        suite_name: Suite name ('speed', 'quality', 'stress', 'resources', 'complete')
+        model_type: ModelType enum (ModelType.LLM or ModelType.VLM)
+        count: Number of prompts to return (1-20)
+
+    Returns:
+        List of prompts (up to count items)
+    """
+    from src.benchmarking.models.metric_types import ModelType
+
+    # Convert ModelType enum to string
+    model_type_str = "llm" if model_type == ModelType.LLM else "vlm"
+
+    # Get full suite prompts list
+    all_prompts = get_prompts_for_suite(suite_name, model_type_str)
+
+    # Return first N prompts
+    return all_prompts[:min(count, len(all_prompts))]
 
 
 def get_default_config(suite_type: str) -> Dict[str, Any]:

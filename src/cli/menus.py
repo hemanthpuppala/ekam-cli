@@ -128,7 +128,7 @@ class SystemSpecsScreen:
                     content += f"\n  • Compute Capability: {gpu_info['compute_capability']}"
 
                 # Show memory with note for Apple Silicon
-                if gpu_total_gb > 0:
+                if gpu_total_gb is not None and gpu_total_gb > 0:
                     usage_pct = (gpu_used_gb / gpu_total_gb * 100)
                     content += f"\n  • Total Memory: {gpu_total_gb:.1f} GB"
                     content += f"\n  • Used Memory: {gpu_used_gb:.1f} GB ({usage_pct:.1f}%)"
@@ -137,21 +137,21 @@ class SystemSpecsScreen:
                     if specs.gpu.gpu_type.lower() == "mps":
                         content += "\n  • [dim](Unified memory, estimate based on system RAM)[/dim]"
 
-        elif gpu_total_gb > 0:
+        elif gpu_total_gb is not None and gpu_total_gb > 0:
             # Fallback to specs data if full_specs not available
             content += f"\n  • Total Memory: {gpu_total_gb:.1f} GB"
-            if gpu_used_gb > 0:
+            if gpu_used_gb is not None and gpu_used_gb > 0:
                 usage_pct = (gpu_used_gb / gpu_total_gb * 100)
                 content += f"\n  • Used Memory: {gpu_used_gb:.1f} GB ({usage_pct:.1f}%)"
 
         # Add current GPU metrics from snapshot
         if snapshot.gpus:
             for gpu in snapshot.gpus:
-                if gpu.gpu_utilization_percent > 0:
+                if gpu.gpu_utilization_percent is not None and gpu.gpu_utilization_percent > 0:
                     content += f"\n  • Current Utilization: {gpu.gpu_utilization_percent:.1f}%"
-                if gpu.power_draw_watts:
+                if gpu.power_draw_watts is not None and gpu.power_draw_watts > 0:
                     content += f"\n  • Power Draw: {gpu.power_draw_watts:.1f}W"
-                    if gpu.power_limit_watts:
+                    if gpu.power_limit_watts is not None and gpu.power_limit_watts > 0:
                         content += f" / {gpu.power_limit_watts:.1f}W"
 
         # Temperature information
@@ -552,8 +552,9 @@ class ModelSelectionMenu:
             # Apply filter
             filtered_models = ModelSelectionMenu._apply_filter(models, filter_choice)
 
-            # If filter resulted in 0 models, show error and go back
-            if not filtered_models:
+            # If filter resulted in 0 models but original list had models,
+            # show error and go back to retry with filter menu
+            if not filtered_models and models:
                 tui.show_error(
                     f"No models match the selected filter.\n\n"
                     f"Try a different filter or select 'Show ALL models'."
@@ -569,6 +570,37 @@ class ModelSelectionMenu:
 
         tui.clear_screen()
         tui.show_step_heading(f"Model Selection - {provider.upper()}")
+
+        # Handle empty model list with arrow-key wizard
+        if not filtered_models:
+            from ..cli.text_input import professional_prompt
+
+            tui.clear_screen()
+            tui.show_panel(
+                f"[yellow]No models installed for {provider.upper()}[/yellow]\n\n"
+                f"You can install a new model or navigate to other options.\n\n"
+                f"[dim]Use arrow keys to select an option below.[/dim]",
+                title=f"[bold yellow]No Models Found[/bold yellow]",
+                border_style="yellow"
+            )
+            tui.console.print()
+
+            # Build arrow-key selection options for providers with no models
+            arrow_options = [
+                ("INSTALL", "[green]Install Model[/green]", f"Install a new model for {provider.upper()}"),
+                ("BACK", "[cyan]Back[/cyan]", "Return to provider selection"),
+                ("HOME", "[magenta]Home[/magenta]", "Return to operation menu"),
+                ("QUIT", "[red]Quit[/red]", "Exit the application gracefully"),
+            ]
+
+            # Use arrow-key selection
+            choice = professional_prompt.get_arrow_selection(
+                options=arrow_options,
+                title=f"{provider.upper()} - No Models Available",
+                instructions="Use ↑/↓ arrows to navigate, Enter to select"
+            )
+
+            return choice if choice else "BACK"
 
         # Group models by type
         categorized = {}

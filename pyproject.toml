@@ -36,7 +36,16 @@ classifiers = [
 ]
 
 # Core dependencies - No version pinning, always latest
+# NOTE: Default installs CPU-only PyTorch. For CUDA support:
+#   pip uninstall torch torchvision -y
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Verify: python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 dependencies = [
+    # Core ML packages - Listed FIRST (required by gptqmodel)
+    "torch",
+    "torchvision",
+    "transformers",  # Latest with Qwen 3, LLaMA 3.x, VLMs
+
     # UI and Core utilities
     "rich",
     "prompt-toolkit",
@@ -46,11 +55,7 @@ dependencies = [
     "pyyaml",
     "psutil",
     "loguru",
-
-    # Core ML packages - Latest for all architectures
-    "torch",
-    "torchvision",
-    "transformers",  # Latest with Qwen 3, LLaMA 3.x, VLMs
+    "python-dotenv",
 
     # GGUF Quantization support (Ollama, llama.cpp compatible)
     "llama-cpp-python",
@@ -64,17 +69,11 @@ dependencies = [
 
     # Advanced quantization support (GPTQ, QLoRA, GGUF, bfloat16, fp8, int8)
     "accelerate",
-    "bitsandbytes",
-    "gptqmodel",  # Latest GPTQ v2
+    # gptqmodel removed from core deps - install separately: pip install gptqmodel
 
     # Finetuning support
     "peft",
     "trl",  # Transformers Reinforcement Learning
-
-    # Apple Silicon (Mac M1/M2/M3/M4) optimization
-    "mlx",
-    "mlx-lm",
-    "mlx-vlm",
 
     # CPU Feature Detection
     "py-cpuinfo",
@@ -107,12 +106,32 @@ dev = [
     "isort",
 ]
 
+# GPTQ Quantization support (requires torch pre-installed)
+# Install AFTER main installation: pip install gptqmodel
+# WARNING: May have build issues on Windows - GGUF/bitsandbytes are alternatives
+gptq = [
+    "gptqmodel",       # Latest GPTQ v2 quantization
+]
+
+# Platform-specific: Apple Silicon (macOS M1/M2/M3/M4 only)
+# Install with: pip install -e ".[macos]"
+macos = [
+    "mlx",         # Native Metal-accelerated ML framework
+    "mlx-lm",      # MLX language model support
+    "mlx-vlm",     # MLX vision-language model support
+]
+
+# Platform-specific: Linux/WSL with CUDA
+# Install with: pip install -e ".[cuda]"
 cuda = [
+    "bitsandbytes",    # INT8 quantization (experimental on Windows)
     "flash-attn",      # High-speed attention for CUDA 11.6+/ROCm 5.3+
     "vllm",            # High-throughput LLM serving
     "nvidia-ml-py",    # NVIDIA GPU monitoring
 ]
 
+# Platform-specific: Intel optimizations
+# Install with: pip install -e ".[intel]"
 intel = [
     "openvino",
     "openvino-dev",

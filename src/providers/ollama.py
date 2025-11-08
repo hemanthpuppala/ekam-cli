@@ -13,6 +13,7 @@ from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType, Pro
 from ..models.model import ModelInfo
 from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
+from ..models.system import SystemSpecs
 from ..utils.history_formatter import format_qa_history
 from ..utils.ollama_file_locator import OllamaFileLocator
 from .base import BaseProvider
@@ -21,16 +22,20 @@ from .base import BaseProvider
 class OllamaProvider(BaseProvider):
     """Ollama provider using HTTP API."""
 
-    def __init__(self, config: ProviderConfig):
+    def __init__(self, config: ProviderConfig, system_specs: Optional['SystemSpecs'] = None):
         """Initialize Ollama provider.
 
         Args:
             config: Provider configuration with host and timeout settings
+            system_specs: System specifications for dynamic GPU/CPU detection
         """
         self.config = config
         self.base_url = str(config.host).rstrip("/")
         self.timeout = config.timeout_seconds
         self.client = httpx.Client(timeout=self.timeout)
+
+        # Store or detect system specs
+        self.system_specs = system_specs or SystemSpecs.detect()
 
         # Initialize metadata cache for efficient model inspection
         self.metadata_cache = ModelMetadataCache()
@@ -769,19 +774,38 @@ class OllamaProvider(BaseProvider):
             logger.debug(f"Using custom parameters: {custom_parameters}")
 
         # Use /api/chat endpoint (Ollama handles templates automatically)
+        # PERFORMANCE: Enable streaming for lower latency and progressive generation
         payload = {
             "model": model_id,
             "messages": messages,
-            "stream": False,
+            "stream": True,  # Enable streaming
             "options": options
         }
 
-        response = self.client.post(f"{self.base_url}/api/chat", json=payload)
-        response.raise_for_status()
-        result = response.json()
+        # Handle streaming response
+        # Note: We accumulate chunks internally to maintain backward compatibility
+        # Future enhancement: Pass chunks to display layer for progressive rendering
+        full_response = ""
 
-        # Extract assistant's response from the message
-        message_content = result.get("message", {}).get("content", "").strip()
+        with self.client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line)
+                        # Accumulate message content from each chunk
+                        if "message" in chunk and "content" in chunk["message"]:
+                            full_response += chunk["message"]["content"]
+
+                        # Check if done
+                        if chunk.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse streaming chunk: {line}")
+                        continue
+
+        message_content = full_response.strip()
 
         if not message_content:
             logger.warning(f"Empty response from {model_id}")

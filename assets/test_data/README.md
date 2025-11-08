@@ -145,3 +145,52 @@ During the benchmark configuration:
 - Check file extensions (case-sensitive on some systems)
 - Ensure images are in the `images/` subdirectory, not the endpoint root
 - Use `ls assets/test_data/visual_qa/images/` to verify images are present
+
+
+
+
+ How VLM Quantization Works
+
+  Architecture
+
+  VLMs have TWO separate components:
+
+  1. Language Decoder (LLM part)
+    - The main transformer model that generates text
+    - Can be aggressively quantized: Q4_K_M, Q5_K_M, Q6_K, Q8_0
+  2. Vision Encoder (mmproj/CLIP part)
+    - Converts images to embeddings the LLM understands
+    - More sensitive to quantization than the language part
+    - Typically kept at F16 or Q8_0 for quality
+
+  Why Separate Files?
+
+  From llama.cpp developers:
+  "The multimodal model uses another network to extract features, and this process is more sensitive to disturbances. If a picture is compressed to 
+  fewer tokens, the impact on vision part quantization is much greater than the impact on LLM."
+
+  Conversion Workflow for HuggingFace VLMs
+
+  # Step 1: Convert HF model to GGUF (creates F16 base)
+  python convert_hf_to_gguf.py ./Qwen2-VL-2B-Instruct \
+    --outfile ./qwen2-vl-2b-instruct-f16.gguf
+
+  # Step 2: Run "surgery" to extract vision encoder
+  # This creates TWO files:
+  #   - qwen2-vl-2b-instruct-f16.gguf (language model only)
+  #   - qwen2-vl-2b-instruct-mmproj-f16.gguf (vision encoder)
+  python examples/llava/qwen2_vl_surgery.py ./Qwen2-VL-2B-Instruct
+
+  # Step 3: Quantize language model (aggressive)
+  ./llama-quantize qwen2-vl-2b-instruct-f16.gguf \
+    qwen2-vl-2b-instruct-q4_k_m.gguf Q4_K_M
+
+  # Step 4: Optionally quantize vision encoder (conservative)
+  ./llama-quantize qwen2-vl-2b-instruct-mmproj-f16.gguf \
+    qwen2-vl-2b-instruct-mmproj-q8_0.gguf Q8_0
+
+  Final Files Structure
+
+  models/
+  ├── qwen2-vl-2b-instruct-q4_k_m.gguf       # Language: Q4_K_M (2.5GB)
+  └── qwen2-vl-2b-instruct-mmproj-q8_0.gguf  # Vision: Q8_0 (1GB)

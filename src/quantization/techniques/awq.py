@@ -15,7 +15,7 @@ from loguru import logger
 
 from ...models.model import ModelInfo
 from ...models.provider import ProviderType
-from ..models import QuantizationTask, QuantizationType
+from ..models import QuantizationTask, QuantizationType, TaskStatus
 from .base import BaseQuantizer
 
 
@@ -135,8 +135,6 @@ class AWQQuantizer(BaseQuantizer):
         try:
             from transformers import AutoTokenizer
             from awq import AutoAWQForCausalLM
-
-            from ..models import TaskStatus
 
             task.status = TaskStatus.RUNNING
             logger.info(f"Starting AWQ {task.quant_type.display_name} quantization")

@@ -1162,19 +1162,19 @@ def register_all_providers(session_manager: SessionManager, config: dict, system
 
         try:
             if provider_type == ProviderType.OLLAMA:
-                provider = OllamaProvider(provider_config)
+                provider = OllamaProvider(provider_config, system_specs)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered Ollama provider at {provider_config.host}")
                 registered_providers.append(provider_type)
 
             elif provider_type == ProviderType.HUGGINGFACE:
-                provider = HuggingFaceProvider(provider_config)
+                provider = HuggingFaceProvider(provider_config, system_specs)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered HuggingFace provider at {provider_config.cache_dir}")
                 registered_providers.append(provider_type)
 
             elif provider_type == ProviderType.GGUF:
-                provider = GGUFProvider(provider_config)
+                provider = GGUFProvider(provider_config, system_specs)
                 session_manager.register_provider(provider_type, provider_config, provider)
                 logger.info(f"Registered GGUF provider at {provider_config.models_dir}")
                 registered_providers.append(provider_type)
@@ -1193,7 +1193,7 @@ def register_all_providers(session_manager: SessionManager, config: dict, system
             elif provider_type == ProviderType.MLX:
                 try:
                     from ..providers.mlx import MLXProvider
-                    provider = MLXProvider(provider_config)
+                    provider = MLXProvider(provider_config, system_specs)
                     session_manager.register_provider(provider_type, provider_config, provider)
                     logger.info(f"Registered MLX provider at {provider_config.models_dir}")
                     registered_providers.append(provider_type)
@@ -1206,7 +1206,7 @@ def register_all_providers(session_manager: SessionManager, config: dict, system
             elif provider_type == ProviderType.OPENVINO:
                 try:
                     from ..providers.openvino import OpenVINOProvider
-                    provider = OpenVINOProvider(provider_config)
+                    provider = OpenVINOProvider(provider_config, system_specs)
                     session_manager.register_provider(provider_type, provider_config, provider)
                     logger.info(f"Registered OpenVINO provider at {provider_config.models_dir}")
                     registered_providers.append(provider_type)
@@ -1273,17 +1273,8 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
         try:
             models = session_manager.discover_models(provider=provider_type)
             logger.info(f"Discovered {len(models)} models from {selected_provider}")
-
-            if not models:
-                tui.show_message(
-                    f"No models found for {selected_provider.upper()}.\n\n"
-                    f"Install models using:\n"
-                    f"  Ollama: ollama pull llama3.2:3b",
-                    title="No Models",
-                    style="yellow"
-                )
-                tui.prompt("Press Enter to continue...", style="dim")
-                continue
+            # Note: ModelSelectionMenu now handles empty model list with arrow-key navigation
+            # showing Install/Back/Home/Quit options for all providers
 
         except Exception as e:
             logger.error(f"Failed to discover models: {e}")

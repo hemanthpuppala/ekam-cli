@@ -48,6 +48,23 @@ print_error() {
 
 # Detect OS
 detect_os() {
+    # Check if running in WSL (Windows Subsystem for Linux)
+    # Method 1: Check /proc/version
+    if [ -f /proc/version ] && grep -qEi "(Microsoft|WSL)" /proc/version 2>/dev/null; then
+        echo "wsl"
+        return 0
+    fi
+    # Method 2: Check for WSL environment variable
+    if [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSLENV" ]; then
+        echo "wsl"
+        return 0
+    fi
+    # Method 3: Check for /mnt/c directory (typical WSL mount)
+    if [ -d /mnt/c ] && [ -d /mnt/c/Windows ]; then
+        echo "wsl"
+        return 0
+    fi
+    # Not WSL - check other OS types
     if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]] || [[ "$OSTYPE" == "cygwin" ]]; then
         echo "windows"
     elif [[ "$OSTYPE" == "darwin"* ]]; then
@@ -128,15 +145,47 @@ print_success "Python $PYTHON_VERSION found"
 # Create venv
 print_section "Setting up virtual environment..."
 if [ -d "$VENV_DIR" ]; then
-    print_warning "Virtual environment already exists at $VENV_DIR"
-    read -p "Recreate? [y/N]: " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        rm -rf "$VENV_DIR"
-        $PYTHON_CMD -m venv "$VENV_DIR"
-        print_success "Virtual environment recreated"
+    # Check if existing venv is compatible with current OS
+    VENV_COMPATIBLE=true
+    if [ "$OS" = "wsl" ] || [ "$OS" = "linux" ] || [ "$OS" = "macos" ]; then
+        # Unix-like systems need bin/activate
+        if [ ! -f "$VENV_DIR/bin/activate" ] && [ -f "$VENV_DIR/Scripts/activate" ]; then
+            print_warning "Existing venv is Windows-style, but you're on $OS"
+            print_warning "The venv needs to be recreated for $OS"
+            VENV_COMPATIBLE=false
+        fi
+    elif [ "$OS" = "windows" ]; then
+        # Windows needs Scripts/activate
+        if [ ! -f "$VENV_DIR/Scripts/activate" ] && [ -f "$VENV_DIR/bin/activate" ]; then
+            print_warning "Existing venv is Unix-style, but you're on Windows"
+            print_warning "The venv needs to be recreated for Windows"
+            VENV_COMPATIBLE=false
+        fi
+    fi
+
+    if [ "$VENV_COMPATIBLE" = false ]; then
+        print_warning "Virtual environment is incompatible with current OS"
+        read -p "Recreate for $OS? [Y/n]: " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            rm -rf "$VENV_DIR"
+            $PYTHON_CMD -m venv "$VENV_DIR"
+            print_success "Virtual environment recreated for $OS"
+        else
+            print_error "Cannot continue with incompatible venv"
+            exit 1
+        fi
     else
-        print_success "Using existing virtual environment"
+        print_warning "Virtual environment already exists at $VENV_DIR"
+        read -p "Recreate? [y/N]: " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$VENV_DIR"
+            $PYTHON_CMD -m venv "$VENV_DIR"
+            print_success "Virtual environment recreated"
+        else
+            print_success "Using existing virtual environment"
+        fi
     fi
 else
     if $PYTHON_CMD -m venv "$VENV_DIR"; then
@@ -152,6 +201,7 @@ print_section "Activating virtual environment..."
 if [ "$OS" = "windows" ]; then
     ACTIVATE_SCRIPT="$VENV_DIR/Scripts/activate"
 else
+    # Linux, macOS, and WSL all use bin/activate
     ACTIVATE_SCRIPT="$VENV_DIR/bin/activate"
 fi
 
@@ -285,6 +335,31 @@ case $dep_choice in
         ;;
 esac
 
+# Install optional quantization packages (GPTQ, AWQ)
+print_section "Installing optional quantization support..."
+
+# Try GPTQ
+echo "Attempting to install gptqmodel (requires torch to be installed first)..."
+if pip install gptqmodel 2>&1 | grep -v "WARNING"; then
+    print_success "gptqmodel installed successfully"
+else
+    print_warning "Failed to install gptqmodel (this is optional)"
+    print_warning "You can try installing it manually later with:"
+    echo -e "  ${YELLOW}pip install gptqmodel${NC}"
+fi
+
+echo
+
+# Try AWQ
+echo "Attempting to install autoawq (requires torch to be installed first)..."
+if pip install autoawq 2>&1 | grep -v "WARNING"; then
+    print_success "autoawq installed successfully"
+else
+    print_warning "Failed to install autoawq (this is optional)"
+    print_warning "You can try installing it manually later with:"
+    echo -e "  ${YELLOW}pip install autoawq${NC}"
+fi
+
 # Create .gitignore entry
 print_section "Updating .gitignore..."
 if [ ! -f "$SCRIPT_DIR/.gitignore" ]; then
@@ -299,8 +374,8 @@ else
     fi
 fi
 
-# Ollama installation and model setup
-print_section "Setting up Ollama (LLM provider)..."
+# Ollama installation and model setup (MANDATORY)
+print_section "Setting up Ollama (LLM provider - REQUIRED)..."
 echo
 
 # Check if Ollama is installed
@@ -315,37 +390,63 @@ else
         macos)
             echo "Installing Ollama for macOS..."
             if command -v brew &> /dev/null; then
-                brew install ollama > /dev/null 2>&1
-                print_success "Ollama installed via Homebrew"
+                if brew install ollama; then
+                    print_success "Ollama installed via Homebrew"
+                    OLLAMA_INSTALLED=true
+                else
+                    print_error "Failed to install Ollama via Homebrew"
+                    echo "Please install manually from: ${YELLOW}https://ollama.ai/download${NC}"
+                    exit 1
+                fi
             else
-                print_warning "Homebrew not found. Please install Ollama manually:"
+                print_error "Homebrew not found. Please install Ollama manually:"
                 echo -e "  ${YELLOW}https://ollama.ai/download${NC}"
                 echo "  Then run: bash $SCRIPT_DIR/setup.sh"
-                OLLAMA_INSTALLED=false
+                exit 1
+            fi
+            ;;
+        wsl)
+            echo "Installing Ollama for WSL (Windows Subsystem for Linux)..."
+            if command -v curl &> /dev/null; then
+                if curl -fsSL https://ollama.ai/install.sh | sh; then
+                    print_success "Ollama installed in WSL"
+                    OLLAMA_INSTALLED=true
+                else
+                    print_error "Ollama installation failed. Please install manually:"
+                    echo -e "  ${YELLOW}curl -fsSL https://ollama.ai/install.sh | sh${NC}"
+                    echo "Or install Ollama for Windows and it will work in WSL:"
+                    echo -e "  ${YELLOW}https://ollama.ai/download${NC}"
+                    exit 1
+                fi
+            else
+                print_error "curl not found. Please install curl first:"
+                echo -e "  ${YELLOW}sudo apt-get install curl${NC}"
+                exit 1
             fi
             ;;
         linux)
             echo "Installing Ollama for Linux..."
             if command -v curl &> /dev/null; then
-                curl -fsSL https://ollama.ai/install.sh 2>/dev/null | sh > /dev/null 2>&1
-                if [ $? -eq 0 ]; then
+                if curl -fsSL https://ollama.ai/install.sh | sh; then
                     print_success "Ollama installed"
                     OLLAMA_INSTALLED=true
                 else
-                    print_warning "Ollama installation had issues. Please install manually:"
-                    echo -e "  ${YELLOW}https://ollama.ai/download${NC}"
+                    print_error "Ollama installation failed. Please install manually:"
+                    echo -e "  ${YELLOW}curl -fsSL https://ollama.ai/install.sh | sh${NC}"
+                    exit 1
                 fi
             else
-                print_warning "curl not found. Please install Ollama manually:"
-                echo -e "  ${YELLOW}https://ollama.ai/download${NC}"
+                print_error "curl not found. Please install curl first:"
+                echo -e "  ${YELLOW}sudo apt-get install curl${NC}"
+                exit 1
             fi
             ;;
         windows)
-            print_warning "Windows requires manual Ollama installation"
+            print_error "Windows requires manual Ollama installation"
             echo "Please download and install Ollama from:"
             echo -e "  ${YELLOW}https://ollama.ai/download${NC}"
-            echo "Then run this script again"
-            OLLAMA_INSTALLED=false
+            echo "After installing, run this script again in WSL or Git Bash"
+            exit 1
             ;;
     esac
 fi
@@ -431,8 +532,10 @@ if command -v ollama &> /dev/null; then
 
     echo
 else
-    print_warning "Ollama is not installed. Skipping model setup."
-    print_warning "You can install Ollama later and pull a model with: ollama pull qwen3:0.6b"
+    print_error "Ollama installation is required but not available."
+    print_error "Please install Ollama manually and run setup again."
+    echo -e "  ${YELLOW}https://ollama.ai/download${NC}"
+    exit 1
 fi
 
 # HuggingFace token setup

@@ -186,9 +186,9 @@ class QualityConfig(BaseModel):
 
     # Core execution parameters
     outputs_per_prompt: int = Field(
-        default=5,
-        ge=2,
-        le=50,
+        default=10,
+        ge=5,
+        le=100,
         description="Number of outputs to generate PER PROMPT for consistency analysis"
     )
     num_warmup: int = Field(
@@ -299,7 +299,7 @@ class StressConfig(BaseModel):
 
     # Core test duration (PER MODEL)
     duration_minutes: int = Field(
-        default=30,
+        default=15,
         ge=1,
         le=1440,  # Max 24 hours
         description="How long to run continuous stress testing per model (minutes)"

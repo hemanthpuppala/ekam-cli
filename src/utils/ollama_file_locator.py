@@ -38,15 +38,61 @@ class OllamaFileLocator:
         """Initialize Ollama file locator.
 
         Args:
-            ollama_home: Custom Ollama home directory (default: ~/.ollama)
+            ollama_home: Custom Ollama home directory (default: auto-detect)
             cache_enabled: Enable caching of model→path mappings
         """
-        self.ollama_home = ollama_home or Path.home() / ".ollama"
+        # Auto-detect Ollama home directory if not provided
+        if ollama_home:
+            self.ollama_home = ollama_home
+        else:
+            self.ollama_home = self._detect_ollama_home()
+
         self.blobs_dir = self.ollama_home / "models" / "blobs"
         self.cache_enabled = cache_enabled
         self._path_cache: Dict[str, Path] = {}
 
         logger.debug(f"Initialized OllamaFileLocator (home: {self.ollama_home})")
+
+    def _detect_ollama_home(self) -> Path:
+        """Auto-detect Ollama home directory.
+
+        Checks multiple locations in order:
+        1. OLLAMA_MODELS environment variable
+        2. /usr/share/ollama/.ollama (system-wide Linux installation)
+        3. ~/.ollama (user installation - default)
+
+        Returns:
+            Path to Ollama home directory
+        """
+        # Check environment variable first
+        if 'OLLAMA_MODELS' in os.environ:
+            env_path = Path(os.environ['OLLAMA_MODELS'])
+            if env_path.exists():
+                try:
+                    # Test read access
+                    list(env_path.iterdir())
+                    logger.debug(f"Using OLLAMA_MODELS env var: {env_path}")
+                    return env_path
+                except (PermissionError, OSError):
+                    logger.debug(f"OLLAMA_MODELS env var path not accessible: {env_path}")
+
+        # Check system-wide installation (Linux)
+        system_path = Path("/usr/share/ollama/.ollama")
+        if system_path.exists():
+            try:
+                blobs_dir = system_path / "models" / "blobs"
+                if blobs_dir.exists():
+                    # Test read access
+                    list(blobs_dir.iterdir())
+                    logger.debug(f"Detected system-wide Ollama installation: {system_path}")
+                    return system_path
+            except (PermissionError, OSError) as e:
+                logger.debug(f"System-wide Ollama path not accessible: {system_path} ({e})")
+
+        # Default: user home directory
+        user_path = Path.home() / ".ollama"
+        logger.debug(f"Using default Ollama home: {user_path}")
+        return user_path
 
     def get_model_path(self, model_name: str, force_refresh: bool = False) -> Optional[Path]:
         """Get file path for an Ollama model.
@@ -143,10 +189,11 @@ class OllamaFileLocator:
             return None
 
     def _parse_blob_hash(self, modelfile: str) -> Optional[str]:
-        """Parse blob hash from modelfile content.
+        r"""Parse blob hash from modelfile content.
 
         Expected formats:
             FROM /path/to/.ollama/models/blobs/sha256-abc123def456...
+            FROM C:\path\to\.ollama\models\blobs\sha256-abc123def456...
             FROM blob:sha256-abc123def456...
             FROM @sha256:abc123def456...
 
@@ -156,9 +203,10 @@ class OllamaFileLocator:
         Returns:
             Blob hash (e.g., "sha256-abc123..."), or None if not found
         """
-        # Pattern 1: Full path to blob file
+        # Pattern 1: Full path to blob file (Unix or Windows)
         # FROM /Users/user/.ollama/models/blobs/sha256-abc123...
-        pattern1 = r"FROM\s+(?:.*/)?(sha256-[a-f0-9]+)"
+        # FROM C:\Users\user\.ollama\models\blobs\sha256-abc123...
+        pattern1 = r"FROM\s+(?:.*[/\\])?(sha256-[a-f0-9]+)"
         match = re.search(pattern1, modelfile, re.IGNORECASE)
         if match:
             return match.group(1)

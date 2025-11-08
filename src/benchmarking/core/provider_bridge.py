@@ -52,12 +52,10 @@ class ProviderBridge:
             return model_info.provider
 
         # Fallback: parse from model_id format
-        if model_id.startswith("quantized:gguf:"):
-            return ProviderType.GGUF
-        elif model_id.startswith("quantized:mlx:"):
-            return ProviderType.MLX
-        elif model_id.startswith("quantized:openvino:"):
-            return ProviderType.OPENVINO
+        # FIX: All quantized models (regardless of format) should route to QUANTIZED provider
+        # The QUANTIZED provider will parse the format and delegate appropriately
+        if model_id.startswith("quantized:"):
+            return ProviderType.QUANTIZED
         elif ":" in model_id and not "/" in model_id.split(":")[0]:
             # Format like "gemma3:270m" → Ollama
             return ProviderType.OLLAMA

@@ -22,6 +22,7 @@ from PIL import Image
 from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
 from ..models.provider import ProviderConfig
+from ..models.system import SystemSpecs
 from ..utils.history_formatter import format_qa_history
 from .base import BaseProvider
 
@@ -33,11 +34,12 @@ class MLXProvider(BaseProvider):
     Provides native Metal acceleration and efficient 4-bit quantization.
     """
 
-    def __init__(self, config: ProviderConfig):
+    def __init__(self, config: ProviderConfig, system_specs: Optional['SystemSpecs'] = None):
         """Initialize MLX provider.
 
         Args:
             config: Provider configuration
+            system_specs: System specifications for dynamic GPU/CPU detection
 
         Raises:
             RuntimeError: If not on macOS or MLX not available
@@ -45,6 +47,9 @@ class MLXProvider(BaseProvider):
         self.config = config
         self.models_dir = Path(str(config.models_dir or "~/.cache/mlx/models")).expanduser()
         self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store or detect system specs
+        self.system_specs = system_specs or SystemSpecs.detect()
 
         # Check platform compatibility
         if platform.system() != "Darwin":
@@ -495,17 +500,42 @@ class MLXProvider(BaseProvider):
             temperature = custom_parameters.get("temperature", 0.7) if custom_parameters else 0.7
 
             logger.info("Generating text with MLX-LM...")
-            response = mlx_lm.generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=formatted_prompt,
-                max_tokens=max_tokens,
-                temp=temperature,
-                verbose=False,
-            )
 
-            logger.info("✓ Text generated")
-            response_text = response.strip()
+            # PERFORMANCE: Use streaming generation if available in MLX-LM
+            # MLX-LM's generate() returns a generator when used properly
+            try:
+                # Accumulate tokens from streaming generation
+                response_text = ""
+                for token in mlx_lm.generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=formatted_prompt,
+                    max_tokens=max_tokens,
+                    temp=temperature,
+                    verbose=False,
+                ):
+                    # MLX-LM yields individual tokens or text chunks
+                    if isinstance(token, str):
+                        response_text += token
+                    elif hasattr(token, 'text'):
+                        response_text += token.text
+
+                logger.info("✓ Text generated (streaming)")
+
+            except (TypeError, AttributeError):
+                # Fallback: generate() returned full text directly (older API)
+                response = mlx_lm.generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=formatted_prompt,
+                    max_tokens=max_tokens,
+                    temp=temperature,
+                    verbose=False,
+                )
+                response_text = response if isinstance(response, str) else str(response)
+                logger.info("✓ Text generated (non-streaming)")
+
+            response_text = response_text.strip()
             
             # Apply response cleaning to remove artifacts, reasoning, and <think> tags
             from ..utils.response_cleaner import clean_model_response

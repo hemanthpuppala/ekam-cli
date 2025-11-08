@@ -1,21 +1,25 @@
 """
 Benchmark menu flow controller.
 
-Orchestrates the 7-step benchmark configuration pipeline:
+Orchestrates the 8-step benchmark configuration pipeline:
 1. Model type selection (LLM/VLM)
 2. Suite selection (Complete, Speed, Resources, Quality, Stress)
+   2.5. If Complete suite → Sub-suite selection
 3. Model selection (multi-select)
 4. Endpoint selection (per model)
-5. Test data configuration (default/custom)
-6. Parameters configuration (runs, warmup, etc.)
-7. Execution mode (foreground/background)
-8. Configuration review and confirmation
+5. Number of prompts (1-50, suite-specific defaults)
+6. Test data configuration (default/custom with manual entry)
+7. Parameters configuration (warmup, temperature, max_tokens)
+8. Execution mode (foreground/background)
+9. Configuration review and confirmation (with save option)
 
 Returns a validated BenchmarkConfig ready for execution.
 """
 
 from typing import Optional, Dict, Any
 from pathlib import Path
+import json
+from datetime import datetime
 
 from rich.console import Console
 
@@ -24,6 +28,7 @@ from src.benchmarking.models.metric_types import ModelType, SuiteType, Execution
 from src.benchmarking.cli.benchmark_screens import (
     show_model_type_selection,
     show_suite_selection,
+    show_complete_suite_selection,
     show_model_selection,
     show_endpoint_selection,
     show_test_data_selection,
@@ -36,6 +41,86 @@ from loguru import logger
 
 
 console = Console()
+
+
+def save_benchmark_config(state: Dict[str, Any], filepath: Optional[Path] = None) -> bool:
+    """
+    Save benchmark configuration to JSON file.
+
+    Args:
+        state: Configuration state dictionary
+        filepath: Optional custom save path, defaults to .ekam/saved_configs/
+
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    try:
+        # Default save location
+        if filepath is None:
+            save_dir = Path.cwd() / ".ekam" / "saved_configs"
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            # Generate timestamped filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suite_name = state.get("suite_type", "unknown").value if hasattr(state.get("suite_type"), "value") else "unknown"
+            filepath = save_dir / f"benchmark_config_{suite_name}_{timestamp}.json"
+
+        # Convert state to JSON-serializable format
+        serializable_state = {}
+        for key, value in state.items():
+            if hasattr(value, "value"):  # Enum types
+                serializable_state[key] = value.value
+            elif isinstance(value, Path):
+                serializable_state[key] = str(value)
+            else:
+                serializable_state[key] = value
+
+        # Write to file
+        with open(filepath, 'w') as f:
+            json.dump(serializable_state, f, indent=2)
+
+        console.print(f"\n[green]✓ Configuration saved to: {filepath}[/green]")
+        return True
+
+    except Exception as e:
+        console.print(f"\n[red]✗ Failed to save configuration: {str(e)}[/red]")
+        logger.error(f"Config save failed: {str(e)}")
+        return False
+
+
+def load_benchmark_config(filepath: Path) -> Optional[Dict[str, Any]]:
+    """
+    Load benchmark configuration from JSON file.
+
+    Args:
+        filepath: Path to saved config file
+
+    Returns:
+        State dictionary if loaded successfully, None otherwise
+    """
+    try:
+        if not filepath.exists():
+            console.print(f"\n[red]✗ Config file not found: {filepath}[/red]")
+            return None
+
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+
+        # Convert enum values back
+        if "model_type" in data:
+            data["model_type"] = ModelType(data["model_type"])
+        if "suite_type" in data:
+            data["suite_type"] = SuiteType(data["suite_type"])
+        if "execution_mode" in data:
+            data["execution_mode"] = ExecutionMode(data["execution_mode"])
+
+        console.print(f"\n[green]✓ Configuration loaded from: {filepath}[/green]")
+        return data
+
+    except Exception as e:
+        console.print(f"\n[red]✗ Failed to load configuration: {str(e)}[/red]")
+        logger.error(f"Config load failed: {str(e)}")
+        return None
 
 
 class BenchmarkMenuFlow:
@@ -71,12 +156,12 @@ class BenchmarkMenuFlow:
 
             # State tracking for backward navigation
             current_step = 0
-            total_steps = 7
+            total_steps = 8
 
             while True:
                 # Step 1: Model Type Selection
                 if current_step == 0:
-                    logger.debug("Step 1/7: Model Type Selection")
+                    logger.debug("Step 1/8: Model Type Selection")
                     current_value = self.state.get("model_type")
                     result = show_model_type_selection(current_value)
 
@@ -99,7 +184,7 @@ class BenchmarkMenuFlow:
 
                 # Step 2: Suite Selection
                 elif current_step == 1:
-                    logger.debug("Step 2/7: Suite Selection")
+                    logger.debug("Step 2/8: Suite Selection")
                     current_value = self.state.get("suite")
                     result = show_suite_selection(current_value)
 
@@ -117,11 +202,34 @@ class BenchmarkMenuFlow:
                     else:  # next
                         self.state["suite"] = value
                         logger.debug(f"Suite selected: {value.value}")
+
+                        # If Complete suite selected, show sub-suite selection
+                        if value == SuiteType.COMPLETE:
+                            logger.debug("Complete suite selected, showing sub-suite selection")
+                            current_value_suites = self.state.get("complete_suites")
+                            suite_result = show_complete_suite_selection(current_value_suites)
+
+                            if suite_result is None:
+                                logger.info("User cancelled at Complete suite configuration")
+                                return None
+
+                            suites_value, suites_action = suite_result
+
+                            if suites_action == "cancel":
+                                logger.info("User cancelled at Complete suite configuration")
+                                return None
+                            elif suites_action == "back":
+                                # Go back to suite selection
+                                continue
+                            else:  # next
+                                self.state["complete_suites"] = suites_value
+                                logger.debug(f"Complete sub-suites selected: {', '.join(suites_value)}")
+
                         current_step = 2
 
                 # Step 3: Model Selection (multi-select - TODO: refactor later)
                 elif current_step == 2:
-                    logger.debug("Step 3/7: Model Selection")
+                    logger.debug("Step 3/8: Model Selection")
                     model_type = self.state["model_type"]
                     models = show_model_selection(model_type, self.session_manager)
 
@@ -137,7 +245,7 @@ class BenchmarkMenuFlow:
 
                 # Step 4: Endpoint Selection
                 elif current_step == 3:
-                    logger.debug("Step 4/7: Endpoint Selection")
+                    logger.debug("Step 4/8: Endpoint Selection")
                     models = self.state["models"]
                     model_type = self.state["model_type"]
                     current_value = self.state.get("endpoints")
@@ -160,10 +268,37 @@ class BenchmarkMenuFlow:
                         logger.debug(f"Endpoints configured for {len(value)} model(s)")
                         current_step = 4
 
-                # Step 5: Test Data Selection
+                # Step 5: Number of Prompts Configuration
                 elif current_step == 4:
-                    logger.debug("Step 5/7: Test Data Selection")
+                    logger.debug("Step 5/8: Number of Prompts")
+                    suite_name = self.state["suite"].value
+                    current_value = self.state.get("num_prompts")
+
+                    from src.benchmarking.cli.benchmark_screens import show_num_prompts_config
+                    result = show_num_prompts_config(suite_name, current_value)
+
+                    if result is None:
+                        logger.info("User cancelled at step 5")
+                        return None
+
+                    value, action = result
+
+                    if action == "cancel":
+                        logger.info("User cancelled at num prompts configuration")
+                        return None
+                    elif action == "back":
+                        current_step = 3  # Go back to endpoint selection
+                    else:  # next
+                        self.state["num_prompts"] = value
+                        logger.debug(f"Number of prompts: {value}")
+                        current_step = 5
+
+                # Step 6: Test Data Selection
+                elif current_step == 5:
+                    logger.debug("Step 6/8: Test Data Selection")
                     model_type = self.state["model_type"]
+                    num_prompts = self.state["num_prompts"]
+                    suite_name = self.state["suite"].value
                     endpoints = self.state.get("endpoints")
 
                     # Extract endpoint for VLM
@@ -174,29 +309,7 @@ class BenchmarkMenuFlow:
                             selected_endpoint = first_model[0]
 
                     current_value = self.state.get("test_data")
-                    result = show_test_data_selection(model_type, selected_endpoint, current_value)
-
-                    if result is None:
-                        logger.info("User cancelled at step 5")
-                        return None
-
-                    value, action = result
-
-                    if action == "cancel":
-                        logger.info("User cancelled at test data selection")
-                        return None
-                    elif action == "back":
-                        current_step = 3  # Go back to endpoint selection
-                    else:  # next
-                        self.state["test_data"] = value
-                        logger.debug(f"Test data configured: {value.get('source', 'unknown')}")
-                        current_step = 5
-
-                # Step 6: Parameters Configuration
-                elif current_step == 5:
-                    logger.debug("Step 6/7: Parameters Configuration")
-                    current_value = self.state.get("parameters")
-                    result = show_parameters_config(current_value)
+                    result = show_test_data_selection(model_type, num_prompts, suite_name, selected_endpoint, current_value)
 
                     if result is None:
                         logger.info("User cancelled at step 6")
@@ -205,20 +318,20 @@ class BenchmarkMenuFlow:
                     value, action = result
 
                     if action == "cancel":
-                        logger.info("User cancelled at parameters configuration")
+                        logger.info("User cancelled at test data selection")
                         return None
                     elif action == "back":
-                        current_step = 4  # Go back to test data
+                        current_step = 4  # Go back to num_prompts
                     else:  # next
-                        self.state["parameters"] = value
-                        logger.debug(f"Parameters configured: {value.get('num_runs', 0)} runs")
+                        self.state["test_data"] = value
+                        logger.debug(f"Test data configured: {value.get('source', 'unknown')}")
                         current_step = 6
 
-                # Step 7: Execution Mode
+                # Step 7: Parameters Configuration
                 elif current_step == 6:
-                    logger.debug("Step 7/7: Execution Mode")
-                    current_value = self.state.get("execution_mode")
-                    result = show_execution_mode(current_value)
+                    logger.debug("Step 7/8: Parameters Configuration")
+                    current_value = self.state.get("parameters")
+                    result = show_parameters_config(current_value)
 
                     if result is None:
                         logger.info("User cancelled at step 7")
@@ -227,20 +340,42 @@ class BenchmarkMenuFlow:
                     value, action = result
 
                     if action == "cancel":
+                        logger.info("User cancelled at parameters configuration")
+                        return None
+                    elif action == "back":
+                        current_step = 5  # Go back to test data
+                    else:  # next
+                        self.state["parameters"] = value
+                        logger.debug(f"Parameters configured")
+                        current_step = 7
+
+                # Step 8: Execution Mode
+                elif current_step == 7:
+                    logger.debug("Step 8/8: Execution Mode")
+                    current_value = self.state.get("execution_mode")
+                    result = show_execution_mode(current_value)
+
+                    if result is None:
+                        logger.info("User cancelled at step 8")
+                        return None
+
+                    value, action = result
+
+                    if action == "cancel":
                         logger.info("User cancelled at execution mode selection")
                         return None
                     elif action == "back":
-                        current_step = 5  # Go back to parameters
+                        current_step = 6  # Go back to parameters
                     else:  # next
                         self.state["execution_mode"] = value
                         logger.debug(f"Execution mode: {value.value}")
-                        current_step = 7  # Proceed to review
+                        current_step = 8  # Proceed to review
 
-                # Step 8: Configuration Review
-                elif current_step == 7:
+                # Final: Configuration Review
+                elif current_step == 8:
                     logger.debug("Step 8: Configuration Review")
                     config_summary = self._build_config_summary()
-                    review_action = show_config_review(config_summary)
+                    review_action = show_config_review(config_summary, self.state)
 
                     if review_action == "cancel":
                         logger.info("User cancelled at configuration review")
@@ -248,8 +383,13 @@ class BenchmarkMenuFlow:
                         return None
 
                     elif review_action == "edit":
-                        logger.info("User chose to edit configuration, going back to Step 7")
-                        current_step = 6  # Go back to execution mode (Step 7)
+                        logger.info("User chose to edit configuration, going back to Step 8")
+                        current_step = 7  # Go back to execution mode (Step 8)
+                        continue
+
+                    elif review_action == "save":
+                        # Save was handled in show_config_review, just continue loop
+                        logger.info("Configuration saved, returning to review")
                         continue
 
                     elif review_action == "confirm":
@@ -331,6 +471,14 @@ class BenchmarkMenuFlow:
             "temperature": params.get("temperature", 0.7),
             "max_tokens": params.get("max_tokens", 512),
         }
+
+        # Add Complete suite configuration if applicable
+        if self.state["suite"] == SuiteType.COMPLETE and "complete_suites" in self.state:
+            generation_params["complete"] = {
+                "suites_to_run": self.state["complete_suites"],
+                "suite_execution_order": self.state["complete_suites"],  # Use same order
+                "stop_on_suite_failure": False,
+            }
 
         # Build config dictionary
         config_dict = {

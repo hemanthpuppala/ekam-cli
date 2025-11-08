@@ -21,6 +21,7 @@ from PIL import Image
 from ..models.endpoints import CompatibilityStatus, EndpointType, ModelType
 from ..models.model import ModelInfo
 from ..models.provider import ProviderConfig
+from ..models.system import SystemSpecs
 from ..utils.history_formatter import format_qa_history
 from .base import BaseProvider
 
@@ -32,11 +33,12 @@ class OpenVINOProvider(BaseProvider):
     Includes VLM support for Qwen2-VL, Phi-3.5-Vision, and InternVL2.
     """
 
-    def __init__(self, config: ProviderConfig):
+    def __init__(self, config: ProviderConfig, system_specs: Optional['SystemSpecs'] = None):
         """Initialize OpenVINO provider.
 
         Args:
             config: Provider configuration
+            system_specs: System specifications for dynamic GPU/CPU detection
 
         Raises:
             RuntimeError: If OpenVINO not available
@@ -44,6 +46,9 @@ class OpenVINOProvider(BaseProvider):
         self.config = config
         self.models_dir = Path(str(config.models_dir or "~/.cache/openvino/models")).expanduser()
         self.models_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store or detect system specs
+        self.system_specs = system_specs or SystemSpecs.detect()
 
         # Check platform
         self.platform_info = {
@@ -425,24 +430,60 @@ class OpenVINOProvider(BaseProvider):
             max_tokens = custom_parameters.get("max_tokens", 1024) if custom_parameters else 1024
             temperature = custom_parameters.get("temperature", 0.7) if custom_parameters else 0.7
 
-            # Generate
+            # PERFORMANCE: Use streaming generation for lower latency
             logger.info("Generating text with OpenVINO...")
             import torch
-            with torch.no_grad():
-                output = model.generate(
+
+            try:
+                from transformers import TextIteratorStreamer
+                from threading import Thread
+
+                # Create streamer
+                streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+                # Build generation kwargs
+                generation_kwargs = {
                     **inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    do_sample=temperature > 0,
-                )
+                    "max_new_tokens": max_tokens,
+                    "temperature": temperature,
+                    "do_sample": temperature > 0,
+                    "streamer": streamer,
+                }
 
-            # Decode (skip input tokens)
-            input_length = inputs["input_ids"].shape[1]
-            generated_tokens = output[0][input_length:]
-            response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                # Start generation in separate thread
+                thread = Thread(target=model.generate, kwargs=generation_kwargs)
+                thread.start()
 
-            logger.info("✓ Text generated")
-            return response.strip()
+                # Accumulate streamed tokens
+                response = ""
+                with torch.no_grad():
+                    for text in streamer:
+                        response += text
+
+                # Wait for thread to complete
+                thread.join()
+
+                logger.info("✓ Text generated (streaming)")
+                return response.strip()
+
+            except ImportError:
+                # Fallback to non-streaming if TextIteratorStreamer not available
+                logger.debug("TextIteratorStreamer not available, using non-streaming generation")
+                with torch.no_grad():
+                    output = model.generate(
+                        **inputs,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        do_sample=temperature > 0,
+                    )
+
+                # Decode (skip input tokens)
+                input_length = inputs["input_ids"].shape[1]
+                generated_tokens = output[0][input_length:]
+                response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+
+                logger.info("✓ Text generated (non-streaming)")
+                return response.strip()
 
         except Exception as e:
             logger.error(f"OpenVINO text generation failed: {e}")

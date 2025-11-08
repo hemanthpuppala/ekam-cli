@@ -175,8 +175,9 @@ class StressSuite(BaseSuite):
             current_time = time.time()
             elapsed_minutes = (current_time - test_start) / 60
 
-            # Rotate through prompts
-            prompt = prompts[prompt_idx % len(prompts)]
+            # Rotate through prompts - cycles for duration-based stress testing
+            current_prompt_idx = prompt_idx % len(prompts)
+            prompt = prompts[current_prompt_idx]
             prompt_idx += 1
 
             # Execute run with system monitoring and memory optimization
@@ -202,7 +203,8 @@ class StressSuite(BaseSuite):
                         logger.warning("No images provided for VLM stress test")
                         continue
 
-                    input_image_path = images[run_number % len(images)]
+                    # Use image corresponding to current prompt (cycles with prompts)
+                    input_image_path = images[current_prompt_idx % len(images)]
                     input_data = {
                         "prompt": prompt,
                         "image_path": input_image_path

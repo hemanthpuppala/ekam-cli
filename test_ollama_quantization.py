@@ -33,7 +33,7 @@ def test_ollama_discovery():
 
     try:
         models = provider.discover_models()
-        print(f"\n✓ Discovered {len(models)} Ollama models")
+        print(f"\n[OK] Discovered {len(models)} Ollama models")
 
         if models:
             print("\nModels found:")
@@ -46,11 +46,11 @@ def test_ollama_discovery():
                 print(f"     Source Path: {model.source_path}")
                 print(f"     Architecture: {model.architecture}")
         else:
-            print("\n⚠ No Ollama models found. Is Ollama running? Try: ollama list")
+            print("\n[WARN] No Ollama models found. Is Ollama running? Try: ollama list")
 
         return models
     except Exception as e:
-        print(f"\n✗ Error discovering Ollama models: {e}")
+        print(f"\n[ERROR] Error discovering Ollama models: {e}")
         import traceback
         traceback.print_exc()
         return []
@@ -97,7 +97,7 @@ def test_quantization_filtering(all_models):
     # Filter quantizable models
     quantizable = quant_manager.get_quantizable_models(all_models)
 
-    print(f"\n✓ Quantizable models: {len(quantizable)}")
+    print(f"\n[OK] Quantizable models: {len(quantizable)}")
 
     if quantizable:
         print("\nQuantizable models by provider:")
@@ -112,7 +112,7 @@ def test_quantization_filtering(all_models):
                 print(f"      Source Path: {model.source_path}")
                 print(f"      Quantization: {model.quantization}")
     else:
-        print("\n⚠ No quantizable models found!")
+        print("\n[WARN] No quantizable models found!")
 
     return quantizable
 
@@ -138,9 +138,9 @@ def test_provider_type_comparison():
 
     # Test in conditional
     if test_provider == ProviderType.OLLAMA:
-        print("✓ Enum comparison works!")
+        print("[PASS] Enum comparison works!")
     else:
-        print("✗ Enum comparison FAILED!")
+        print("[FAIL] Enum comparison FAILED!")
 
 
 def test_ollama_file_locator():
@@ -206,12 +206,12 @@ def main():
         print(f"Ollama models in quantizable list: {len(ollama_quantizable)}")
 
         if ollama_quantizable:
-            print("\n✓ SUCCESS: Ollama models are showing in quantization pipeline!")
+            print("\n[SUCCESS] Ollama models are showing in quantization pipeline!")
             print("\nThese Ollama models should appear in the UI:")
             for model in ollama_quantizable:
                 print(f"  - {model.name}")
         else:
-            print("\n✗ PROBLEM: Ollama models NOT appearing in quantizable list")
+            print("\n[PROBLEM] Ollama models NOT appearing in quantizable list")
             print("\nDebugging info:")
             for model in ollama_models:
                 print(f"\n  Model: {model.name}")
@@ -219,7 +219,7 @@ def main():
                 print(f"    provider value: {model.provider}")
                 print(f"    source_path: {model.source_path}")
     else:
-        print("\n⚠ No models to test with. Ensure Ollama is running with models installed.")
+        print("\n[WARN] No models to test with. Ensure Ollama is running with models installed.")
 
     print("\n" + "="*80)
     print("TEST COMPLETE")

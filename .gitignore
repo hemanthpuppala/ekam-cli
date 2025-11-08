@@ -94,3 +94,6 @@ Thumbs.db
 
 # Ignore macOS AppleDouble files
 ._*
+
+# Windows reserved filename
+nul

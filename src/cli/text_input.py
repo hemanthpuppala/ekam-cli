@@ -130,6 +130,61 @@ class ProfessionalPrompt:
             show_instructions=True,
         )
 
+    def get_text_input(
+        self,
+        prompt: str,
+        default_value: str = "",
+        allow_empty: bool = False,
+        multiline: bool = False,
+        style: str = "cyan",
+    ) -> Optional[str]:
+        """Get text input with optional default value.
+
+        Args:
+            prompt: Prompt message
+            default_value: Default value if user presses Enter
+            allow_empty: Allow empty input
+            multiline: Allow multiple lines
+            style: Color style
+
+        Returns:
+            Text string or None if cancelled
+        """
+        # Show multiline instructions if enabled
+        if multiline:
+            tui.console.print("[dim]Press Ctrl+J for new line, Enter to submit[/dim]")
+            tui.console.print()
+
+        while True:
+            try:
+                # Build prompt message with default
+                prompt_msg = prompt
+                if default_value:
+                    prompt_msg += f" (default: {default_value})"
+
+                text = self.get_input(
+                    prompt_msg,
+                    style=style,
+                    allow_multiline=multiline,
+                    show_instructions=False,
+                )
+
+                # Handle empty input
+                if not text:
+                    if default_value:
+                        return default_value
+                    elif allow_empty:
+                        return ""
+                    else:
+                        tui.show_error("Input required. Try again.")
+                        continue
+
+                return text
+
+            except KeyboardInterrupt:
+                # Return None to signal cancellation
+                return None
+
     def get_text(
         self,
         prompt_msg: str = "Enter text:",
