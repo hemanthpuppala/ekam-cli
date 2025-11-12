@@ -225,7 +225,7 @@ def show_suite_selection(current_value: Optional[SuiteType] = None) -> Optional[
     return (suite_type, "next")
 
 
-def show_model_selection(model_type: ModelType, session_manager) -> Optional[List[str]]:
+def show_model_selection(model_type: ModelType, session_manager) -> Optional[tuple[List[str], str]]:
     """
     Display model selection screen (multi-select).
 
@@ -234,7 +234,8 @@ def show_model_selection(model_type: ModelType, session_manager) -> Optional[Lis
         session_manager: SessionManager to query available models
 
     Returns:
-        List of selected model IDs or None if cancelled
+        Tuple of (selected_model_ids, action) where action is "next", "back", or "cancel";
+        returns None on hard cancel
     """
     from src.cli.tui_manager import tui
 
@@ -283,9 +284,10 @@ def show_model_selection(model_type: ModelType, session_manager) -> Optional[Lis
         console.print(table)
         console.print()
 
-        # Multi-select prompt
+        # Multi-select prompt with navigation hints
         console.print("[yellow]Enter model numbers separated by commas (e.g., 1,3,4)[/yellow]")
         console.print("[yellow]Or 'all' to select all models[/yellow]")
+        console.print("[dim]Hotkeys: b = Back, h = Home[/dim]")
 
         selection = get_text_input("Select models", allow_empty=False)
 
@@ -293,7 +295,13 @@ def show_model_selection(model_type: ModelType, session_manager) -> Optional[Lis
             return None
 
         # Parse selection
-        if selection.lower() == "all":
+        sel = selection.strip().lower()
+        if sel == "b":
+            return ([], "back")
+        if sel == "h":
+            return ([], "cancel")
+
+        if sel == "all":
             selected_models = [m.get("model_id") for m in available_models]
         else:
             try:
@@ -304,21 +312,163 @@ def show_model_selection(model_type: ModelType, session_manager) -> Optional[Lis
                         selected_models.append(available_models[idx - 1].get("model_id"))
                     else:
                         console.print(f"[red]Invalid index: {idx}[/red]")
-                        return None
+                        return ([], "back")
             except ValueError:
                 console.print("[red]Invalid input format![/red]")
-                return None
+                return ([], "back")
 
         if not selected_models:
             console.print("[red]No models selected![/red]")
-            return None
+            return ([], "back")
 
         console.print(f"\n[green]Selected {len(selected_models)} model(s):[/green]")
         for model_id in selected_models:
             display_name = _extract_model_display_name(model_id)
             console.print(f"  • {display_name}")
 
-        return selected_models
+        # Step 3.1: For quantized GGUF VLMs, pre-select mmproj if multiple candidates exist
+        try:
+            from src.models.endpoints import ProviderType
+            from src.cli.text_input import professional_prompt
+            from src.cli.tui_manager import tui as _tui
+            # Map model_id to ModelInfo to check provider types
+            discovered = session_manager.discover_models()
+            id_to_model = {m.model_id: m for m in discovered}
+            quant_provider = session_manager.model_discovery.get_provider(ProviderType.QUANTIZED)
+
+            if quant_provider is not None and hasattr(quant_provider, "_find_mmproj_candidates"):
+                # Filter only quantized gguf models from selection
+                pending = []
+                from pathlib import Path
+                for mid in selected_models:
+                    model = id_to_model.get(mid)
+                    if not model:
+                        continue
+                    # Determine if this model is provided by the QUANTIZED provider
+                    provider_obj = getattr(model, "provider", None)
+                    provider_name = str(provider_obj.value if hasattr(provider_obj, "value") else provider_obj).lower()
+                    if not (provider_obj == ProviderType.QUANTIZED or provider_name == "quantized"):
+                        continue
+                    parts = str(mid).split(":", 2)
+                    if len(parts) == 3 and parts[0] == "quantized" and parts[1] == "gguf":
+                        pending.append(Path(parts[2]))
+
+                if pending:
+                    # Clear previous table and show a dedicated Step 3.1 screen
+                    from src.cli.tui_manager import tui as __tui
+                    __tui.clear_screen()
+                    _show_step_header(3, 7, "Vision Encoder Selection", "Select mmproj for quantized VLMs (if multiple are found)")
+
+                    # Show a compact summary of selected models at the top
+                    console.print(f"[green]Selected {len(selected_models)} model(s):[/green]")
+                    for mid in selected_models:
+                        display_name = _extract_model_display_name(mid)
+                        console.print(f"  • {display_name}")
+                    console.print()
+
+                i = 0
+                while i < len(pending):
+                    lang_path = pending[i]
+                    # Get candidates
+                    try:
+                        candidates = quant_provider._find_mmproj_candidates(lang_path)
+                    except Exception as e:
+                        logger.debug(f"mmproj scan failed for {lang_path}: {e}")
+                        continue
+
+                    if not candidates:
+                        i += 1
+                        continue
+                    # If only one candidate found, try a broader family match to detect additional mmproj variants
+                    if len(candidates) == 1:
+                        try:
+                            import re
+                            base = lang_path.stem.lower()
+                            # Strip language/format tokens anywhere in name, not just suffix
+                            base_general = re.sub(r"(_language|_text|_model)", "", base)
+                            # Remove any quant/precision tokens anywhere
+                            base_general = re.sub(r"_q\d[^_]*", "", base_general)
+                            base_general = re.sub(r"_(f16|f32|bf16|fp16)", "", base_general)
+                            family = base_general.strip('_')
+
+                            broad = []
+                            for mmproj in quant_provider.quantized_dir.rglob("mmproj-*.gguf"):
+                                name = mmproj.stem[len("mmproj-"):].lower()
+                                name = re.sub(r"(_language|_text|_model)", "", name)
+                                name = re.sub(r"_q\d[^_]*", "", name)
+                                name = re.sub(r"_(f16|f32|bf16|fp16)", "", name)
+                                name = name.strip('_')
+                                if name == family or name in family or family in name:
+                                    if mmproj not in candidates:
+                                        broad.append(mmproj)
+                            if broad:
+                                candidates.extend(broad)
+                        except Exception:
+                            pass
+
+                    if len(candidates) == 1:
+                        quant_provider._session_mmproj_choice[str(lang_path)] = candidates[0]
+                        logger.info(f"Auto-selected mmproj for {lang_path.name}: {candidates[0].name}")
+                        i += 1
+                        continue
+
+                    # Multiple candidates, prompt user once per model
+                    options = [("__back", "[blue]← Back[/blue]", "Go back to previous selection or model list")]
+                    for p in candidates:
+                        try:
+                            meta = quant_provider.metadata_cache.get_metadata(str(p), provider="gguf")
+                        except Exception:
+                            meta = None
+                        try:
+                            size_gb = p.stat().st_size / (1024 ** 3)
+                        except Exception:
+                            size_gb = 0.0
+                        quant = (meta.quantization.upper() if meta and getattr(meta, "quantization", None) else "UNKNOWN")
+                        label = f"[green]{p.name}[/green]"
+                        desc = f"{size_gb:.2f} GB • {quant}"
+                        options.append((str(p), label, desc))
+
+                    _tui.console.print(f"\n[cyan]Select vision encoder (mmproj) for[/cyan] [yellow]{lang_path.name}[/yellow]")
+                    _tui.console.print(
+                        f"[dim]Found {len(candidates)} candidate mmproj files in results/quantizations[/dim]"
+                    )
+                    _tui.console.print(
+                        "[dim]Choose the one to pair with this VLM. Different quantizations can impact speed/quality.[/dim]"
+                    )
+                    _tui.console.print(
+                        "[dim]Your choice is remembered for this session and used during loading.[/dim]"
+                    )
+                    choice = professional_prompt.get_arrow_selection(
+                        options=options,
+                        title="Select Vision Encoder (mmproj)",
+                        instructions="Use ↑/↓ arrows, Enter to select, q to skip",
+                    )
+                    if not choice:
+                        _tui.console.print("[yellow]Skipped mmproj selection for this model (auto-detect later)[/yellow]")
+                        i += 1
+                        continue
+                    if choice == "__back":
+                        # If at first model, go back to Step 3 (model selection)
+                        if i == 0:
+                            return None
+                        # Otherwise go back to previous model's mmproj selection
+                        i -= 1
+                        # Clear any previous remembered choice to force re-selection
+                        try:
+                            key = str(pending[i])
+                            if key in quant_provider._session_mmproj_choice:
+                                del quant_provider._session_mmproj_choice[key]
+                        except Exception:
+                            pass
+                        continue
+                    sel_path = Path(choice)
+                    quant_provider._session_mmproj_choice[str(lang_path)] = sel_path
+                    logger.info(f"User selected mmproj for {lang_path.name}: {sel_path.name}")
+                    i += 1
+        except Exception as mmerr:
+            logger.debug(f"mmproj pre-selection step skipped due to: {mmerr}")
+
+        return (selected_models, "next")
 
     except Exception as e:
         logger.error(f"Failed to get models: {e}")
@@ -684,6 +834,300 @@ def _manual_prompt_entry_wizard(
             return None
 
 
+def _json_pairs_upload_wizard(
+    model_type: ModelType,
+    selected_endpoint: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Interactive wizard for uploading image-prompt pairs from JSON file.
+
+    Supports two JSON formats:
+    1. Dict format: {"image1.jpg": "prompt1", "image2.jpg": "prompt2"}
+    2. List format: [{"image": "img.jpg", "prompt": "p1"}, {"image": "img.jpg", "prompt": "p2"}]
+
+    Args:
+        model_type: LLM or VLM (VLM requires images)
+        selected_endpoint: VLM endpoint (if applicable)
+
+    Returns:
+        Dict with 'prompts', 'images', and 'pairs', or None if cancelled
+    """
+    from src.cli.text_input import professional_prompt
+    from src.cli.tui_manager import tui
+    from rich.panel import Panel
+    import json
+    from pathlib import Path
+
+    # Helper: Validate image path (reuse existing logic)
+    def validate_image_path(path_str: str) -> Optional[Path]:
+        """Validate and resolve image path using CWD -> project root -> absolute."""
+        if not path_str:
+            return None
+
+        # Strip quotes (single or double) from path
+        path_str = path_str.strip().strip('"').strip("'")
+
+        # Try CWD first
+        cwd_path = Path.cwd() / path_str
+        if cwd_path.exists() and cwd_path.is_file():
+            return cwd_path
+
+        # Try project root (parent of src/)
+        project_root = Path(__file__).parent.parent.parent.parent
+        root_path = project_root / path_str
+        if root_path.exists() and root_path.is_file():
+            return root_path
+
+        # Try as absolute path
+        abs_path = Path(path_str)
+        if abs_path.exists() and abs_path.is_file():
+            return abs_path
+
+        return None
+
+    while True:
+        tui.clear_screen()
+        console.print(f"[bold magenta]JSON Image-Prompt Pairs Upload[/bold magenta]")
+        console.print()
+
+        # Show example formats in a panel
+        example_dict = """{
+  "path/to/image1.jpg": "Describe this image",
+  "path/to/image2.jpg": "What objects are visible?"
+}"""
+
+        example_list = """[
+  {"image": "path/to/image1.jpg", "prompt": "Describe this image"},
+  {"image": "path/to/image1.jpg", "prompt": "What colors are present?"},
+  {"image": "path/to/image2.jpg", "prompt": "Count the objects"}
+]"""
+
+        console.print(Panel(
+            f"[bold cyan]Supported JSON Formats:[/bold cyan]\n\n"
+            f"[yellow]1. Dict Format (1:1 mapping):[/yellow]\n"
+            f"[dim]{example_dict}[/dim]\n\n"
+            f"[yellow]2. List Format (supports same image with different prompts):[/yellow]\n"
+            f"[dim]{example_list}[/dim]\n\n"
+            f"[bold]Notes:[/bold]\n"
+            f"• Image paths can be relative to project root or absolute\n"
+            f"• Same image can appear multiple times with different prompts (list format)\n"
+            f"• All image paths will be validated before proceeding",
+            title="[cyan]JSON Format Examples[/cyan]",
+            border_style="cyan"
+        ))
+        console.print()
+
+        # Get JSON file path
+        console.print("[bold cyan]Enter path to JSON file:[/bold cyan]")
+        console.print("[dim]Supports quotes, relative paths, and absolute paths[/dim]")
+        console.print("[dim]Commands: /back (return to previous step)[/dim]")
+        console.print()
+
+        json_path_input = professional_prompt.get_text_input(
+            prompt="JSON file path",
+            default_value="",
+            allow_empty=False,
+            multiline=False
+        )
+
+        if json_path_input is None or json_path_input.lower() == "/back":
+            return None
+
+        # Strip quotes and resolve path
+        json_path_str = json_path_input.strip().strip('"').strip("'")
+        json_path = Path(json_path_str)
+
+        # Try resolving relative to CWD or project root
+        if not json_path.exists():
+            project_root = Path(__file__).parent.parent.parent.parent
+            json_path_alt = project_root / json_path_str
+            if json_path_alt.exists():
+                json_path = json_path_alt
+
+        # Validate JSON file exists
+        if not json_path.exists():
+            console.print(f"[red]✗ JSON file not found: {json_path}[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        if not json_path.is_file():
+            console.print(f"[red]✗ Not a file: {json_path}[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        # Load and parse JSON
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+        except json.JSONDecodeError as e:
+            console.print(f"[red]✗ Invalid JSON format: {e}[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+        except Exception as e:
+            console.print(f"[red]✗ Failed to read JSON file: {e}[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        # Parse JSON data into pairs
+        pairs = []
+        errors = []
+
+        if isinstance(json_data, dict):
+            # Dict format: {"image.jpg": "prompt"}
+            for img_path, prompt in json_data.items():
+                if not isinstance(prompt, str):
+                    errors.append(f"Prompt for '{img_path}' is not a string")
+                    continue
+                pairs.append((img_path, prompt))
+
+        elif isinstance(json_data, list):
+            # List format: [{"image": "...", "prompt": "..."}]
+            for idx, item in enumerate(json_data):
+                if not isinstance(item, dict):
+                    errors.append(f"Item {idx} is not a dictionary")
+                    continue
+
+                img_path = item.get("image") or item.get("image_path") or item.get("img")
+                prompt = item.get("prompt")
+
+                if not img_path:
+                    errors.append(f"Item {idx} missing 'image' field")
+                    continue
+                if not prompt:
+                    errors.append(f"Item {idx} missing 'prompt' field")
+                    continue
+                if not isinstance(prompt, str):
+                    errors.append(f"Item {idx} prompt is not a string")
+                    continue
+
+                pairs.append((img_path, prompt))
+        else:
+            console.print(f"[red]✗ JSON must be a dict or list, got {type(json_data).__name__}[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        if errors:
+            console.print(f"[red]✗ Found {len(errors)} error(s) in JSON:[/red]")
+            for error in errors[:5]:  # Show first 5 errors
+                console.print(f"  • {error}")
+            if len(errors) > 5:
+                console.print(f"  [dim]... and {len(errors) - 5} more[/dim]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        if not pairs:
+            console.print(f"[red]✗ No valid image-prompt pairs found in JSON[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        # Validate all image paths
+        console.print()
+        console.print(f"[cyan]Validating {len(pairs)} image path(s)...[/cyan]")
+        console.print()
+
+        validated_pairs = []
+        validation_errors = []
+
+        for img_path_str, prompt in pairs:
+            validated_path = validate_image_path(img_path_str)
+            if not validated_path:
+                validation_errors.append(f"Image not found: {img_path_str}")
+                continue
+
+            # Check image format
+            valid_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+            if validated_path.suffix.lower() not in valid_extensions:
+                validation_errors.append(f"Unsupported format ({validated_path.suffix}): {img_path_str}")
+                continue
+
+            validated_pairs.append((str(validated_path), prompt))
+
+        if validation_errors:
+            console.print(f"[red]✗ Found {len(validation_errors)} validation error(s):[/red]")
+            for error in validation_errors[:10]:  # Show first 10 errors
+                console.print(f"  • {error}")
+            if len(validation_errors) > 10:
+                console.print(f"  [dim]... and {len(validation_errors) - 10} more[/dim]")
+            console.print()
+            console.print("[yellow]Options:[/yellow]")
+            console.print("  [1] Fix JSON file and retry")
+            console.print("  [2] Continue with valid pairs only")
+            console.print("  [3] Cancel")
+            console.print()
+
+            choice = professional_prompt.get_text_input(
+                prompt="Choose option (1/2/3)",
+                default_value="1",
+                allow_empty=False
+            )
+
+            if choice == "1" or choice is None:
+                continue  # Retry
+            elif choice == "3":
+                return None  # Cancel
+            # else: continue with validated_pairs (choice == "2")
+
+        if not validated_pairs:
+            console.print(f"[red]✗ No valid pairs after validation[/red]")
+            console.print("[dim]Press Enter to retry...[/dim]")
+            input()
+            continue
+
+        # Show summary
+        console.print()
+        console.print(f"[green]✓ Successfully loaded {len(validated_pairs)} image-prompt pair(s)[/green]")
+        console.print()
+        console.print("[bold]Sample pairs:[/bold]")
+        for idx, (img_path, prompt) in enumerate(validated_pairs[:5], 1):
+            img_name = Path(img_path).name
+            prompt_preview = prompt[:60] + "..." if len(prompt) > 60 else prompt
+            console.print(f"  [cyan]{idx}.[/cyan] [dim]{img_name}:[/dim] {prompt_preview}")
+
+        if len(validated_pairs) > 5:
+            console.print(f"  [dim]... and {len(validated_pairs) - 5} more pair(s)[/dim]")
+
+        console.print()
+
+        # Confirm
+        menu_options = [
+            ("confirm", "[green]Yes - Use these pairs[/green]", "Proceed with loaded pairs"),
+            ("retry", "[yellow]No - Try another file[/yellow]", "Load a different JSON file"),
+            ("cancel", "[red]Cancel[/red]", "Return to previous step"),
+        ]
+
+        choice = professional_prompt.get_arrow_selection(
+            options=menu_options,
+            title="Confirm JSON pairs",
+            instructions="Y = Yes, N = No, C = Cancel"
+        )
+
+        if choice == "confirm" or choice == "y":
+            # Extract images and prompts from validated pairs
+            images = [img for img, _ in validated_pairs]
+            prompts = [prompt for _, prompt in validated_pairs]
+
+            result = {
+                "prompts": prompts,
+                "images": images,
+                "pairs": validated_pairs,
+                "source": "json_upload"
+            }
+            return result
+
+        elif choice == "retry" or choice == "n":
+            continue  # Loop back to file selection
+
+        elif choice == "cancel" or choice == "c" or choice is None:
+            return None
+
+
 def show_num_prompts_config(
     suite_name: str,
     current_value: Optional[int] = None
@@ -704,7 +1148,7 @@ def show_num_prompts_config(
 
     # Suite-specific defaults
     suite_defaults = {
-        "speed": 20,
+        "speed": 10,
         "resources": 10,
         "quality": 20,
         "stress": 3,
@@ -718,16 +1162,22 @@ def show_num_prompts_config(
         tui.clear_screen()
         _show_step_header(5, 8, "Number of Prompts", f"Configure how many prompts to use for {suite_name.title()} suite")
 
-        console.print("[bold]Prompt Configuration:[/bold]")
-        console.print()
-        console.print(f"  Each prompt will be run exactly once (1 prompt = 1 run)")
+        # Guidance
+        console.print("Each prompt will be run exactly once (1 prompt = 1 run)")
         if suite_name.lower() == "quality":
-            console.print(f"  [dim](Quality suite will generate multiple outputs per prompt)[/dim]")
+            console.print("[dim](Quality suite will generate multiple outputs per prompt)[/dim]")
         elif suite_name.lower() == "stress":
-            console.print(f"  [dim](Stress suite will cycle through prompts for the duration)[/dim]")
+            console.print("[dim](Stress suite will cycle through prompts for the duration)[/dim]")
         console.print()
-        console.print(f"  [cyan]Current value:[/cyan] {num_prompts} prompts")
-        console.print(f"  [dim]Range: 1-50 | Default: {default_value}[/dim]")
+
+        # Tabular display of current value
+        from rich.table import Table as _Table
+        tbl = _Table.grid(padding=(0, 2))
+        tbl.add_column("Parameter", style="cyan")
+        tbl.add_column("Current Value", style="white")
+        tbl.add_row("Prompts", f"{num_prompts}")
+        console.print(tbl)
+        console.print(f"[dim]Range: 1-50 | Default: {default_value}[/dim]")
         console.print()
 
         # Menu options
@@ -762,11 +1212,8 @@ def show_num_prompts_config(
         elif choice == "edit":
             # Prompt for new value
             console.print()
-            console.print("[bold cyan]Enter number of prompts (1-50):[/bold cyan]")
-            console.print("[dim]Type /back to return, /default for default value[/dim]")
-
             user_input = professional_prompt.get_text_input(
-                prompt="Number of prompts",
+                prompt="Number of prompts [1-50]",
                 default_value=str(num_prompts),
                 allow_empty=False
             )
@@ -837,20 +1284,6 @@ def show_test_data_selection(
     # Build arrow-key options based on model type and available data
     arrow_options = []
 
-    # For VLM with structured test data, show structured option
-    if model_type == ModelType.VLM and selected_endpoint:
-        from src.benchmarking.datasets.defaults import validate_endpoint_data
-
-        endpoint_status = validate_endpoint_data(selected_endpoint)
-
-        if endpoint_status.get("is_ready"):
-            image_count = endpoint_status['image_count']
-            arrow_options.append((
-                "structured",
-                "[green]Structured Test Data[/green]",
-                f"Pre-configured {image_count} image-prompt pairs for {selected_endpoint}"
-            ))
-
     # Add default and custom options
     default_available = 20  # We have 20 default prompts per endpoint
     if model_type == ModelType.LLM:
@@ -864,10 +1297,12 @@ def show_test_data_selection(
             ("custom", "[yellow]Custom Prompts[/yellow]", f"Manually enter all {num_prompts} prompts one by one")
         ])
     else:  # VLM
-        if num_prompts <= default_available:
-            default_desc = f"Use {num_prompts} default prompts with test images"
-        else:
-            default_desc = f"Use {default_available} defaults + manual entry for {num_prompts - default_available} more"
+        # Default now loads image-prompt pairs from assets/test_data for the selected endpoint
+        default_desc = (
+            f"Load image-prompt pairs from test_data for {selected_endpoint}"
+            if selected_endpoint else
+            "Load image-prompt pairs from VLM test_data"
+        )
 
         arrow_options.extend([
             ("default", "[cyan]Default Test Data[/cyan]", default_desc),
@@ -892,113 +1327,186 @@ def show_test_data_selection(
         return (None, "back")
 
     # Process selection
-    if choice == "structured":
-        from src.benchmarking.datasets.defaults import get_test_data_for_endpoint
-
-        test_data = get_test_data_for_endpoint(selected_endpoint)
-        console.print(f"\n[green]✓ Loaded {test_data['num_pairs']} image-prompt pairs[/green]")
-        console.print(f"[dim]Endpoint: {selected_endpoint}[/dim]")
-
-        result = {
-            "source": "structured",
-            "endpoint": selected_endpoint,
-            "prompts": test_data["prompts"],
-            "images": test_data["images"],
-            "pairs": test_data["pairs"],
-        }
-        return (result, "next")
-
-    elif choice == "default":
+    if choice == "default":
         # Use default prompts (up to 20 available)
-        from src.benchmarking.datasets.defaults import get_default_prompts_for_suite
+        if model_type == ModelType.VLM and selected_endpoint:
+            # For VLM, Default pulls paired images+prompts from assets/test_data for the endpoint
+            from src.benchmarking.datasets.defaults import get_test_data_for_endpoint
 
-        prompts = []
-        images = []
+            test_data = get_test_data_for_endpoint(selected_endpoint, count=num_prompts)
+            console.print(f"\n[green]✓ Loaded {test_data['num_pairs']} image-prompt pairs[/green]")
+            console.print(f"[dim]Endpoint: {selected_endpoint}[/dim]")
 
-        if num_prompts <= 20:
-            # Use first N default prompts
-            prompts = get_default_prompts_for_suite(suite_name, model_type, count=num_prompts)
-            console.print(f"\n[green]✓ Loaded {len(prompts)} suite-specific default prompts[/green]")
-
-            result = {"source": "default", "prompts": prompts, "images": images}
+            result = {
+                "source": "default",
+                "endpoint": selected_endpoint,
+                "prompts": test_data["prompts"],
+                "images": test_data["images"],
+                "pairs": test_data["pairs"],
+            }
             return (result, "next")
         else:
-            # Use all 20 defaults + manual entry for overflow
-            prompts = get_default_prompts_for_suite(suite_name, model_type, count=20)
-            console.print(f"\n[cyan]✓ Loaded {len(prompts)} default prompts[/cyan]")
-            console.print(f"[yellow]→ Need {num_prompts - 20} more prompts via manual entry[/yellow]")
-            console.print()
-            console.print("[dim]Press Enter to start manual entry wizard...[/dim]")
-            input()
+            # LLM default behavior (prompts only) and VLM fallback if no endpoint provided
+            from src.benchmarking.datasets.defaults import get_default_prompts_for_suite
 
-            # Launch wizard for remaining prompts
-            wizard_result = _manual_prompt_entry_wizard(
-                num_prompts=num_prompts - 20,
-                model_type=model_type,
-                selected_endpoint=selected_endpoint,
-                existing_prompts=[],
-                existing_images=[]
-            )
+            prompts = []
+            images = []
 
-            # Handle wizard commands
-            if wizard_result is None:
-                return (None, "back")
-            elif wizard_result.get("_command") == "/runs":
-                return (None, "runs")
-            elif wizard_result.get("_command") == "/default":
-                # User wants to skip to defaults - just use the 20 we have
-                console.print(f"\n[yellow]Using only {len(prompts)} default prompts[/yellow]")
+            if num_prompts <= 20:
+                prompts = get_default_prompts_for_suite(suite_name, model_type, count=num_prompts)
+                console.print(f"\n[green]✓ Loaded {len(prompts)} suite-specific default prompts[/green]")
                 result = {"source": "default", "prompts": prompts, "images": images}
                 return (result, "next")
+            else:
+                prompts = get_default_prompts_for_suite(suite_name, model_type, count=20)
+                console.print(f"\n[cyan]✓ Loaded {len(prompts)} default prompts[/cyan]")
+                console.print(f"[yellow]→ Need {num_prompts - 20} more prompts via manual entry[/yellow]")
+                console.print()
+                console.print("[dim]Press Enter to start manual entry wizard...[/dim]")
+                input()
 
-            # Combine defaults + manual entries
-            prompts.extend(wizard_result["prompts"])
-            if model_type == ModelType.VLM and "images" in wizard_result:
-                images.extend(wizard_result["images"])
+                wizard_result = _manual_prompt_entry_wizard(
+                    num_prompts=num_prompts - 20,
+                    model_type=model_type,
+                    selected_endpoint=selected_endpoint,
+                    existing_prompts=[],
+                    existing_images=[]
+                )
 
-            console.print(f"\n[green]✓ Total: {len(prompts)} prompts ({20} default + {num_prompts - 20} manual)[/green]")
+                if wizard_result is None:
+                    return (None, "back")
+                elif wizard_result.get("_command") == "/runs":
+                    return (None, "runs")
+                elif wizard_result.get("_command") == "/default":
+                    console.print(f"\n[yellow]Using only {len(prompts)} default prompts[/yellow]")
+                    result = {"source": "default", "prompts": prompts, "images": images}
+                    return (result, "next")
 
-            result = {"source": "mixed", "prompts": prompts, "images": images}
-            return (result, "next")
+                prompts.extend(wizard_result["prompts"])
+                if model_type == ModelType.VLM and "images" in wizard_result:
+                    images.extend(wizard_result["images"])
+
+                # Build pairs for VLM
+                pairs = []
+                if model_type == ModelType.VLM and images:
+                    pairs = list(zip(images, prompts))
+
+                console.print(f"\n[green]✓ Total: {len(prompts)} prompts ({20} default + {num_prompts - 20} manual)[/green]")
+
+                result = {
+                    "source": "mixed",
+                    "prompts": prompts,
+                    "images": images,
+                    "pairs": pairs
+                }
+                return (result, "next")
 
     elif choice == "custom":
-        # Full manual entry for all prompts
-        console.print(f"\n[yellow]Manual Prompt Entry Mode[/yellow]")
-        console.print(f"[dim]You will enter {num_prompts} prompts one by one[/dim]")
-        console.print()
-        console.print("[dim]Press Enter to start...[/dim]")
-        input()
+        # STEP 1: Choose between JSON upload or manual entry
+        while True:
+            tui.clear_screen()
+            _show_step_header(6, 8, "Custom Prompts - Input Method", "Choose how to provide your custom prompts")
 
-        # Launch wizard
-        wizard_result = _manual_prompt_entry_wizard(
-            num_prompts=num_prompts,
-            model_type=model_type,
-            selected_endpoint=selected_endpoint,
-            existing_prompts=[],
-            existing_images=[]
-        )
+            # Build sub-menu for VLM custom prompts
+            if model_type == ModelType.VLM:
+                custom_options = [
+                    ("json", "[cyan]Upload JSON File[/cyan]", f"Load image-prompt pairs from JSON (supports duplicate images)"),
+                    ("manual", "[yellow]Enter Manually[/yellow]", f"Enter {num_prompts} image-prompt pairs one by one"),
+                ]
+            else:  # LLM
+                custom_options = [
+                    ("manual", "[yellow]Enter Manually[/yellow]", f"Enter {num_prompts} prompts one by one"),
+                ]
 
-        # Handle wizard result
-        if wizard_result is None:
-            return (None, "back")
-        elif wizard_result.get("_command") == "/runs":
-            return (None, "runs")
-        elif wizard_result.get("_command") == "/default":
-            # User wants to switch to defaults
-            from src.benchmarking.datasets.defaults import get_default_prompts_for_suite
-            prompts = get_default_prompts_for_suite(suite_name, model_type, count=min(num_prompts, 20))
-            console.print(f"\n[yellow]Switched to {len(prompts)} default prompts[/yellow]")
-            result = {"source": "default", "prompts": prompts, "images": []}
-            return (result, "next")
+            custom_options.extend([
+                ("__previous", "[blue]← Previous[/blue]", "Go back to test data selection"),
+                ("__cancel", "[red]Cancel[/red]", "Cancel benchmark configuration"),
+            ])
 
-        # Successfully collected all prompts
-        prompts = wizard_result["prompts"]
-        images = wizard_result.get("images", [])
+            custom_choice = professional_prompt.get_arrow_selection(
+                options=custom_options,
+                title="Select Custom Prompt Input Method",
+                instructions="Use ↑/↓ arrows to navigate, Enter to select"
+            )
 
-        console.print(f"\n[green]✓ Successfully entered {len(prompts)} custom prompts[/green]")
+            if custom_choice is None or custom_choice == "__cancel":
+                return (None, "cancel")
+            elif custom_choice == "__previous":
+                return (None, "back")
 
-        result = {"source": "custom", "prompts": prompts, "images": images}
-        return (result, "next")
+            # STEP 2: Handle JSON upload
+            if custom_choice == "json":
+                json_result = _json_pairs_upload_wizard(
+                    model_type=model_type,
+                    selected_endpoint=selected_endpoint
+                )
+
+                if json_result is None:
+                    continue  # Go back to custom input method selection
+
+                # Successfully loaded JSON
+                prompts = json_result["prompts"]
+                images = json_result.get("images", [])
+                pairs = json_result.get("pairs", [])
+
+                console.print(f"\n[green]✓ Successfully loaded {len(prompts)} prompts from JSON[/green]")
+
+                result = {
+                    "source": "json_upload",
+                    "prompts": prompts,
+                    "images": images,
+                    "pairs": pairs
+                }
+                return (result, "next")
+
+            # STEP 3: Handle manual entry
+            elif custom_choice == "manual":
+                console.print(f"\n[yellow]Manual Prompt Entry Mode[/yellow]")
+                console.print(f"[dim]You will enter {num_prompts} prompts one by one[/dim]")
+                console.print()
+                console.print("[dim]Press Enter to start...[/dim]")
+                input()
+
+                # Launch wizard
+                wizard_result = _manual_prompt_entry_wizard(
+                    num_prompts=num_prompts,
+                    model_type=model_type,
+                    selected_endpoint=selected_endpoint,
+                    existing_prompts=[],
+                    existing_images=[]
+                )
+
+                # Handle wizard result
+                if wizard_result is None:
+                    continue  # Go back to custom input method selection
+                elif wizard_result.get("_command") == "/runs":
+                    return (None, "runs")
+                elif wizard_result.get("_command") == "/default":
+                    # User wants to switch to defaults
+                    from src.benchmarking.datasets.defaults import get_default_prompts_for_suite
+                    prompts = get_default_prompts_for_suite(suite_name, model_type, count=min(num_prompts, 20))[:num_prompts]
+                    console.print(f"\n[yellow]Switched to {len(prompts)} default prompts[/yellow]")
+                    result = {"source": "default", "prompts": prompts, "images": []}
+                    return (result, "next")
+
+                # Successfully collected all prompts (enforce count limit)
+                prompts = wizard_result["prompts"][:num_prompts]
+                images = wizard_result.get("images", [])
+
+                # Build pairs for VLM
+                pairs = []
+                if model_type == ModelType.VLM and images:
+                    pairs = list(zip(images, prompts))
+
+                console.print(f"\n[green]✓ Successfully entered {len(prompts)} custom prompts[/green]")
+
+                result = {
+                    "source": "custom",
+                    "prompts": prompts,
+                    "images": images,
+                    "pairs": pairs
+                }
+                return (result, "next")
 
 
 def show_parameters_config(current_value: Optional[Dict[str, Any]] = None) -> Optional[tuple]:
@@ -1015,63 +1523,76 @@ def show_parameters_config(current_value: Optional[Dict[str, Any]] = None) -> Op
     from src.cli.text_input import professional_prompt
     from src.cli.tui_manager import tui
 
-    # Initialize parameters with defaults
-    # NOTE: num_runs removed - now configured as num_prompts in Step 5
+    # Initialize parameters with defaults (common across providers)
     params = {
-        "num_warmup": current_value.get("num_warmup", 1) if current_value else 1,
-        "temperature": current_value.get("temperature", 0.7) if current_value else 0.7,
-        "max_tokens": current_value.get("max_tokens", 512) if current_value else 512,
-        "export_formats": current_value.get("export_formats", ["json", "csv"]) if current_value else ["json", "csv"],
+        "num_warmup": (current_value or {}).get("num_warmup", 1),
+        "temperature": (current_value or {}).get("temperature", 0.7),
+        "top_p": (current_value or {}).get("top_p", 0.9),
+        "top_k": (current_value or {}).get("top_k", 50),
+        "max_tokens": (current_value or {}).get("max_tokens", 512),
+        "n_ctx": (current_value or {}).get("n_ctx", 2048),
+        "image_resolution": (current_value or {}).get("image_resolution", "1280x1024"),
     }
 
     while True:
         tui.clear_screen()
         _show_step_header(7, 8, "Benchmark Parameters", "Configure model inference parameters")
 
-        # Show current configuration summary
-        console.print("[bold]Current Configuration:[/bold]")
-        console.print()
-        console.print(f"  [cyan]Warmup runs:[/cyan] {params['num_warmup']}")
-        console.print(f"  [cyan]Temperature:[/cyan] {params['temperature']}")
-        console.print(f"  [cyan]Max tokens:[/cyan] {params['max_tokens']}")
-        console.print(f"  [cyan]Export formats:[/cyan] {', '.join(params['export_formats'])}")
-        console.print()
+        # Show current configuration summary as a structured table
+        from rich.table import Table as _Table
+        from rich.panel import Panel as _Panel
+        from rich.columns import Columns as _Columns
+
+        param_table = _Table(padding=(0, 1))
+        param_table.add_column("Parameter", style="cyan")
+        param_table.add_column("Value", style="white")
+        param_table.add_column("Range", style="dim")
+
+        param_table.add_row("Warmup runs", str(params['num_warmup']), "0-5")
+        param_table.add_row("Temperature", str(params['temperature']), "0.0-1.0")
+        param_table.add_row("Top-p", str(params['top_p']), "0.0-1.0")
+        param_table.add_row("Top-k", str(params['top_k']), "0-200")
+        param_table.add_row("Max tokens", str(params['max_tokens']), "1-4096")
+        param_table.add_row("n_ctx", str(params['n_ctx']), "256-32768")
+        param_table.add_row("Image resolution", str(params['image_resolution']), "WIDTHxHEIGHT")
+
+        console.print(param_table)
         console.print("[dim]Note: Number of prompts configured in Step 5[/dim]")
         console.print()
 
         # Build interactive menu options
+        from src.cli.text_input import professional_prompt
         menu_options = [
-            ("edit_warmup", "[yellow]Warmup runs[/yellow]", f"Currently: {params['num_warmup']} (range: 0-5)"),
-            ("edit_temp", "[yellow]Temperature[/yellow]", f"Currently: {params['temperature']} (range: 0.0-1.0)"),
-            ("edit_tokens", "[yellow]Max tokens[/yellow]", f"Currently: {params['max_tokens']} (range: 1-4096)"),
-            ("edit_formats", "[yellow]Export formats[/yellow]", f"Currently: {', '.join(params['export_formats'])}"),
+            ("edit_warmup", "Warmup runs", f"Currently: {params['num_warmup']} (range: 0-5)"),
+            ("edit_temp", "Temperature", f"Currently: {params['temperature']} (range: 0.0-1.0)"),
+            ("edit_top_p", "Top-p", f"Currently: {params['top_p']} (range: 0.0-1.0)"),
+            ("edit_top_k", "Top-k", f"Currently: {params['top_k']} (range: 0-200)"),
+            ("edit_tokens", "Max tokens", f"Currently: {params['max_tokens']} (range: 1-4096)"),
+            ("edit_nctx", "n_ctx", f"Currently: {params['n_ctx']} (range: 256-32768)"),
+            ("edit_img_res", "Image resolution", f"Currently: {params['image_resolution']} (format: WIDTHxHEIGHT)"),
             ("__separator", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""),
-            ("continue", "[green]Continue to Step 8 →[/green]", "Proceed to execution mode selection"),
-            ("__previous", "[blue]← Previous[/blue]", "Go back to test data selection"),
-            ("__cancel", "[red]Cancel[/red]", "Cancel benchmark configuration"),
+            ("__continue", "Continue to Final Review →", "Proceed to configuration review"),
+            ("__previous", "← Previous", "Go back to test data selection"),
+            ("__cancel", "Cancel", "Cancel benchmark configuration"),
         ]
 
-        # Get user selection
         choice = professional_prompt.get_arrow_selection(
             options=menu_options,
             title="Select parameter to edit or continue",
             instructions="Use ↑/↓ arrows to navigate, Enter to select"
         )
 
-        # Handle navigation
-        if choice is None or choice == "__cancel":
+        choice_key = choice
+
+        if choice_key is None or choice_key == "__cancel":
             return (None, "cancel")
-        elif choice == "__previous":
+        if choice_key == "__previous":
             return (None, "back")
-        elif choice == "__separator":
-            # Separator selected, ignore
-            continue
-        elif choice == "continue":
-            # Validate and return
+        if choice_key == "__continue":
             return (params, "next")
 
-        # Handle parameter editing
-        elif choice == "edit_warmup":
+        # Selected a parameter card; open corresponding editor
+        if choice_key == "edit_warmup":
             tui.clear_screen()
             console.print()
             console.print("[bold cyan]Edit Warmup Runs[/bold cyan]")
@@ -1087,7 +1608,7 @@ def show_parameters_config(current_value: Optional[Dict[str, Any]] = None) -> Op
             )
             params["num_warmup"] = new_value
 
-        elif choice == "edit_temp":
+        elif choice_key == "edit_temp":
             tui.clear_screen()
             console.print()
             console.print("[bold cyan]Edit Temperature[/bold cyan]")
@@ -1112,7 +1633,38 @@ def show_parameters_config(current_value: Optional[Dict[str, Any]] = None) -> Op
             console.print()
             tui.prompt("Press Enter to continue...", style="dim")
 
-        elif choice == "edit_tokens":
+        elif choice_key == "edit_top_p":
+            tui.clear_screen()
+            console.print("[bold cyan]Edit Top-p[/bold cyan]")
+            tp = professional_prompt.get_input(
+                f"Top-p (default: {params['top_p']})",
+                style="cyan",
+                allow_multiline=False,
+                show_instructions=False
+            )
+            if tp:
+                try:
+                    params['top_p'] = max(0.0, min(1.0, float(tp)))
+                except ValueError:
+                    pass
+
+        elif choice_key == "edit_top_k":
+            tui.clear_screen()
+            console.print("[bold cyan]Edit Top-k[/bold cyan]")
+            tk = professional_prompt.get_input(
+                f"Top-k (default: {params['top_k']})",
+                style="cyan",
+                allow_multiline=False,
+                show_instructions=False
+            )
+            if tk:
+                try:
+                    v = int(tk)
+                    params['top_k'] = max(0, min(200, v))
+                except ValueError:
+                    pass
+
+        elif choice_key == "edit_tokens":
             tui.clear_screen()
             console.print()
             console.print("[bold cyan]Edit Max Tokens[/bold cyan]")
@@ -1127,6 +1679,57 @@ def show_parameters_config(current_value: Optional[Dict[str, Any]] = None) -> Op
                 style="cyan"
             )
             params["max_tokens"] = new_value
+
+        elif choice_key == "edit_nctx":
+            tui.clear_screen()
+            console.print("[bold cyan]Edit n_ctx[/bold cyan]")
+            console.print("[dim]Context window size (tokens kept in memory)[/dim]")
+            new_value = professional_prompt.get_numeric(
+                prompt_msg="n_ctx",
+                min_val=256,
+                max_val=32768,
+                default=params["n_ctx"],
+                style="cyan"
+            )
+            params["n_ctx"] = new_value
+
+        elif choice_key == "edit_img_res":
+            tui.clear_screen()
+            console.print()
+            console.print("[bold cyan]Edit Image Resolution[/bold cyan]")
+            console.print("[dim]VLM input images will be rescaled to this resolution (maintains aspect ratio with padding)[/dim]")
+            console.print(f"[dim]Format: WIDTHxHEIGHT (e.g., 1280x1024, 1920x1080)[/dim]")
+            console.print(f"[dim]Range: 256x256 to 4096x4096 per dimension[/dim]")
+            console.print(f"[dim]Current: {params['image_resolution']}[/dim]")
+            console.print()
+
+            resolution_input = professional_prompt.get_input(
+                f"Image resolution (default: {params['image_resolution']})",
+                style="cyan",
+                allow_multiline=False,
+                show_instructions=False
+            )
+
+            # Use default if user pressed Enter without input
+            if not resolution_input.strip():
+                resolution_input = params['image_resolution']
+
+            # Parse and validate resolution (WIDTHxHEIGHT)
+            import re
+            match = re.match(r'(\d+)x(\d+)', resolution_input.strip())
+            if match:
+                width, height = int(match.group(1)), int(match.group(2))
+                # Validate range (256-4096 per dimension)
+                if 256 <= width <= 4096 and 256 <= height <= 4096:
+                    params["image_resolution"] = f"{width}x{height}"
+                    console.print(f"[green]✓ Image resolution set to: {width}x{height}[/green]")
+                else:
+                    console.print(f"[red]✗ Invalid range. Must be 256-4096 per dimension. Keeping: {params['image_resolution']}[/red]")
+            else:
+                console.print(f"[red]✗ Invalid format. Use WIDTHxHEIGHT (e.g., 1280x1024). Keeping: {params['image_resolution']}[/red]")
+
+            console.print()
+            tui.prompt("Press Enter to continue...", style="dim")
 
         elif choice == "edit_formats":
             tui.clear_screen()

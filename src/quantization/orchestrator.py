@@ -115,18 +115,32 @@ class QuantizationOrchestrator:
         target_family = target_quant_type.method_family
 
         # ========== VLM INCOMPATIBILITY CHECKS ==========
-        # GGUF: VLMs cannot be converted to GGUF (llama.cpp doesn't support vision encoders)
+        # GGUF: Modern VLMs are now supported (Qwen2-VL, Gemma3, SmolVLM, etc.)
+        # Legacy VLMs (LLaVA 1.5/1.6, MiniCPM-V) require GenericQuantizer
         if is_vlm and target_family == "GGUF":
-            raise ValueError(
-                f"❌ GGUF quantization is NOT supported for Vision-Language Models (VLMs)\n\n"
-                f"Why: llama.cpp doesn't support vision encoders (CLIP, ViT) or multimodal architectures.\n\n"
-                f"Available alternatives for VLMs:\n"
-                f"  • Generic FP16 (size: 50%, quality: perfect) - RECOMMENDED\n"
-                f"  • Generic INT8 (size: 25%, CUDA required, component-level with language-only)\n"
-                f"  • Generic INT4 (size: 12.5%, CUDA required, component-level with language-only)\n"
-                f"  • BitsAndBytes (HuggingFace integration, CUDA required)\n"
-                f"  • MLX INT4 (Apple Silicon, component-level support)\n"
-            )
+            # Check if it's a modern VLM with GGUF support
+            try:
+                from .models.vlm_detector import VLMDetector
+                from pathlib import Path
+                vlm_info = VLMDetector.detect(Path(model_info.model_id) if is_hf else Path(model_info.source_path or model_info.model_id))
+                if vlm_info.is_vlm and not vlm_info.architecture.supports_modern_conversion:
+                    # Legacy VLM - reject GGUF
+                    raise ValueError(
+                        f"❌ GGUF quantization is NOT supported for {vlm_info.architecture.display_name}\n\n"
+                        f"Why: Legacy VLM architecture requires special conversion scripts.\n\n"
+                        f"Available alternatives:\n"
+                        f"  • Generic FP16 (size: 50%, quality: perfect) - RECOMMENDED\n"
+                        f"  • Generic INT8/INT4 (component-level: language-only)\n"
+                        f"  • MLX INT4 (Apple Silicon, full model)\n"
+                    )
+                # Modern VLM: allow GGUF conversion (will be handled by GGUFQuantizer with --mmproj)
+                logger.info(f"✓ VLM GGUF conversion supported: {vlm_info.architecture.display_name}")
+            except ValueError:
+                raise  # Re-raise if it's our VLM rejection error
+            except Exception as e:
+                logger.warning(f"Could not detect VLM architecture for GGUF check: {e}")
+                # Be optimistic - let GGUFQuantizer handle the detection and conversion
+                logger.info("Attempting VLM GGUF conversion - will detect architecture during conversion")
 
         # GPTQ: Not designed for VLMs
         if is_vlm and target_family == "GPTQ":

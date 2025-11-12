@@ -31,3 +31,24 @@ Models are automatically unloaded in **ALL** exit scenarios:
 5. ✅ **Unexpected errors** - Exception handler triggers cleanup
 
 No manual cleanup required!
+
+## VLM GGUF Compatibility Notes
+
+- Ekam uses llama.cpp’s `convert_hf_to_gguf.py` with `--mmproj` for VLMs, producing a text model GGUF and a `mmproj-*.gguf` vision projector.
+- After conversion, Ekam inspects the mmproj to detect the expected input dimension of the projector MLP:
+  - 1152 → single-crop features (fully compatible)
+  - 2304 → multi-crop (global + regional) features (e.g., some Moondream2 variants)
+
+If 2304 is detected, Ekam logs a warning. The bundled llama.cpp in this repository includes a safe concat-zero fallback in `tools/mtmd/clip.cpp` that prevents crashes on Metal and other backends (quality may be slightly degraded vs. multi-crop training).
+
+### Optional VLM Smoke Test
+
+You can run a quick local sanity test after conversion by enabling:
+
+```bash
+EKAM_VLM_SMOKETEST=1 ekam quantize --to gguf <hf_model_id>
+```
+
+Requirements:
+- A locally built `llama.cpp` binary (`llama-mtmd-cli` or `llava-cli`)
+- A test image in `assets/` (e.g., `assets/image_3.jpg`)

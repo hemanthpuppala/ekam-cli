@@ -815,51 +815,57 @@ class ModelMetadataCache:
             file_size_gb = gguf_path.stat().st_size / 1e9
             file_mtime = gguf_path.stat().st_mtime
 
-            # PERFORMANCE FIX: Use gguf library for header-only reading (100x faster)
-            # This avoids loading the entire multi-GB model file into memory
+            # PERFORMANCE FIX: Prefer bundled gguf reader (no weight loading)
+            # Avoid llama-cpp-python fallback to prevent destructor errors on partial init
+            metadata_dict = {}
             try:
-                from gguf import GGUFReader
+                # Try to import bundled gguf reader via helper (adds local llama.cpp/gguf-py)
+                from .gguf_inspect import _import_gguf_reader
+                GGUFReader = _import_gguf_reader()
+                if GGUFReader is None:
+                    raise ImportError("gguf reader not available")
 
                 # Read metadata from GGUF header directly (no model loading!)
-                # This only reads the first few KB of the file
                 reader = GGUFReader(str(gguf_path))
 
-                # Extract metadata from header
-                metadata_dict = {}
+                # Extract ONLY the metadata we need (skip tokenizer arrays)
                 if hasattr(reader, 'fields'):
-                    for field in reader.fields.values():
-                        # Convert field name and value to dict format
-                        field_name = str(field.name) if hasattr(field, 'name') else ''
-                        if hasattr(field, 'parts') and field.parts:
-                            # Handle array/nested fields
-                            metadata_dict[field_name] = str(field.parts[0]) if len(field.parts) == 1 else [str(p) for p in field.parts]
+                    try:
+                        from gguf import GGUFValueType  # type: ignore
+                    except Exception:
+                        GGUFValueType = None  # Best-effort without types
+
+                    for field in getattr(reader, 'fields', {}).values():
+                        field_name = str(getattr(field, 'name', ''))
+
+                        # Skip tokenizer fields (huge arrays, not needed)
+                        if field_name.startswith('tokenizer.'):
+                            continue
+
+                        if hasattr(field, 'types') and hasattr(field, 'parts') and getattr(field, 'parts', None):
+                            try:
+                                if GGUFValueType and field.types and field.types[0] == GGUFValueType.STRING:
+                                    string_bytes = field.parts[-1]
+                                    metadata_dict[field_name] = bytes(string_bytes).decode('utf-8', errors='ignore')
+                                elif len(field.parts[-1]) == 1:
+                                    metadata_dict[field_name] = field.parts[-1][0]
+                                else:
+                                    # Skip large arrays for performance
+                                    pass
+                            except Exception:
+                                # Best-effort fallback
+                                pass
                         elif hasattr(field, 'value'):
                             metadata_dict[field_name] = field.value
 
-                logger.debug(f"Read GGUF header with {len(metadata_dict)} metadata fields")
+                logger.debug(
+                    f"Read GGUF header with {len(metadata_dict)} metadata fields (fast mode, skipped tokenizer)"
+                )
 
-            except ImportError:
-                # Fallback to llama-cpp-python if gguf library not available
-                logger.debug("gguf library not available, falling back to llama-cpp-python")
-                try:
-                    from llama_cpp import Llama
-                    model = Llama(model_path=str(gguf_path), n_ctx=512, n_gpu_layers=0, verbose=False)
-                    metadata_dict = model.metadata if hasattr(model, "metadata") else {}
-                    del model
-                except Exception as e:
-                    logger.debug(f"Could not load GGUF: {e}")
-                    metadata_dict = {}
             except Exception as e:
-                logger.debug(f"Could not read GGUF header with gguf library: {e}, trying fallback")
-                # Fallback to llama-cpp-python
-                try:
-                    from llama_cpp import Llama
-                    model = Llama(model_path=str(gguf_path), n_ctx=512, n_gpu_layers=0, verbose=False)
-                    metadata_dict = model.metadata if hasattr(model, "metadata") else {}
-                    del model
-                except Exception as e2:
-                    logger.debug(f"Fallback also failed: {e2}")
-                    metadata_dict = {}
+                # Do not fall back to llama_cpp.Llama to avoid __del__ AttributeError on partial init
+                logger.debug(f"GGUF header read not available ({e}); proceeding with filename-based inference")
+                metadata_dict = {}
 
             # Extract architecture from filename or metadata
             architecture = self._extract_gguf_architecture(gguf_path, metadata_dict)
@@ -915,7 +921,11 @@ class ModelMetadataCache:
         """
         # Try metadata first
         if "general.architecture" in metadata:
-            return metadata["general.architecture"]
+            arch_value = metadata["general.architecture"]
+            # Handle case where metadata value is a list
+            if isinstance(arch_value, list):
+                return str(arch_value[0]) if arch_value else "unknown"
+            return str(arch_value)
 
         # Parse from filename
         filename = gguf_path.stem.lower()
@@ -949,32 +959,37 @@ class ModelMetadataCache:
         Returns:
             Quantization string (q4_k_m, q5_k_s, etc.)
         """
-        filename_lower = filename.lower()
+        from pathlib import Path as _P
+        name = _P(filename).stem.lower()
 
-        # GGUF quantization patterns
+        # Known quantization tokens (ordered for precedence); include bf16 before f16
         quant_patterns = [
-            "q2_k",
-            "q3_k_m",
-            "q3_k_s",
-            "q4_0",
-            "q4_1",
-            "q4_k_m",
-            "q4_k_s",
-            "q5_0",
-            "q5_1",
-            "q5_k_m",
-            "q5_k_s",
-            "q6_k",
-            "q8_0",
-            "f16",
-            "f32",
+            # 3-token patterns
+            "q5_k_m", "q5_k_s", "q4_k_m", "q4_k_s", "q3_k_m", "q3_k_s", "q3_k_l",
+            # 2-token patterns
+            "q5_0", "q5_1", "q4_0", "q4_1", "q3_k", "q2_k", "q6_k", "q8_0",
+            # IQ/TQ variants (common in community builds)
+            "iq4_xs", "iq4_nl", "iq3_xs", "iq3_xxs", "iq3_s", "iq3_m",
+            "iq2_xs", "iq2_xxs", "iq2_s", "iq2_m", "iq1_m", "iq1_s",
+            "tq1_0", "tq2_0",
+            # Precision formats
+            "bf16", "f16", "f32",
         ]
 
-        for pattern in quant_patterns:
-            if pattern in filename_lower:
-                return pattern
+        # Build regex for token-bound matches and select the rightmost occurrence
+        import re as _re
+        best_match = None
+        best_pos = -1
+        for pat in quant_patterns:
+            # Match whole token separated by _ or - or string boundaries
+            rx = _re.compile(rf"(^|[\-_]){_re.escape(pat)}($|[\-_])")
+            for m in rx.finditer(name):
+                # Rightmost match wins
+                if m.end() > best_pos:
+                    best_pos = m.end()
+                    best_match = pat
 
-        return "unknown"
+        return best_match or "unknown"
 
     def _estimate_params_from_gguf(self, file_size_gb: float, quantization: str) -> float:
         """Estimate parameter count from GGUF file size.

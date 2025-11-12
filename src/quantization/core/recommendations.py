@@ -186,43 +186,137 @@ def _get_gguf_recommendations(
 ) -> list[QuantizationRecommendation]:
     """Get GGUF quantization recommendations.
 
-    ALWAYS shows all GGUF types, but marks as unavailable for VLMs.
+    ALWAYS shows all GGUF types. For VLMs, checks if modern conversion is supported.
     """
     recommendations = []
     original_size_gb = model_info.size_gb
 
-    # Check if VLM (llama.cpp doesn't support VLMs yet)
+    # Check if VLM and if it supports modern GGUF conversion
     from ...models.endpoints import ModelType
+    from ...models.provider import ProviderType
+    from ...models.vlm_detector import VLMDetector
+    from pathlib import Path
+
     is_vlm = model_info.model_type == ModelType.VLM
+    vlm_supports_gguf = False
+    vlm_architecture = None
+
+    if is_vlm:
+        # Detect VLM architecture and check if modern conversion is supported
+        try:
+            model_path = Path(model_info.source_path) if model_info.source_path else None
+            if model_path and model_path.exists():
+                vlm_info = VLMDetector.detect(model_path)
+                vlm_supports_gguf = vlm_info.is_vlm and vlm_info.architecture.supports_modern_conversion
+                vlm_architecture = vlm_info.architecture.display_name
+        except Exception as e:
+            from loguru import logger
+            logger.warning(f"Failed to detect VLM architecture: {e}")
+
+        # Provider-based allowance: if the source is already GGUF or Ollama, enable GGUF re-quantization
+        try:
+            if getattr(model_info, "provider", None) in [ProviderType.GGUF, ProviderType.OLLAMA]:
+                vlm_supports_gguf = True or vlm_supports_gguf
+        except Exception:
+            pass
 
     # Estimate sizes for different quantization levels
     size_factors = {
-        QuantizationType.GGUF_Q4_K_M: 0.5,  # ~50% of original
-        QuantizationType.GGUF_Q4_K_S: 0.45,  # Smaller variant
-        QuantizationType.GGUF_Q5_K_M: 0.6,  # ~60% of original
-        QuantizationType.GGUF_Q5_K_S: 0.55,
-        QuantizationType.GGUF_Q6_K: 0.7,  # ~70% of original
-        QuantizationType.GGUF_Q8_0: 0.9,  # ~90% of original
+        # Full precision formats
+        QuantizationType.GGUF_F32: 1.0,   # 100% of original (32-bit)
+        QuantizationType.GGUF_F16: 0.5,   # 50% of original (16-bit) ⭐ Popular
+        QuantizationType.GGUF_BF16: 0.5,  # 50% of original (brain float16)
+
+        # 8-bit quantization
+        QuantizationType.GGUF_Q8_0: 0.27,  # ~27% (8.5 bpw)
+
+        # 6-bit quantization
+        QuantizationType.GGUF_Q6_K: 0.21,  # ~21% (6.56 bpw)
+
+        # 5-bit quantization
+        QuantizationType.GGUF_Q5_K_M: 0.18,  # ~18% (5.54 bpw) ⭐ Popular
+        QuantizationType.GGUF_Q5_K_S: 0.17,  # ~17% (5.5 bpw)
+
+        # 4-bit quantization
+        QuantizationType.GGUF_Q4_K_M: 0.15,  # ~15% (4.58 bpw) ⭐ Popular
+        QuantizationType.GGUF_Q4_K_S: 0.14,  # ~14% (4.55 bpw)
+        QuantizationType.GGUF_IQ4_XS: 0.13,  # ~13% (4.25 bpw - best quality 4-bit)
+
+        # 3-bit quantization
+        QuantizationType.GGUF_Q3_K_M: 0.11,  # ~11% (3.91 bpw)
+        QuantizationType.GGUF_Q3_K_S: 0.10,  # ~10% (3.5 bpw)
+        QuantizationType.GGUF_IQ3_M: 0.11,   # ~11% (3.7 bpw)
+
+        # 2-bit quantization
+        QuantizationType.GGUF_Q2_K: 0.08,    # ~8% (2.8 bpw)
+        QuantizationType.GGUF_IQ2_M: 0.08,   # ~8% (2.7 bpw)
+        QuantizationType.GGUF_IQ2_S: 0.07,   # ~7% (2.5 bpw)
     }
 
     # Quality and speed scores (higher is better)
     scores = {
-        QuantizationType.GGUF_Q4_K_M: (8, 9),  # (quality, speed)
-        QuantizationType.GGUF_Q4_K_S: (7, 10),
+        # Full precision - maximum quality, slowest
+        QuantizationType.GGUF_F32: (10, 2),   # Full precision, very slow
+        QuantizationType.GGUF_F16: (10, 5),   # Half precision, good balance ⭐
+        QuantizationType.GGUF_BF16: (10, 5),  # Brain float16, ML-optimized
+
+        # 8-bit - excellent quality
+        QuantizationType.GGUF_Q8_0: (10, 6),  # Near-lossless
+
+        # 6-bit - very good quality
+        QuantizationType.GGUF_Q6_K: (9, 7),
+
+        # 5-bit - good quality, popular ⭐
         QuantizationType.GGUF_Q5_K_M: (9, 8),
         QuantizationType.GGUF_Q5_K_S: (8, 9),
-        QuantizationType.GGUF_Q6_K: (9, 7),
-        QuantizationType.GGUF_Q8_0: (10, 6),
+
+        # 4-bit - balanced, very popular ⭐
+        QuantizationType.GGUF_Q4_K_M: (8, 9),
+        QuantizationType.GGUF_Q4_K_S: (7, 10),
+        QuantizationType.GGUF_IQ4_XS: (8, 9),  # Best quality 4-bit
+
+        # 3-bit - acceptable quality
+        QuantizationType.GGUF_Q3_K_M: (7, 10),
+        QuantizationType.GGUF_Q3_K_S: (6, 10),
+        QuantizationType.GGUF_IQ3_M: (7, 10),
+
+        # 2-bit - noticeable degradation
+        QuantizationType.GGUF_Q2_K: (5, 10),
+        QuantizationType.GGUF_IQ2_M: (6, 10),  # Better than Q2_K
+        QuantizationType.GGUF_IQ2_S: (5, 10),
     }
 
     # Best use cases
     best_for = {
-        QuantizationType.GGUF_Q4_K_M: "Edge devices, Raspberry Pi",
-        QuantizationType.GGUF_Q4_K_S: "Low-memory devices",
-        QuantizationType.GGUF_Q5_K_M: "Desktop, balanced performance",
+        # Full precision
+        QuantizationType.GGUF_F32: "Maximum precision, large systems only",
+        QuantizationType.GGUF_F16: "Universal compatibility, 50% size reduction ⭐",
+        QuantizationType.GGUF_BF16: "ML workloads, training compatibility",
+
+        # 8-bit
+        QuantizationType.GGUF_Q8_0: "Archival, near-lossless quality",
+
+        # 6-bit
+        QuantizationType.GGUF_Q6_K: "Server inference, high quality",
+
+        # 5-bit ⭐
+        QuantizationType.GGUF_Q5_K_M: "Desktop, excellent quality/size balance ⭐",
         QuantizationType.GGUF_Q5_K_S: "Desktop, memory-constrained",
-        QuantizationType.GGUF_Q6_K: "Server, high-quality inference",
-        QuantizationType.GGUF_Q8_0: "Archival, maximum quality",
+
+        # 4-bit ⭐
+        QuantizationType.GGUF_Q4_K_M: "Edge devices, good quality ⭐",
+        QuantizationType.GGUF_Q4_K_S: "Low-memory devices, Raspberry Pi",
+        QuantizationType.GGUF_IQ4_XS: "Best 4-bit quality, importance-weighted",
+
+        # 3-bit
+        QuantizationType.GGUF_Q3_K_M: "Very low memory, acceptable quality",
+        QuantizationType.GGUF_Q3_K_S: "Extreme memory constraints",
+        QuantizationType.GGUF_IQ3_M: "Low memory, importance-weighted",
+
+        # 2-bit
+        QuantizationType.GGUF_Q2_K: "Experimental, severe quality loss",
+        QuantizationType.GGUF_IQ2_M: "Experimental, better than Q2_K",
+        QuantizationType.GGUF_IQ2_S: "Experimental, maximum compression",
     }
 
     available_ram_gb = system_specs.available_ram_gb
@@ -231,28 +325,40 @@ def _get_gguf_recommendations(
         estimated_size = original_size_gb * factor
         quality, speed = scores[quant_type]
 
-        # Estimate time: ~2-4 minutes per GB depending on CPU
+        # Estimate time: F16/F32/BF16 are conversions (faster), others are quantizations
         cpu_cores = system_specs.cpu_cores_physical
-        time_per_gb = 3.0 / (cpu_cores / 4)  # Scale with cores
+
+        if quant_type in [QuantizationType.GGUF_F16, QuantizationType.GGUF_F32, QuantizationType.GGUF_BF16]:
+            # Conversion only (HF safetensors → GGUF format)
+            time_per_gb = 1.5 / (cpu_cores / 4)  # Faster than quantization
+        else:
+            # Quantization (conversion + quantization step)
+            time_per_gb = 3.0 / (cpu_cores / 4)  # Scale with cores
+
         estimated_time = original_size_gb * time_per_gb
 
         # Determine if this fits in available RAM
         fits_in_ram = estimated_size < (available_ram_gb * 0.7)  # Leave 30% headroom
 
         # Determine availability
-        if is_vlm:
+        if is_vlm and not vlm_supports_gguf:
+            # Legacy VLM that doesn't support modern GGUF conversion
             is_available = False
             unavailable_reason = (
-                "GGUF doesn't support Vision-Language Models (VLMs). "
-                "llama.cpp cannot convert VLM architectures. "
-                "Use Generic FP16 or BitsAndBytes quantization for VLMs instead."
+                f"VLM architecture '{vlm_architecture}' does not support GGUF conversion. "
+                "Modern VLMs (Qwen2-VL, Gemma3, SmolVLM, etc.) are supported. "
+                "Use Generic FP16 or BitsAndBytes quantization for this VLM instead."
             )
-            reason = f"{quant_type.display_name}: NOT supported for VLMs. llama.cpp limitation."
+            reason = f"{quant_type.display_name}: NOT supported for this VLM architecture."
         else:
             is_available = True
             unavailable_reason = ""
             # Reason for this quantization
-            reason = f"{quant_type.display_name}: "
+            if is_vlm and vlm_supports_gguf:
+                reason = f"{quant_type.display_name} (VLM): "
+            else:
+                reason = f"{quant_type.display_name}: "
+
             if not fits_in_ram:
                 reason += f"⚠️  May exceed available RAM ({available_ram_gb:.1f}GB). "
             else:
@@ -264,6 +370,9 @@ def _get_gguf_recommendations(
                 reason += "Good quality."
             else:
                 reason += "Acceptable quality."
+
+            if is_vlm and vlm_supports_gguf:
+                reason += f" Vision components (mmproj) will be generated."
 
         recommendations.append(
             QuantizationRecommendation(

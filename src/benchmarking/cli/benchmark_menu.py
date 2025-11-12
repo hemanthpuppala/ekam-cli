@@ -161,7 +161,7 @@ class BenchmarkMenuFlow:
             while True:
                 # Step 1: Model Type Selection
                 if current_step == 0:
-                    logger.debug("Step 1/8: Model Type Selection")
+                    logger.info("Step 1/8: Model Type Selection")
                     current_value = self.state.get("model_type")
                     result = show_model_type_selection(current_value)
 
@@ -179,12 +179,12 @@ class BenchmarkMenuFlow:
                         continue
                     else:  # next
                         self.state["model_type"] = value
-                        logger.debug(f"Model type selected: {value.value}")
+                        logger.info(f"Step 1 completed: Model type = {value.value}")
                         current_step = 1
 
                 # Step 2: Suite Selection
                 elif current_step == 1:
-                    logger.debug("Step 2/8: Suite Selection")
+                    logger.info("Step 2/8: Suite Selection")
                     current_value = self.state.get("suite")
                     result = show_suite_selection(current_value)
 
@@ -201,11 +201,11 @@ class BenchmarkMenuFlow:
                         current_step = 0  # Go back to model type
                     else:  # next
                         self.state["suite"] = value
-                        logger.debug(f"Suite selected: {value.value}")
+                        logger.info(f"Step 2 completed: Suite = {value.value}")
 
                         # If Complete suite selected, show sub-suite selection
                         if value == SuiteType.COMPLETE:
-                            logger.debug("Complete suite selected, showing sub-suite selection")
+                            logger.info("Complete suite selected, showing sub-suite selection")
                             current_value_suites = self.state.get("complete_suites")
                             suite_result = show_complete_suite_selection(current_value_suites)
 
@@ -223,29 +223,42 @@ class BenchmarkMenuFlow:
                                 continue
                             else:  # next
                                 self.state["complete_suites"] = suites_value
-                                logger.debug(f"Complete sub-suites selected: {', '.join(suites_value)}")
+                                logger.info(f"Complete sub-suites: {', '.join(suites_value)}")
 
                         current_step = 2
 
-                # Step 3: Model Selection (multi-select - TODO: refactor later)
+                # Step 3: Model Selection (multi-select)
                 elif current_step == 2:
-                    logger.debug("Step 3/8: Model Selection")
+                    logger.info("Step 3/8: Model Selection")
                     model_type = self.state["model_type"]
-                    models = show_model_selection(model_type, self.session_manager)
+                    result = show_model_selection(model_type, self.session_manager)
 
-                    if models is None or not models:
-                        # For now, treat cancel as going back
-                        logger.debug("Going back from model selection")
-                        current_step = 1
+                    if result is None:
+                        logger.info("User cancelled at step 3")
+                        return None
+
+                    models, action = result
+
+                    if action == "cancel":
+                        logger.info("User cancelled at model selection")
+                        return None
+                    elif action == "back":
+                        current_step = 1  # Go back to suite selection
                         continue
-
-                    self.state["models"] = models
-                    logger.debug(f"Models selected: {len(models)} model(s)")
-                    current_step = 3
+                    else:  # next
+                        if not models:
+                            logger.info("No models selected; staying on model selection")
+                            current_step = 2
+                            continue
+                        self.state["models"] = models
+                        logger.info(f"Step 3 completed: {len(models)} model(s) selected")
+                        for model_id in models:
+                            logger.info(f"  - {model_id}")
+                        current_step = 3
 
                 # Step 4: Endpoint Selection
                 elif current_step == 3:
-                    logger.debug("Step 4/8: Endpoint Selection")
+                    logger.info("Step 4/8: Endpoint Selection")
                     models = self.state["models"]
                     model_type = self.state["model_type"]
                     current_value = self.state.get("endpoints")
@@ -265,12 +278,14 @@ class BenchmarkMenuFlow:
                         current_step = 2  # Go back to model selection
                     else:  # next
                         self.state["endpoints"] = value
-                        logger.debug(f"Endpoints configured for {len(value)} model(s)")
+                        logger.info(f"Step 4 completed: Endpoints configured for {len(value)} model(s)")
+                        for model_id, endpoints in value.items():
+                            logger.info(f"  - {model_id}: {endpoints}")
                         current_step = 4
 
                 # Step 5: Number of Prompts Configuration
                 elif current_step == 4:
-                    logger.debug("Step 5/8: Number of Prompts")
+                    logger.info("Step 5/8: Number of Prompts Configuration")
                     suite_name = self.state["suite"].value
                     current_value = self.state.get("num_prompts")
 
@@ -290,12 +305,12 @@ class BenchmarkMenuFlow:
                         current_step = 3  # Go back to endpoint selection
                     else:  # next
                         self.state["num_prompts"] = value
-                        logger.debug(f"Number of prompts: {value}")
+                        logger.info(f"Step 5 completed: Number of prompts = {value}")
                         current_step = 5
 
                 # Step 6: Test Data Selection
                 elif current_step == 5:
-                    logger.debug("Step 6/8: Test Data Selection")
+                    logger.info("Step 6/8: Test Data Selection")
                     model_type = self.state["model_type"]
                     num_prompts = self.state["num_prompts"]
                     suite_name = self.state["suite"].value
@@ -324,12 +339,17 @@ class BenchmarkMenuFlow:
                         current_step = 4  # Go back to num_prompts
                     else:  # next
                         self.state["test_data"] = value
-                        logger.debug(f"Test data configured: {value.get('source', 'unknown')}")
+                        source = value.get('source', 'unknown')
+                        logger.info(f"Step 6 completed: Test data source = {source}")
+                        if 'pairs' in value:
+                            logger.info(f"  - {len(value['pairs'])} image-prompt pairs configured")
+                        elif 'prompts' in value:
+                            logger.info(f"  - {len(value['prompts'])} prompts configured")
                         current_step = 6
 
                 # Step 7: Parameters Configuration
                 elif current_step == 6:
-                    logger.debug("Step 7/8: Parameters Configuration")
+                    logger.info("Step 7/8: Parameters Configuration")
                     current_value = self.state.get("parameters")
                     result = show_parameters_config(current_value)
 
@@ -346,34 +366,23 @@ class BenchmarkMenuFlow:
                         current_step = 5  # Go back to test data
                     else:  # next
                         self.state["parameters"] = value
-                        logger.debug(f"Parameters configured")
+                        logger.info(f"Step 7 completed: Parameters configured")
+                        logger.info(f"  - Temperature: {value.get('temperature', 'default')}")
+                        logger.info(f"  - Max tokens: {value.get('max_tokens', 'default')}")
+                        logger.info(f"  - Num runs: {value.get('num_runs', 'default')}")
+                        logger.info(f"  - Num warmup: {value.get('num_warmup', 'default')}")
                         current_step = 7
 
-                # Step 8: Execution Mode
+                # Step 8: Execution Mode (skipped, default to Foreground)
                 elif current_step == 7:
-                    logger.debug("Step 8/8: Execution Mode")
-                    current_value = self.state.get("execution_mode")
-                    result = show_execution_mode(current_value)
-
-                    if result is None:
-                        logger.info("User cancelled at step 8")
-                        return None
-
-                    value, action = result
-
-                    if action == "cancel":
-                        logger.info("User cancelled at execution mode selection")
-                        return None
-                    elif action == "back":
-                        current_step = 6  # Go back to parameters
-                    else:  # next
-                        self.state["execution_mode"] = value
-                        logger.debug(f"Execution mode: {value.value}")
-                        current_step = 8  # Proceed to review
+                    from src.benchmarking.models.metric_types import ExecutionMode
+                    logger.info("Step 8/8: Execution Mode (auto-configured to Foreground)")
+                    self.state["execution_mode"] = ExecutionMode.FOREGROUND
+                    current_step = 8  # Proceed to review
 
                 # Final: Configuration Review
                 elif current_step == 8:
-                    logger.debug("Step 8: Configuration Review")
+                    logger.info("Final Step: Configuration Review")
                     config_summary = self._build_config_summary()
                     review_action = show_config_review(config_summary, self.state)
 
@@ -383,20 +392,29 @@ class BenchmarkMenuFlow:
                         return None
 
                     elif review_action == "edit":
-                        logger.info("User chose to edit configuration, going back to Step 8")
+                        logger.info("User chose to edit configuration from review screen")
                         current_step = 7  # Go back to execution mode (Step 8)
                         continue
 
                     elif review_action == "save":
                         # Save was handled in show_config_review, just continue loop
-                        logger.info("Configuration saved, returning to review")
+                        logger.info("User saved configuration template")
                         continue
 
                     elif review_action == "confirm":
                         # Build and validate BenchmarkConfig
+                        logger.info("User confirmed configuration - building BenchmarkConfig")
                         try:
                             config = self._build_config()
-                            logger.info("BenchmarkConfig successfully created and validated")
+                            logger.info("=" * 80)
+                            logger.info("BENCHMARK CONFIGURATION CONFIRMED")
+                            logger.info("=" * 80)
+                            logger.info(f"Suite: {self.state['suite'].value}")
+                            logger.info(f"Models: {len(self.state['models'])}")
+                            logger.info(f"Num prompts: {self.state['num_prompts']}")
+                            logger.info(f"Num runs: {self.state['parameters'].get('num_runs', 'default')}")
+                            logger.info(f"Execution mode: {self.state['execution_mode'].value}")
+                            logger.info("=" * 80)
                             return config
 
                         except Exception as e:
@@ -426,14 +444,20 @@ class BenchmarkMenuFlow:
         Returns:
             Dictionary with human-readable configuration summary
         """
+        # Ensure models is a list (defensive coding)
+        models = self.state["models"]
+        if not isinstance(models, list):
+            logger.warning(f"models in summary was not a list (type={type(models)}), converting to list")
+            models = [models] if models else []
+            self.state["models"] = models  # Fix the state as well
+
         summary = {
             "model_type": self.state["model_type"].value.upper(),
             "suite": self.state["suite"].display_name(),
-            "models": self.state["models"],
+            "models": models,
             "num_runs": self.state["parameters"].get("num_runs", 0),
             "num_warmup": self.state["parameters"].get("num_warmup", 0),
             "execution_mode": self.state["execution_mode"].value.title(),
-            "export_formats": self.state["parameters"].get("export_formats", []),
         }
 
         # Add estimated duration
@@ -446,10 +470,11 @@ class BenchmarkMenuFlow:
         }
 
         base_duration = suite_durations.get(self.state["suite"], 30)
-        num_models = len(self.state["models"])
+        num_models = len(models)
         estimated_duration = base_duration * num_models
 
         summary["estimated_duration"] = estimated_duration
+        summary["export_formats"] = ["json", "csv"]
 
         return summary
 
@@ -466,10 +491,16 @@ class BenchmarkMenuFlow:
         # Extract parameters
         params = self.state["parameters"]
 
-        # Build generation parameters
+        # Build generation parameters (common across providers)
         generation_params = {
             "temperature": params.get("temperature", 0.7),
+            "top_p": params.get("top_p", 0.9),
+            "top_k": params.get("top_k", 50),
             "max_tokens": params.get("max_tokens", 512),
+            "n_ctx": params.get("n_ctx", 4096),
+            # Include run controls here so suite-specific builders can see them
+            "num_runs": params.get("num_runs", 5),
+            "num_warmup": params.get("num_warmup", 1),
         }
 
         # Add Complete suite configuration if applicable
@@ -480,18 +511,24 @@ class BenchmarkMenuFlow:
                 "stop_on_suite_failure": False,
             }
 
+        # Ensure models is a list (defensive coding)
+        models = self.state["models"]
+        if not isinstance(models, list):
+            logger.warning(f"models was not a list (type={type(models)}), converting to list")
+            models = [models] if models else []
+
         # Build config dictionary
         config_dict = {
             "suite_type": self.state["suite"],
             "model_type": self.state["model_type"],
-            "models": self.state["models"],
+            "models": models,
             "endpoints": self.state["endpoints"],
             "test_data": self.state["test_data"],
             "parameters": generation_params,
             "num_runs": params.get("num_runs", 5),
             "num_warmup": params.get("num_warmup", 1),
             "execution_mode": self.state["execution_mode"],
-            "export_formats": params.get("export_formats", ["json", "csv"]),
+            "export_formats": ["json", "csv"],
             "output_dir": Path("results"),
         }
 

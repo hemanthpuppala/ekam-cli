@@ -45,6 +45,9 @@ class OllamaProvider(BaseProvider):
         self.file_locator = OllamaFileLocator()
         logger.debug("Initialized Ollama file locator for quantization")
 
+        # Per-model context length overrides (num_ctx)
+        self._ctx_overrides: dict[str, int] = {}
+
     def discover_models(self) -> list[ModelInfo]:
         """Discover available models from Ollama server.
 
@@ -372,6 +375,52 @@ class OllamaProvider(BaseProvider):
             Model identifier as handle
         """
         logger.info(f"Loading Ollama model: {model_id}")
+        # Prompt for context length (num_ctx) before first use for this model
+        if model_id not in self._ctx_overrides:
+            from ..cli.text_input import professional_prompt
+            from ..cli.tui_manager import tui
+            min_ctx, max_ctx = 256, 32768
+            default_ctx = 4096
+            recommended_ctx = 4096
+
+            # Clear any prior panels (e.g., global loading) before prompting
+            tui.clear_screen()
+
+            import os
+            min_ctx, max_ctx = 256, 32768
+            default_ctx = 4096
+            n_ctx = default_ctx
+            try:
+                env_ctx = os.getenv("EKAM_N_CTX")
+                if env_ctx:
+                    n_ctx = max(min_ctx, min(max_ctx, int(env_ctx)))
+                if not os.getenv("EKAM_BENCHMARK_MODE"):
+                    tui.console.print("\n[cyan]Context Window (n_ctx)[/cyan] — tokens kept in memory per request")
+                    tui.console.print(
+                        f"[dim]Min:[/dim] {min_ctx}   [dim]Max:[/dim] {max_ctx}   "
+                        f"[dim]Default:[/dim] {default_ctx}   [dim]Recommended:[/dim] {default_ctx}"
+                    )
+                    tui.console.print("[dim]Higher values increase RAM/VRAM usage and may reduce throughput.[/dim]")
+                    n_ctx = professional_prompt.get_numeric(
+                        "Context length (tokens)",
+                        min_val=min_ctx,
+                        max_val=max_ctx,
+                        default=default_ctx,
+                        style="cyan",
+                    )
+            except Exception:
+                n_ctx = default_ctx
+            logger.info(f"Using Ollama num_ctx: {n_ctx}")
+            self._ctx_overrides[model_id] = n_ctx
+            # Clear and show a compact loading box after prompt
+            tui.clear_screen()
+            if not os.getenv("EKAM_BENCHMARK_MODE"):
+                tui.show_message(
+                    f"Loading model: {model_id}\n\n[dim]Please wait...[/dim]",
+                    title="Loading",
+                    style="cyan",
+                )
+
         # Ollama loads models on-demand during inference
         # Return model_id as handle for tracking
         return model_id
@@ -510,7 +559,8 @@ class OllamaProvider(BaseProvider):
         handle: Any,
         image: Image.Image,
         question: str,
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Run question answering on image using Ollama with unified history.
 
@@ -519,6 +569,7 @@ class OllamaProvider(BaseProvider):
             image: PIL Image to analyze
             question: Question to answer
             conversation_history: Optional list of (question, answer) tuples
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Text answer
@@ -537,21 +588,48 @@ class OllamaProvider(BaseProvider):
             "model": model_id,
             "prompt": formatted_question,
             "images": [image_b64],
-            "stream": False,
+            "stream": bool(stream_callback),  # Enable streaming if callback provided
         }
 
-        response = self.client.post(f"{self.base_url}/api/generate", json=payload)
-        response.raise_for_status()
-        result = response.json()
+        if stream_callback:
+            # Streaming mode
+            full_response = ""
+            with self.client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
+                response.raise_for_status()
 
-        return result.get("response", "").strip()
+                is_first_token = True
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            chunk = json.loads(line)
+                            delta = chunk.get("response", "")
+                            if delta:
+                                full_response += delta
+                                stream_callback(delta, is_first=is_first_token)
+                                is_first_token = False
+
+                            # Check if done
+                            if chunk.get("done", False):
+                                break
+                        except json.JSONDecodeError:
+                            continue
+
+            return full_response.strip()
+        else:
+            # Non-streaming mode
+            response = self.client.post(f"{self.base_url}/api/generate", json=payload)
+            response.raise_for_status()
+            result = response.json()
+
+            return result.get("response", "").strip()
 
     def run_caption(
         self,
         handle: Any,
         image: Image.Image,
         detail_level: str = "detailed",
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate image caption using Ollama with unified history.
 
@@ -560,6 +638,7 @@ class OllamaProvider(BaseProvider):
             image: PIL Image to caption
             detail_level: "detailed" or "short"
             conversation_history: Optional list of (prompt, response) tuples
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Text caption
@@ -584,14 +663,40 @@ class OllamaProvider(BaseProvider):
             "model": model_id,
             "prompt": formatted_prompt,
             "images": [image_b64],
-            "stream": False,
+            "stream": bool(stream_callback),  # Enable streaming if callback provided
         }
 
-        response = self.client.post(f"{self.base_url}/api/generate", json=payload)
-        response.raise_for_status()
-        result = response.json()
+        if stream_callback:
+            # Streaming mode
+            full_response = ""
+            with self.client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
+                response.raise_for_status()
 
-        return result.get("response", "").strip()
+                is_first_token = True
+                for line in response.iter_lines():
+                    if line:
+                        try:
+                            chunk = json.loads(line)
+                            delta = chunk.get("response", "")
+                            if delta:
+                                full_response += delta
+                                stream_callback(delta, is_first=is_first_token)
+                                is_first_token = False
+
+                            # Check if done
+                            if chunk.get("done", False):
+                                break
+                        except json.JSONDecodeError:
+                            continue
+
+            return full_response.strip()
+        else:
+            # Non-streaming mode
+            response = self.client.post(f"{self.base_url}/api/generate", json=payload)
+            response.raise_for_status()
+            result = response.json()
+
+            return result.get("response", "").strip()
 
     def run_detect(self, handle: Any, image: Image.Image, object_name: str) -> list[dict]:
         """Detect objects in image using Ollama.
@@ -697,7 +802,8 @@ class OllamaProvider(BaseProvider):
         prompt: str,
         conversation_history: Optional[list[tuple[str, str]]] = None,
         system_prompt: Optional[str] = None,
-        custom_parameters: Optional[dict] = None
+        custom_parameters: Optional[dict] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate text response using Ollama's /api/chat endpoint.
 
@@ -722,7 +828,10 @@ class OllamaProvider(BaseProvider):
         # Ollama handles template formatting automatically per model
         messages = []
 
-        # Add system message
+        # Add system message (allow /config system_prompt to override)
+        if custom_parameters and not system_prompt and isinstance(custom_parameters.get("system_prompt"), str):
+            system_prompt = custom_parameters.get("system_prompt")
+
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         else:
@@ -756,6 +865,10 @@ class OllamaProvider(BaseProvider):
             "stop": [],            # Let model finish naturally
         }
 
+        # Apply per-model context length if configured
+        if model_id in self._ctx_overrides:
+            options["num_ctx"] = self._ctx_overrides[model_id]
+
         # Override with custom parameters from session
         if custom_parameters:
             if "max_tokens" in custom_parameters:
@@ -770,6 +883,8 @@ class OllamaProvider(BaseProvider):
                 options["repeat_penalty"] = custom_parameters["repeat_penalty"]
             if "seed" in custom_parameters:
                 options["seed"] = custom_parameters["seed"]
+            if "stop" in custom_parameters:
+                options["stop"] = custom_parameters["stop"]
 
             logger.debug(f"Using custom parameters: {custom_parameters}")
 
@@ -782,9 +897,7 @@ class OllamaProvider(BaseProvider):
             "options": options
         }
 
-        # Handle streaming response
-        # Note: We accumulate chunks internally to maintain backward compatibility
-        # Future enhancement: Pass chunks to display layer for progressive rendering
+        # Handle streaming response (accumulate for return; optionally stream via callback)
         full_response = ""
 
         with self.client.stream("POST", f"{self.base_url}/api/chat", json=payload) as response:
@@ -796,7 +909,14 @@ class OllamaProvider(BaseProvider):
                         chunk = json.loads(line)
                         # Accumulate message content from each chunk
                         if "message" in chunk and "content" in chunk["message"]:
-                            full_response += chunk["message"]["content"]
+                            delta = chunk["message"]["content"]
+                            if delta:
+                                full_response += delta
+                                if stream_callback:
+                                    try:
+                                        stream_callback(delta, is_first=(len(full_response) == len(delta)))
+                                    except Exception:
+                                        pass
 
                         # Check if done
                         if chunk.get("done", False):
@@ -810,6 +930,14 @@ class OllamaProvider(BaseProvider):
         if not message_content:
             logger.warning(f"Empty response from {model_id}")
             return "No response generated."
+
+        # LOG RAW RESPONSE FROM OLLAMA (BEFORE ANY PROCESSING)
+        logger.info("="*80)
+        logger.info(f"[OLLAMA RAW RESPONSE] ({len(message_content)} chars)")
+        logger.info(message_content)
+        logger.info("="*80)
+        logger.info(f"[OLLAMA] Has <think> tags: {'<think>' in message_content.lower()}")
+        logger.info(f"[OLLAMA] Has </think> tags: {'</think>' in message_content.lower()}")
 
         # Apply response cleaning to remove artifacts and meta-commentary
         from ..utils.response_cleaner import clean_model_response

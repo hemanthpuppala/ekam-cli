@@ -10,6 +10,7 @@ Measures model stability under extended load:
 
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
+from pathlib import Path
 import time
 
 from src.benchmarking.suites.base_suite import BaseSuite
@@ -19,6 +20,7 @@ from src.benchmarking.models.metric_types import SuiteType, ResultStatus, Metric
 from src.benchmarking.models.suite_configs import StressConfig, stress_config_from_params
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
+from src.benchmarking.utils.llama_delay import apply_llama_server_delay
 from src.benchmarking.utils import MemoryOptimizer
 from loguru import logger
 
@@ -198,19 +200,44 @@ class StressSuite(BaseSuite):
                     input_data = prompt
                     input_image_path = "-"  # LLMs don't use images
                 else:  # VLM
-                    images = config.test_data.get("images", [])
-                    if not images:
-                        logger.warning("No images provided for VLM stress test")
-                        continue
-
-                    # Use image corresponding to current prompt (cycles with prompts)
-                    input_image_path = images[current_prompt_idx % len(images)]
+                    # Prefer explicit pairs mapping if provided
+                    pairs = config.test_data.get("pairs")
+                    def _normalize_pairs(p):
+                        if p is None:
+                            return []
+                        if isinstance(p, dict):
+                            return list(p.items())
+                        out = []
+                        for item in p:
+                            if isinstance(item, (list, tuple)) and len(item) == 2:
+                                out.append((item[0], item[1]))
+                            elif isinstance(item, dict):
+                                img = item.get("image") or item.get("image_path") or item.get("img")
+                                pr = item.get("prompt")
+                                if img is not None and pr is not None:
+                                    out.append((img, pr))
+                        return out
+                    _pairs = _normalize_pairs(pairs)
+                    if _pairs:
+                        # Align prompt to matching pair when possible
+                        match = next(((img, pr) for img, pr in _pairs if pr == prompt), None)
+                        if match:
+                            input_image_path, _ = match
+                        else:
+                            input_image_path = _pairs[current_prompt_idx % len(_pairs)][0]
+                    else:
+                        images = config.test_data.get("images", [])
+                        if not images:
+                            logger.warning("No images provided for VLM stress test")
+                            continue
+                        input_image_path = images[current_prompt_idx % len(images)]
                     input_data = {
                         "prompt": prompt,
                         "image_path": input_image_path
                     }
 
-                # Execute with system monitoring
+                # Log request before inference
+                logger.info(f"Run {run_number} | Request: prompt='{prompt[:50]}...' image={Path(input_image_path).name}")
                 with self.system_monitor.track_inference(
                     model_id=model_id,
                     endpoint=endpoint,
@@ -236,11 +263,26 @@ class StressSuite(BaseSuite):
                 # Extract raw response (untruncated)
                 raw_response = result.get("output", "")
 
+                # Extract reasoning from response and format
+                from src.utils.response_formatter import extract_thinking_blocks
+                thinking_blocks, clean_response = extract_thinking_blocks(raw_response)
+
+                # Format response with reasoning if present
+                if thinking_blocks:
+                    reasoning_str = "\n\n".join(thinking_blocks)
+                    formatted_response = f"Reasoning: {reasoning_str}\n\nResponse: {clean_response}"
+                else:
+                    formatted_response = raw_response
+
+                # Log response after inference
+                response_preview = clean_response[:100].replace('\n', ' ') if clean_response else "Empty"
+                logger.info(f"Run {run_number} | Response: {response_preview}..." if len(clean_response) > 100 else f"Run {run_number} | Response: {response_preview}")
+
                 # Create metadata dict with full input/output details for CSV
                 run_metadata = {
                     "input_prompt": prompt,
                     "input_image_path": input_image_path,
-                    "raw_response": raw_response
+                    "raw_response": formatted_response  # Store formatted version with reasoning
                 }
 
                 # Record latency with full I/O metadata
@@ -311,6 +353,11 @@ class StressSuite(BaseSuite):
                     is_warmup=False,
                     metadata={"error_message": str(e)}
                 )
+
+            # Apply post-inference delay for llama-server to allow state cleanup
+            # This delay is OUTSIDE latency measurement and does not affect benchmark timing
+            provider_type = model_id.split(":")[0] if ":" in model_id else model_id
+            apply_llama_server_delay(provider_type)
 
             # Checkpoint logging
             if current_time >= next_checkpoint:

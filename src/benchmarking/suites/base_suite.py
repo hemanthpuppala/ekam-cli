@@ -216,6 +216,12 @@ class BaseSuite(ABC):
             )
 
             if result:
+                # Report success to progress display (suite-agnostic)
+                if self.progress_display:
+                    try:
+                        self.progress_display.report_success()
+                    except Exception:
+                        pass
                 return result
             else:
                 # Circuit breaker open or max retries exceeded
@@ -318,6 +324,11 @@ class BaseSuite(ABC):
         }
         self._errors.append(error_entry)
         logger.warning(f"Error recorded: {error_entry}")
+        if self.progress_display:
+            try:
+                self.progress_display.report_failure()
+            except Exception:
+                pass
 
     def _execute_with_memory_optimization(
         self,
@@ -563,13 +574,14 @@ class BaseSuite(ABC):
 
     # Progress display helper methods
 
-    def _progress_start(self, total_runs: int, num_models: int) -> None:
+    def _progress_start(self, total_runs: int, num_models: int, model_ids: Optional[list] = None) -> None:
         """
-        Start progress display.
+        Start progress display with enhanced tracking.
 
         Args:
             total_runs: Total number of runs per model
             num_models: Number of models being tested
+            model_ids: Optional list of model IDs for enhanced tracking
         """
         if self.progress_display:
             self.progress_display.start(
@@ -577,6 +589,9 @@ class BaseSuite(ABC):
                 total_runs_per_model=total_runs,
                 suite_name=self.suite_type.display_name()
             )
+            # Initialize enhanced model tracking if model_ids provided
+            if model_ids:
+                self.progress_display.initialize_models(model_ids, total_runs)
 
     def _progress_update_phase(self, phase: ProgressPhase) -> None:
         """
@@ -637,6 +652,122 @@ class BaseSuite(ABC):
         """Stop progress display."""
         if self.progress_display:
             self.progress_display.stop()
+
+    # Enhanced tracking methods (O(1) time/space complexity)
+
+    def _track_model_start(self, model_id: str) -> None:
+        """
+        Track model start.
+
+        O(1) time complexity.
+
+        Args:
+            model_id: Model identifier
+        """
+        if self.progress_display:
+            self.progress_display.start_model(model_id)
+
+    def _track_run_start(self, model_id: str, run_number: int) -> None:
+        """
+        Track run start.
+
+        O(1) time complexity.
+
+        Args:
+            model_id: Model identifier
+            run_number: Run number (1-based)
+        """
+        if self.progress_display:
+            self.progress_display.start_run(model_id, run_number)
+
+    def _track_run_success(
+        self,
+        model_id: str,
+        run_number: int,
+        latency_ms: Optional[float] = None,
+        is_retry: bool = False
+    ) -> None:
+        """
+        Track successful run completion.
+
+        O(1) time complexity.
+
+        Args:
+            model_id: Model identifier
+            run_number: Run number (1-based)
+            latency_ms: Run latency in milliseconds
+            is_retry: Whether this was a retry
+        """
+        if self.progress_display:
+            self.progress_display.record_run_success(model_id, run_number, latency_ms, is_retry)
+
+    def _track_run_failure(
+        self,
+        model_id: str,
+        run_number: int,
+        error: str,
+        is_retry: bool = False
+    ) -> None:
+        """
+        Track failed run.
+
+        O(1) time complexity.
+
+        Args:
+            model_id: Model identifier
+            run_number: Run number (1-based)
+            error: Error message
+            is_retry: Whether this was a retry
+        """
+        if self.progress_display:
+            self.progress_display.record_run_failure(model_id, run_number, error, is_retry)
+
+    def _track_model_complete(self, model_id: str) -> None:
+        """
+        Track model completion.
+
+        O(1) time complexity.
+
+        Args:
+            model_id: Model identifier
+        """
+        if self.progress_display:
+            self.progress_display.complete_model(model_id)
+
+    def _display_run_status(self, model_id: str) -> None:
+        """
+        Display run-by-run status panel for a model.
+
+        Args:
+            model_id: Model identifier
+        """
+        if self.progress_display:
+            panel = self.progress_display.render_run_status_panel(model_id)
+            self.progress_display.console.print(panel)
+
+    def _display_queue_status(self) -> None:
+        """Display queue status modal."""
+        if self.progress_display:
+            panel = self.progress_display.render_queue_modal()
+            self.progress_display.console.print(panel)
+
+    def _get_failed_runs_for_retry(self) -> list:
+        """
+        Get failed runs for batch retry.
+
+        O(1) time complexity.
+
+        Returns:
+            List of (model_id, run_number) tuples
+        """
+        if self.progress_display:
+            return self.progress_display.get_failed_runs()
+        return []
+
+    def _clear_retry_queue(self) -> None:
+        """Clear retry queue after processing."""
+        if self.progress_display:
+            self.progress_display.clear_retry_queue()
 
     def __repr__(self) -> str:
         """String representation."""

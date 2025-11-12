@@ -34,6 +34,7 @@ class ProviderBridge:
         """
         self.session_manager = session_manager
         self._loaded_models = {}  # model_id → (provider_type, handle)
+        self._recent_load_failures: set[str] = set()
         self._inference_methods = {}  # (model_id, endpoint) → successful_method_signature
 
     def resolve_provider(self, model_id: str) -> Optional[ProviderType]:
@@ -75,8 +76,22 @@ class ProviderBridge:
         """
         # Check if already loaded
         if model_id in self._loaded_models:
-            logger.debug(f"Model {model_id} already loaded")
-            return self._loaded_models[model_id]
+            provider_type, handle = self._loaded_models[model_id]
+
+            # Validate that the cached handle is still valid
+            # For LlamaServerManager, check if server is still running
+            from src.services.llama_server_manager import LlamaServerManager
+            if isinstance(handle, LlamaServerManager):
+                if not handle.is_running():
+                    logger.warning(f"Cached llama-server for {model_id} is not running - reloading")
+                    # Remove stale cache entry and reload
+                    del self._loaded_models[model_id]
+                else:
+                    logger.debug(f"Model {model_id} already loaded (server validated)")
+                    return provider_type, handle
+            else:
+                logger.debug(f"Model {model_id} already loaded")
+                return provider_type, handle
 
         # Resolve provider
         provider_type = self.resolve_provider(model_id)
@@ -94,15 +109,47 @@ class ProviderBridge:
         provider_config = self.session_manager.state.provider_configs.get(provider_type)
         device = provider_config.get_primary_device() if provider_config else "cpu"
 
-        try:
-            logger.info(f"Loading model {model_id} via {provider_type} on {device}")
-            handle = provider.load_model(model_id, device)
-            self._loaded_models[model_id] = (provider_type, handle)
-            logger.info(f"Successfully loaded {model_id}")
-            return provider_type, handle
-        except Exception as e:
-            logger.error(f"Failed to load model {model_id}: {e}", exc_info=True)
-            return None, None
+        # Try load with single retry on failure
+        attempts = 0
+        last_err: Optional[Exception] = None
+        while attempts < 2:
+            try:
+                attempts += 1
+                logger.info(f"Loading model {model_id} via {provider_type} on {device} (attempt {attempts})")
+                handle = provider.load_model(model_id, device)
+                self._loaded_models[model_id] = (provider_type, handle)
+                # Clear from failure set on success
+                if model_id in self._recent_load_failures:
+                    self._recent_load_failures.discard(model_id)
+                logger.info(f"Successfully loaded {model_id}")
+                return provider_type, handle
+            except Exception as e:
+                last_err = e
+                logger.error(f"Failed to load model {model_id} (attempt {attempts}): {e}", exc_info=True)
+                # Cleanup between attempts
+                try:
+                    if model_id in self._loaded_models:
+                        self.unload_model(model_id)
+                except Exception:
+                    pass
+                if attempts >= 2:
+                    break
+                # brief backoff
+                try:
+                    import time as _t
+                    _t.sleep(1.0)
+                except Exception:
+                    pass
+
+        # Record failure
+        self._recent_load_failures.add(model_id)
+        return None, None
+
+    def get_and_clear_load_failures(self) -> list[str]:
+        """Return and clear the set of recent load failures."""
+        failed = list(self._recent_load_failures)
+        self._recent_load_failures.clear()
+        return failed
 
     def _try_vision_method(
         self,

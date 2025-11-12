@@ -786,26 +786,12 @@ class LoadingScreen:
 
     @staticmethod
     def show(message: str = "Loading...") -> None:
-        """Display loading message.
-
-        Args:
-            message: Loading message
-        """
-        tui.clear_screen()
-
-        width, height = tui.get_terminal_size()
-
-        # Center the loading message
-        padding = "\n" * (height // 3)
-        content = f"{padding}[bold cyan]{message}[/bold cyan]\n\n[dim]Please wait...[/dim]"
-
-        panel = Panel(
-            content,
-            border_style="cyan",
-            expand=True
+        """Display a compact loading message box (non-fullscreen)."""
+        tui.show_message(
+            f"{message}\n\n[dim]Please wait...[/dim]",
+            title="Loading",
+            style="cyan",
         )
-
-        tui.console.print(panel)
 
 
 class EndpointMenu:

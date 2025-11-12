@@ -60,6 +60,8 @@ class HuggingFaceProvider(BaseProvider):
         self.current_model = None
         self.current_processor = None
         self.current_adapter = None  # Model-specific method adapter
+        # User-selected context window (immutable until unload)
+        self._current_ctx: Optional[int] = None
 
     def _setup_mps_memory_management(self) -> None:
         """Configure MPS memory management to avoid OOM errors.
@@ -491,6 +493,15 @@ class HuggingFaceProvider(BaseProvider):
                                     model_type = ModelType.LLM
                                     capabilities = [EndpointType.TEXT]
 
+                                # Get the actual model snapshot directory for quantization
+                                snapshots_dir = model_dir / "snapshots"
+                                source_path = None
+                                if snapshots_dir.exists():
+                                    # Get latest snapshot (most recent)
+                                    snapshots = list(snapshots_dir.iterdir())
+                                    if snapshots:
+                                        source_path = max(snapshots, key=lambda p: p.stat().st_mtime)
+
                                 model_info = ModelInfo(
                                     model_id=model_id,
                                     name=model_id,
@@ -508,11 +519,21 @@ class HuggingFaceProvider(BaseProvider):
                                     compatibility=CompatibilityStatus.PERFECT_FIT,  # Will be assessed later
                                     compatibility_message="Compatibility not yet assessed",
                                     is_installed=True,
+                                    source_path=source_path,
                                 )
                             else:
                                 # Fallback: metadata inspection failed, use basic info
                                 logger.warning(f"Could not get metadata for {model_id}, using fallback")
                                 size_gb = self._estimate_cached_model_size(model_dir)
+
+                                # Get the actual model snapshot directory for quantization
+                                snapshots_dir = model_dir / "snapshots"
+                                source_path = None
+                                if snapshots_dir.exists():
+                                    snapshots = list(snapshots_dir.iterdir())
+                                    if snapshots:
+                                        source_path = max(snapshots, key=lambda p: p.stat().st_mtime)
+
                                 model_info = ModelInfo(
                                     model_id=model_id,
                                     name=model_id,
@@ -523,6 +544,7 @@ class HuggingFaceProvider(BaseProvider):
                                     compatibility=CompatibilityStatus.PERFECT_FIT,
                                     compatibility_message="Compatibility not yet assessed",
                                     is_installed=True,
+                                    source_path=source_path,
                                 )
 
                             models.append(model_info)
@@ -590,6 +612,7 @@ class HuggingFaceProvider(BaseProvider):
                                 compatibility=CompatibilityStatus.PERFECT_FIT,
                                 compatibility_message="Compatibility not yet assessed",
                                 is_installed=True,
+                                source_path=model_dir,
                             )
                         else:
                             # Fallback: metadata inspection failed, use basic info
@@ -605,6 +628,7 @@ class HuggingFaceProvider(BaseProvider):
                                 compatibility=CompatibilityStatus.PERFECT_FIT,
                                 compatibility_message="Compatibility not yet assessed",
                                 is_installed=True,
+                                source_path=model_dir,
                             )
 
                         models.append(model_info)
@@ -743,6 +767,46 @@ class HuggingFaceProvider(BaseProvider):
             RuntimeError: If model cannot be loaded after all attempts
         """
         logger.info(f"Loading HuggingFace model: {model_id}")
+
+        # Determine context window before loading
+        import os
+        min_ctx, max_ctx = 256, 32768
+        default_ctx = 4096
+        self._current_ctx = default_ctx
+        try:
+            env_ctx = os.getenv("EKAM_N_CTX")
+            if env_ctx:
+                self._current_ctx = max(min_ctx, min(max_ctx, int(env_ctx)))
+            # Only prompt if not in benchmark mode
+            if not os.getenv("EKAM_BENCHMARK_MODE"):
+                from ..cli.text_input import professional_prompt
+                from ..cli.tui_manager import tui
+                # Clear any prior panels before prompting
+                tui.clear_screen()
+                tui.console.print("\n[cyan]Context Window (n_ctx)[/cyan] — tokens kept in memory per request")
+                tui.console.print(
+                    f"[dim]Min:[/dim] {min_ctx}   [dim]Max:[/dim] {max_ctx}   "
+                    f"[dim]Default:[/dim] {default_ctx}   [dim]Recommended:[/dim] {default_ctx}"
+                )
+                tui.console.print("[dim]Higher values increase RAM/VRAM usage and may reduce throughput.[/dim]")
+                self._current_ctx = professional_prompt.get_numeric(
+                    "Context length (tokens)",
+                    min_val=min_ctx,
+                    max_val=max_ctx,
+                    default=default_ctx,
+                    style="cyan",
+                )
+                logger.info(f"Using HF context window (truncate inputs): n_ctx={self._current_ctx}")
+                # Clear and show compact loading box after questions
+                tui.clear_screen()
+                tui.show_message(
+                    f"Loading model: {model_id}\n\n[dim]Please wait...[/dim]",
+                    title="Loading",
+                    style="cyan",
+                )
+        except Exception:
+            # Safe fallback if any issue
+            self._current_ctx = default_ctx
 
         # Clean up previous model to free memory before loading new one
         self._cleanup_current_model()
@@ -1450,7 +1514,9 @@ class HuggingFaceProvider(BaseProvider):
         handle: Any,
         image: Image.Image,
         question: str,
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        stream_callback: Optional[callable] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """Run question answering with model-specific methods or universal fallback.
 
@@ -1462,6 +1528,8 @@ class HuggingFaceProvider(BaseProvider):
             image: PIL Image (VLM only, can be None for LLM)
             question: Question text
             conversation_history: Optional list of (user_msg, bot_response) tuples
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
+            session_id: Optional session ID (not used by HF, for API compatibility)
 
         Returns:
             Answer text
@@ -1492,7 +1560,8 @@ class HuggingFaceProvider(BaseProvider):
             model, processor,
             image=image,
             question=question,
-            conversation_history=conversation_history
+            conversation_history=conversation_history,
+            stream_callback=stream_callback
         )
 
     def _generic_qa_inference(
@@ -1501,7 +1570,8 @@ class HuggingFaceProvider(BaseProvider):
         processor: Any,
         image: Optional[Image.Image] = None,
         question: str = "",
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        stream_callback: Optional[callable] = None
     ) -> str:
         """Generic QA inference using UniversalInferenceHandler.
 
@@ -1511,6 +1581,7 @@ class HuggingFaceProvider(BaseProvider):
             image: Optional image
             question: Question text
             conversation_history: Optional conversation history
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Answer text
@@ -1545,11 +1616,17 @@ class HuggingFaceProvider(BaseProvider):
                 model_type=model_type
             )
 
+            # Check if we're in benchmark mode - disable streaming if so
+            import os
+            is_benchmark = os.getenv("EKAM_BENCHMARK_MODE") == "1"
+            effective_callback = None if is_benchmark else stream_callback
+            
             return handler.run_qa(
                 image=image if is_vlm else None,
                 question=question,
                 conversation_history=conversation_history,
-                max_new_tokens=1024
+                max_new_tokens=1024,
+                stream_callback=effective_callback
             )
 
         except Exception as e:
@@ -1561,7 +1638,8 @@ class HuggingFaceProvider(BaseProvider):
         handle: Any,
         image: Image.Image,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        detail_level: str = "detailed"
+        detail_level: str = "detailed",
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate image caption using model-specific method or fallback.
 
@@ -1573,6 +1651,7 @@ class HuggingFaceProvider(BaseProvider):
             image: PIL Image
             conversation_history: Optional list of (user_msg, bot_response) tuples
             detail_level: "detailed" or "short"
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Caption text
@@ -1591,7 +1670,8 @@ class HuggingFaceProvider(BaseProvider):
                     model, processor,
                     image=kwargs.get('image'),
                     question=prompt,
-                    conversation_history=conversation_history
+                    conversation_history=conversation_history,
+                    stream_callback=stream_callback
                 )
 
             try:
@@ -1615,7 +1695,8 @@ class HuggingFaceProvider(BaseProvider):
             model, processor,
             image=image,
             question=prompt,
-            conversation_history=conversation_history
+            conversation_history=conversation_history,
+            stream_callback=stream_callback
         )
 
     def run_detect(self, handle: Any, image: Image.Image, object_name: str) -> list[dict]:
@@ -1763,7 +1844,8 @@ class HuggingFaceProvider(BaseProvider):
         handle: Any,
         prompt: str,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        custom_parameters: Optional[dict] = None
+        custom_parameters: Optional[dict] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate text response for LLM using tokenizer's built-in chat template.
 
@@ -1777,6 +1859,7 @@ class HuggingFaceProvider(BaseProvider):
             conversation_history: Optional list of (user_msg, bot_response) tuples
             custom_parameters: Optional dict of custom generation parameters
                               (max_tokens, temperature, top_p, top_k, repeat_penalty, seed)
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Generated text
@@ -1836,7 +1919,11 @@ class HuggingFaceProvider(BaseProvider):
 
             # Tokenize input and move to the SAME device as the model
             # This works universally: CUDA (NVIDIA), MPS (Apple), CPU (all), ROCm (AMD), etc.
-            inputs = tokenizer(formatted_prompt, return_tensors="pt", padding=True).to(model_device)
+            # Apply context truncation if user selected a window at load
+            tok_kwargs = {"return_tensors": "pt", "padding": True}
+            if getattr(self, "_current_ctx", None):
+                tok_kwargs.update({"truncation": True, "max_length": int(self._current_ctx)})
+            inputs = tokenizer(formatted_prompt, **tok_kwargs).to(model_device)
             
             # Debug: Log what tokenizer produced
             logger.debug(f"Tokenizer outputs: {list(inputs.keys())}")
@@ -1954,6 +2041,11 @@ class HuggingFaceProvider(BaseProvider):
                 logger.debug(f"  {key}: shape={tensor.shape if tensor is not None else 'None'}, "
                            f"dtype={tensor.dtype if tensor is not None else 'None'}")
 
+            # Check if we're in benchmark mode - disable streaming if so
+            import os
+            is_benchmark = os.getenv("EKAM_BENCHMARK_MODE") == "1"
+            effective_callback = None if is_benchmark else stream_callback
+
             # PERFORMANCE: Use streaming generation for lower latency
             # Generate with parameters using TextIteratorStreamer
             try:
@@ -1970,11 +2062,16 @@ class HuggingFaceProvider(BaseProvider):
                 thread = Thread(target=model.generate, kwargs=generation_kwargs)
                 thread.start()
 
-                # Accumulate streamed tokens
+                # Accumulate streamed tokens and call callback if provided
                 response = ""
+                is_first_token = True
                 with torch.no_grad():
                     for text in streamer:
                         response += text
+                        # Call stream callback for token-by-token display
+                        if effective_callback and text:
+                            effective_callback(text, is_first=is_first_token)
+                            is_first_token = False
 
                 # Wait for thread to complete
                 thread.join()

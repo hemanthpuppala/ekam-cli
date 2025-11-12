@@ -164,7 +164,7 @@ class LoRATrainer(BaseTrainer):
             logger.error(f"Failed to setup training: {e}", exc_info=True)
             raise
 
-    def _get_device_map(self) -> str | dict:
+    def _get_device_map(self) -> "str | dict":
         """Determine device mapping for model loading.
 
         Returns:

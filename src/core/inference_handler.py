@@ -375,6 +375,7 @@ class UniversalInferenceHandler:
         question: str,
         conversation_history: Optional[list[tuple[str, str]]] = None,
         max_new_tokens: int = 1024,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Run Q&A inference with optional image and conversation history.
 
@@ -385,6 +386,7 @@ class UniversalInferenceHandler:
             question: Question text
             conversation_history: Optional conversation history for context
             max_new_tokens: Maximum tokens to generate
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Generated answer text
@@ -421,14 +423,21 @@ class UniversalInferenceHandler:
                 )
                 max_new_tokens = min(max_new_tokens, 512)
 
-            # Generate response
+            # Generate response with optional streaming
             logger.info("Generating response...")
-            output = self._generate(inputs, max_new_tokens, model_device)
-
-            # Decode response
-            response = self.processor_wrapper.batch_decode(
-                output, skip_special_tokens=True
-            )[0]
+            
+            if stream_callback:
+                # Streaming mode using TextIteratorStreamer
+                response = self._generate_streaming(
+                    inputs, max_new_tokens, model_device, stream_callback
+                )
+            else:
+                # Non-streaming mode (traditional)
+                output = self._generate(inputs, max_new_tokens, model_device)
+                # Decode response
+                response = self.processor_wrapper.batch_decode(
+                    output, skip_special_tokens=True
+                )[0]
 
             # Extract answer if using history format
             if conversation_history and "A:" in response:
@@ -582,6 +591,71 @@ class UniversalInferenceHandler:
 
         with torch.no_grad():
             return self.model.generate(**cpu_inputs, **cpu_config)
+
+    def _generate_streaming(
+        self,
+        inputs: dict[str, Any],
+        max_new_tokens: int,
+        device: Any,
+        stream_callback: callable
+    ) -> str:
+        """Generate text with token-by-token streaming.
+        
+        Args:
+            inputs: Model inputs
+            max_new_tokens: Maximum tokens to generate
+            device: Device to run on
+            stream_callback: Callback function(delta: str, is_first: bool)
+            
+        Returns:
+            Full generated text
+        """
+        try:
+            from transformers import TextIteratorStreamer
+            import threading
+        except ImportError:
+            logger.warning("TextIteratorStreamer not available, falling back to non-streaming")
+            output = self._generate(inputs, max_new_tokens, device)
+            response = self.processor_wrapper.batch_decode(output, skip_special_tokens=True)[0]
+            return response
+        
+        try:
+            # Create streamer
+            streamer = TextIteratorStreamer(
+                self.processor_wrapper.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+            
+            # Prepare generation config
+            generation_config = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,
+                "streamer": streamer,
+            }
+            
+            # Start generation in background thread
+            generation_kwargs = dict(inputs, **generation_config)
+            thread = threading.Thread(target=self.model.generate, kwargs=generation_kwargs)
+            thread.start()
+            
+            # Stream tokens to callback
+            full_response = ""
+            is_first_token = True
+            for new_text in streamer:
+                if new_text:
+                    full_response += new_text
+                    stream_callback(new_text, is_first=is_first_token)
+                    is_first_token = False
+            
+            thread.join()
+            return full_response
+            
+        except Exception as e:
+            logger.warning(f"Streaming failed: {e}, falling back to non-streaming")
+            output = self._generate(inputs, max_new_tokens, device)
+            response = self.processor_wrapper.batch_decode(output, skip_special_tokens=True)[0]
+            return response
 
     def run_text_generation(
         self,

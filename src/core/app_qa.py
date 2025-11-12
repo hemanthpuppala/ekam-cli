@@ -119,7 +119,7 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
             display_conversation_history(active_session)
 
         # Show instructions
-        tui.console.print("[dim]Commands: /info | /config | /status | /newimage | /exit[/dim]")
+        tui.console.print("[dim]Commands: /info | /config | /status | /newimage | /clear | /exit[/dim]")
         tui.console.print("[dim]✓ Arrow Keys: Navigate | Up/Down: History | Enter: Submit | Ctrl+J: New line[/dim]\n")
 
         # Get user question using professional prompt handler
@@ -146,6 +146,18 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
         # Slash commands
         if question_stripped.startswith("/"):
             command = question_lower[1:]  # Remove the /
+
+            # Clear history command
+            if command in ["clear"]:
+                if use_history and active_session:
+                    active_session.exchanges.clear()
+                    tui.clear_screen()
+                    tui.console.print("[green]✓ QA history cleared[/green]\n")
+                    tui.prompt("Press Enter to continue...", style="dim")
+                else:
+                    tui.console.print("\n[yellow]No history to clear (single-turn mode)[/yellow]\n")
+                    tui.prompt("Press Enter to continue...", style="dim")
+                continue
 
             # Model info command
             if command in ["info", "model", "modelinfo"]:
@@ -225,6 +237,7 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
                 tui.console.print("  [cyan]/status[/cyan]    - Display current generation parameters")
                 tui.console.print("  [cyan]/config[/cyan]    - Configure generation parameters (temperature, max_tokens, etc.)")
                 tui.console.print("  [cyan]/newimage[/cyan] - Change to a different image")
+                tui.console.print("  [cyan]/clear[/cyan]     - Clear QA history and screen")
                 tui.console.print("  [cyan]/help[/cyan]      - Show this help message")
                 tui.console.print("  [cyan]/exit[/cyan]      - Exit QA endpoint\n")
                 tui.prompt("Press Enter to continue...", style="dim")
@@ -322,12 +335,53 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
             if provider is None:
                 raise ValueError(f"Provider {model_info.provider} not registered")
 
+            # Setup streaming callback for progressive token display
+            from rich.live import Live
+            from rich.text import Text
+            ai_text = Text()
+            streamed_text = [""]
+            first_token_time = [None]
+
+            def _stream_cb(delta: str, is_first: bool):
+                if is_first and first_token_time[0] is None:
+                    first_token_time[0] = time.perf_counter()
+                streamed_text[0] += delta
+                ai_text.append(delta)
+                live.update(ai_text)
+
+            live = Live(ai_text, console=tui.console, refresh_per_second=24)
+            live.start()
+
+            # Determine if we should use KV cache based on device
+            from ..utils.kv_cache_policy import should_use_kv_cache, get_kv_cache_status_message
+            device = session_manager.state.loaded_model.device
+            use_kv_cache = should_use_kv_cache(device, is_benchmark=False)
+
+            # Pass session_id only if using history AND KV cache is safe for this device
+            session_id_for_inference = None
+            if use_history and active_session and use_kv_cache:
+                session_id_for_inference = active_session.session_id
+                logger.info(f"💾 {get_kv_cache_status_message(device, False)}")
+                logger.debug(f"Using session ID for KV cache: {session_id_for_inference}")
+            elif use_history and active_session:
+                logger.info(f"⚠️  {get_kv_cache_status_message(device, False)}")
+                logger.debug("Session ID not passed - KV cache disabled for this device")
+
             # Use appropriate method based on provider type
             provider_type_str = str(model_info.provider).lower()
 
             if provider_type_str == "ollama":
-                # Ollama has convenience methods (manages its own history)
-                response = provider.qa(model_info.model_id, str(current_image), question)
+                # Ollama has convenience methods (manages its own history) - doesn't support run_qa with streaming
+                # Use run_qa directly with stream_callback
+                from PIL import Image
+                image = Image.open(current_image)
+
+                # Get conversation history if using history
+                conversation_history = None
+                if use_history and active_session:
+                    conversation_history = active_session.get_history_for_provider()
+
+                response = provider.run_qa(model_info.model_id, image, question, conversation_history, stream_callback=_stream_cb)
             else:
                 # HF and GGUF use handle-based approach with conversation history
                 if not session_manager.state.loaded_model:
@@ -344,8 +398,38 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
                 from PIL import Image
                 image = Image.open(current_image)
 
-                # Pass conversation history to provider
-                response = provider.run_qa(model_handle, image, question, conversation_history)
+                # Build custom parameters from session (/config)
+                custom_parameters = None
+                if use_history and active_session and active_session.model_parameters:
+                    custom_parameters = active_session.model_parameters.to_dict()
+
+                # Pass conversation history (and custom parameters for providers that support it)
+                provider_type_str = str(model_info.provider).lower()
+                try:
+                    if provider_type_str in ["quantized", "gguf"]:
+                        # Providers accept optional custom_parameters, stream_callback, and session_id
+                        response = provider.run_qa(model_handle, image, question, conversation_history, custom_parameters, stream_callback=_stream_cb, session_id=session_id_for_inference)
+                    else:
+                        response = provider.run_qa(model_handle, image, question, conversation_history, stream_callback=_stream_cb, session_id=session_id_for_inference)
+                except TypeError:
+                    # Fallback: older provider signature without stream_callback/session_id
+                    try:
+                        if provider_type_str in ["quantized", "gguf"]:
+                            response = provider.run_qa(model_handle, image, question, conversation_history, custom_parameters, session_id=session_id_for_inference)
+                        else:
+                            response = provider.run_qa(model_handle, image, question, conversation_history, session_id=session_id_for_inference)
+                    except TypeError:
+                        # Oldest signature - no session_id support
+                        if provider_type_str in ["quantized", "gguf"]:
+                            response = provider.run_qa(model_handle, image, question, conversation_history, custom_parameters)
+                        else:
+                            response = provider.run_qa(model_handle, image, question, conversation_history)
+
+            # Stop live streaming view (leaves the streamed response visible)
+            try:
+                live.stop()
+            except Exception:
+                pass
 
             end_time = time.perf_counter()
             elapsed_ms = (end_time - start_time) * 1000
@@ -372,9 +456,11 @@ def run_qa_endpoint(session_manager: SessionManager, model_info: "ModelInfo") ->
             session_manager.state.statistics.record_inference(inference_result, used_history=use_history)
             logger.debug(f"Recorded inference in statistics (history={use_history})")
 
-            # Display just the new response (history already shown above)
-            tui.console.print(f"[bold green]You:[/bold green] {question}")
-            tui.console.print(f"[bold cyan]AI:[/bold cyan] {response}")
+            # The Live display showed the streamed response without labels
+            # Now add formatted output with labels and timing
+            tui.console.print()  # Add newline for spacing
+            tui.console.print(f"[bold green]Question:[/bold green] {question}")
+            tui.console.print(f"[bold cyan]Answer:[/bold cyan] {response}")
             tui.console.print(f"[dim]({elapsed_ms/1000:.2f}s)[/dim]\n")
 
             tui.prompt("Press Enter to continue...", style="dim")

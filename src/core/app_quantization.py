@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from ..benchmarking.core.benchmark_runner import BenchmarkRunner
     from ..benchmarking.models.benchmark_config import BenchmarkConfig
 
+import os
+
 
 def show_quantization_or_inference_menu() -> str:
     """Show menu to choose between Quantization, Finetuning, Inference, or Benchmarking.
@@ -140,6 +142,35 @@ def run_quantization_mode(session_manager: SessionManager) -> str:
             tui.console.print(f"[yellow]Status:[/yellow] {status_text}")
             tui.console.print()
 
+        # Show a small success summary for the most recent completed job
+        try:
+            completed = [t for t in quant_manager.get_all_tasks() if t.is_finished and t.status.value == "completed"]
+            if completed:
+                # Pick the most recent by completed_at if available, else by start time
+                completed.sort(key=lambda t: (t.completed_at or t.started_at or 0), reverse=True)
+                last = completed[0]
+                from rich.panel import Panel
+                from rich.table import Table
+                tbl = Table.grid(padding=(0, 2))
+                tbl.add_column(style="cyan", justify="right")
+                tbl.add_column(style="white")
+                tbl.add_row("Model:", last.model_info.name)
+                tbl.add_row("Type:", last.quant_type.display_name)
+                try:
+                    if getattr(last, "vlm_language_file", None):
+                        tbl.add_row("Language:", getattr(last, "vlm_language_file"))
+                    if getattr(last, "vlm_vision_file", None):
+                        tbl.add_row("Vision:", getattr(last, "vlm_vision_file"))
+                except Exception:
+                    pass
+                tbl.add_row("Output:", str(last.output_path))
+                if getattr(last, "warning_message", None):
+                    tbl.add_row("", f"[yellow]⚠ {last.warning_message}[/yellow]")
+                tui.console.print(Panel(tbl, title="Last Quantization", border_style="green"))
+                tui.console.print()
+        except Exception:
+            pass
+
         # Build arrow-key options
         arrow_options = [
             ("1", "[green]Start New Quantization[/green]", "Configure and start a new model quantization"),
@@ -235,6 +266,9 @@ def run_benchmarking_mode(session_manager: SessionManager) -> str:
     from ..benchmarking.core.benchmark_runner import BenchmarkRunner
     from ..benchmarking.models.metric_types import ExecutionMode
 
+    # Mark process as benchmarking so providers can tune server flags
+    os.environ["EKAM_BENCHMARKING"] = "1"
+
     # Initialize benchmark runner
     runner = BenchmarkRunner(session_manager=session_manager)
 
@@ -314,157 +348,28 @@ def run_benchmarking_mode(session_manager: SessionManager) -> str:
 
 
 def _run_foreground_benchmark(runner: "BenchmarkRunner", config: "BenchmarkConfig") -> None:
-    """Execute benchmark in foreground with real-time progress and per-run feedback.
+    """Execute benchmark in foreground using the live dashboard.
 
-    Args:
-        runner: BenchmarkRunner instance
-        config: BenchmarkConfig to execute
+    Suppresses redundant textual progress to avoid duplicating the dashboard.
     """
     from ..cli.tui_manager import tui
-    from rich.table import Table
-    from rich.panel import Panel
-    import re
 
-    # Clear screen completely - no previous steps visible
+    # Clear screen and hand off to runner (dashboard managed inside runner)
     tui.clear_screen()
 
-    # Get terminal width for separator lines
-    terminal_width = tui.console.width
-
-    # Import display name helper
-    from ..benchmarking.cli.benchmark_screens import _extract_model_display_name
-
-    # Show concise configuration summary at the top
-    tui.show_step_heading("Running Benchmark")
-
-    # Configuration summary table
-    summary_table = Table.grid(padding=(0, 2))
-    summary_table.add_column(style="cyan", justify="right")
-    summary_table.add_column(style="white")
-
-    summary_table.add_row("Suite:", config.suite_type.display_name())
-    summary_table.add_row("Model Type:", config.model_type.value.upper())
-    summary_table.add_row("Models:", f"{len(config.models)} model(s)")
-    summary_table.add_row("Models List:", ", ".join([_extract_model_display_name(m)[:30] + "..." if len(_extract_model_display_name(m)) > 30 else _extract_model_display_name(m) for m in config.models]))
-    summary_table.add_row("Runs per model:", f"{config.num_runs} ({config.num_warmup} warmup)")
-    summary_table.add_row("Export formats:", ", ".join(config.export_formats))
-
-    tui.console.print(Panel(
-        summary_table,
-        title="[bold]Configuration Summary[/bold]",
-        border_style="cyan",
-        padding=(1, 2)
-    ))
-    tui.console.print()
-
-    # Section separator
-    tui.console.print("[bold cyan]" + "─" * terminal_width + "[/bold cyan]")
-    tui.console.print("[bold cyan]Execution Progress[/bold cyan]")
-    tui.console.print("[bold cyan]" + "─" * terminal_width + "[/bold cyan]")
-    tui.console.print()
-
-    # Track run completion for real-time display
-    run_tracker = {
-        "current_model": None,
-        "runs_completed": 0,
-        "total_runs": config.num_runs,
-        "warmup_runs": 0,
-        "total_warmup": config.num_warmup
-    }
-
-    def progress_callback(message: str):
-        """Display progress messages with enhanced per-run feedback."""
-        # Parse latency information from progress messages
-        # Expected format: "Run X/Y completed in Z.ZZms" or similar patterns
-
-        # Check for run completion with latency
-        run_pattern = r"(?:Run|Warmup run)\s+(\d+)/(\d+).*?(\d+\.?\d*)\s*ms"
-        match = re.search(run_pattern, message, re.IGNORECASE)
-
-        if match:
-            run_num = match.group(1)
-            total = match.group(2)
-            latency = float(match.group(3))
-
-            # Determine if warmup or regular run
-            is_warmup = "warmup" in message.lower()
-
-            if is_warmup:
-                run_tracker["warmup_runs"] = int(run_num)
-                tui.console.print(
-                    f"  [dim cyan]Warmup {run_num}/{total}:[/dim cyan] "
-                    f"[yellow]{latency:.2f}ms[/yellow]"
-                )
-            else:
-                run_tracker["runs_completed"] = int(run_num)
-                # Show with green checkmark for completed runs
-                tui.console.print(
-                    f"  [green]✓ Run {run_num}/{total}:[/green] "
-                    f"[bold yellow]{latency:.2f}ms[/bold yellow] latency"
-                )
-
-        # Check for model transitions
-        elif "Benchmarking model:" in message:
-            model_name = message.split("Benchmarking model:")[-1].strip()
-            run_tracker["current_model"] = model_name
-            run_tracker["runs_completed"] = 0
-            run_tracker["warmup_runs"] = 0
-
-            tui.console.print()
-            display_name = _extract_model_display_name(model_name)
-            tui.console.print(f"[bold magenta]📊 Model:[/bold magenta] [cyan]{display_name}[/cyan]")
-
-        # Check for warmup start
-        elif "warmup runs" in message.lower() and "Running" in message:
-            tui.console.print(f"[dim]{message}[/dim]")
-
-        # Check for suite completion messages
-        elif "complete" in message.lower() or "finished" in message.lower():
-            tui.console.print(f"[green]{message}[/green]")
-
-        # Default: show dimmed message
-        else:
-            tui.console.print(f"[dim]{message}[/dim]")
-
     try:
-        tui.console.print("[bold blue]Starting benchmark execution...[/bold blue]")
-        tui.console.print()
+        result = runner.run(config)
 
-        result = runner.run(config, progress_callback=progress_callback)
-
-        # Clear and show completion summary
-        tui.console.print()
-        tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-        tui.console.print()
-        tui.console.print(f"[bold green]✓ Benchmark Complete![/bold green]")
-        tui.console.print()
-        tui.console.print(f"  [cyan]Status:[/cyan] {result.status.value}")
-        tui.console.print(f"  [cyan]Duration:[/cyan] {result.duration_seconds:.2f}s")
-        tui.console.print(f"  [cyan]Successful runs:[/cyan] {result.successful_runs}/{result.total_runs}")
-
-        if result.successful_runs < result.total_runs:
-            failed = result.total_runs - result.successful_runs
-            tui.console.print(f"  [yellow]Failed runs:[/yellow] {failed}")
-
-        tui.console.print()
-        tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
-        tui.console.print()
-
-        # Ask if user wants to see detailed results
-        show_details = tui.prompt("Show detailed results? [Y/n]:", style="green").strip().lower() != "n"
-
-        if show_details:
-            runner.print_result(result, detailed=True)
+        # Minimal completion summary
+        tui.console.print(f"\n[bold green]Benchmark Complete[/bold green]")
+        tui.console.print(f"[cyan]Status:[/cyan] {result.status.value}")
+        tui.console.print(f"[cyan]Duration:[/cyan] {result.duration_seconds:.2f}s")
 
     except Exception as e:
-        tui.console.print()
-        tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
         tui.console.print()
         tui.console.print(f"[bold red]✗ Benchmark Failed[/bold red]")
         tui.console.print(f"[red]Error: {str(e)}[/red]")
         logger.error(f"Benchmark execution failed: {e}", exc_info=True)
-        tui.console.print()
-        tui.console.print("[bold cyan]" + "═" * terminal_width + "[/bold cyan]")
 
     tui.console.print()
     tui.prompt("Press Enter to continue...", style="dim")

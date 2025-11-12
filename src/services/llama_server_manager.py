@@ -14,8 +14,9 @@ import subprocess
 import sys
 import time
 import requests
+import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from loguru import logger
 import psutil
 
@@ -84,11 +85,36 @@ class LlamaServerManager:
                 break
 
         if not llama_server_bin:
+            # Provide platform-specific compilation instructions
+            import platform
+            system = platform.system().lower()
+
+            if system == "darwin":  # macOS
+                compile_cmd = "cmake .. -DGGML_METAL=ON && cmake --build . --config Release"
+                gpu_info = "Metal (Apple Silicon/Intel Mac GPU)"
+            elif system == "linux":
+                # Check for NVIDIA GPU
+                try:
+                    subprocess.run(["nvidia-smi"], capture_output=True, check=True)
+                    compile_cmd = "cmake .. -DGGML_CUDA=ON && cmake --build . --config Release"
+                    gpu_info = "CUDA (NVIDIA GPU)"
+                except:
+                    # No NVIDIA GPU, check for AMD
+                    if Path("/opt/rocm").exists():
+                        compile_cmd = "cmake .. -DGGML_HIPBLAS=ON && cmake --build . --config Release"
+                        gpu_info = "ROCm (AMD GPU)"
+                    else:
+                        compile_cmd = "cmake .. && cmake --build . --config Release"
+                        gpu_info = "CPU only"
+            else:
+                compile_cmd = "cmake .. && cmake --build . --config Release"
+                gpu_info = "CPU only"
+
             raise RuntimeError(
-                "llama-server binary not found. Please compile llama.cpp:\n"
-                "  git clone https://github.com/ggerganov/llama.cpp\n"
-                "  cd llama.cpp && mkdir build && cd build\n"
-                "  cmake .. -DGGML_CUDA=ON && cmake --build . --config Release"
+                f"llama-server binary not found. Please compile llama.cpp ({gpu_info}):\n"
+                f"  git clone https://github.com/ggerganov/llama.cpp\n"
+                f"  cd llama.cpp && mkdir build && cd build\n"
+                f"  {compile_cmd}"
             )
 
         # Use native binary with parameters matching working WebUI command
@@ -112,8 +138,12 @@ class LlamaServerManager:
             cmd.extend(["--mmproj", str(mmproj_path)])
             logger.info(f"VLM mode enabled with mmproj: {Path(mmproj_path).name}")
 
-        # Enable continuous batching for multi-turn conversations
+        # Enable continuous batching (required for VLM to work properly)
         cmd.append("--cont-batching")
+
+        # Enable reasoning/thinking output (keeps <think> tags in response)
+        cmd.extend(["--reasoning-format", "deepseek-legacy"])
+        cmd.extend(["--reasoning-budget", "-1"])  # Unrestricted thinking
 
         logger.info(f"Starting llama-server: {' '.join(cmd)}")
 
@@ -142,7 +172,17 @@ class LlamaServerManager:
 
                 # Check if server is responding
                 if self.is_running():
+                    # Store context size for downstream consumers
+                    try:
+                        self.n_ctx = n_ctx
+                    except Exception:
+                        self.n_ctx = n_ctx
                     logger.info(f"✓ llama-server started successfully on {self.base_url}")
+                    logger.info(f"  Model: {self.model_path.name}")
+                    logger.info(f"  Server type: legacy llama-server (subprocess binary)")
+                    logger.info(f"  GPU layers: {n_gpu_layers}, Context: {n_ctx}")
+                    if mmproj_path:
+                        logger.info(f"  VLM mode: {Path(mmproj_path).name}")
                     return True
 
                 time.sleep(0.5)
@@ -191,6 +231,37 @@ class LlamaServerManager:
         except:
             return False
 
+    def get_recent_output(self, max_lines: int = 50) -> str:
+        """Get recent output from llama-server.
+
+        Args:
+            max_lines: Maximum number of recent lines to return
+
+        Returns:
+            Recent server output as string
+        """
+        if not self.process or not self.process.stdout:
+            return ""
+
+        try:
+            import select
+            import sys
+            if sys.platform != 'win32':
+                # Unix-like systems - non-blocking read
+                ready, _, _ = select.select([self.process.stdout], [], [], 0)
+                if ready:
+                    lines = []
+                    while len(lines) < max_lines:
+                        line = self.process.stdout.readline()
+                        if not line:
+                            break
+                        lines.append(line)
+                    return ''.join(lines)
+        except Exception as e:
+            logger.debug(f"Could not read server output: {e}")
+
+        return ""
+
     def stop(self):
         """Stop llama-server process."""
         if self.process:
@@ -211,12 +282,32 @@ class LlamaServerManager:
 
     def chat_completion(
         self,
-        messages: list[Dict[str, str]],
+        messages: list[Dict[str, Any]],
         max_tokens: int = 512,
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop: Optional[list[str]] = None,
         stream: bool = True,
+        images: Optional[list[str]] = None,
+        image_data: Optional[list[Dict[str, Any]]] = None,
+        # Additional llama.cpp options
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        tfs_z: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        penalty_last_n: Optional[int] = None,
+        mirostat: Optional[int] = None,
+        mirostat_tau: Optional[float] = None,
+        mirostat_eta: Optional[float] = None,
+        seed: Optional[int] = None,
+        n_keep: Optional[int] = None,
+        ignore_eos: Optional[bool] = None,
+        grammar: Optional[str] = None,
+        logit_bias: Optional[Dict[Union[str,int], float]] = None,
+        n_probs: Optional[int] = None,
     ) -> Any:
         """Send chat completion request to llama-server.
 
@@ -236,23 +327,39 @@ class LlamaServerManager:
         if not self.is_running():
             raise RuntimeError("llama-server is not running. Call start() first.")
 
-        url = f"{self.base_url}/v1/chat/completions"
+        url, payload = self.build_chat_payload(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            stream=stream,
+            images=images,
+            image_data=image_data,
+            top_k=top_k,
+            min_p=min_p,
+            typical_p=typical_p,
+            tfs_z=tfs_z,
+            repeat_penalty=repeat_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            penalty_last_n=penalty_last_n,
+            mirostat=mirostat,
+            mirostat_tau=mirostat_tau,
+            mirostat_eta=mirostat_eta,
+            seed=seed,
+            n_keep=n_keep,
+            ignore_eos=ignore_eos,
+            grammar=grammar,
+            logit_bias=logit_bias,
+            n_probs=n_probs,
+        )
 
-        payload = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": stream,
-        }
-
-        if stop:
-            payload["stop"] = stop
-
-        # Use slot ID for KV cache reuse
-        # Same slot = reuse KV cache from previous turns
-        payload["cache_prompt"] = True  # Enable prompt caching
-        payload["slot_id"] = self.slot_id
+        # Save last request for debugging
+        try:
+            self._last_request = {"url": url, "payload": payload}
+        except Exception:
+            pass
 
         if stream:
             # Return streaming response
@@ -264,6 +371,92 @@ class LlamaServerManager:
             response = requests.post(url, json=payload, timeout=120)
             response.raise_for_status()
             return response.json()
+
+    def build_chat_payload(
+        self,
+        messages: list[Dict[str, Any]],
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        images: Optional[list[str]] = None,
+        image_data: Optional[list[Dict[str, Any]]] = None,
+        # Additional llama.cpp options
+        top_k: Optional[int] = None,
+        min_p: Optional[float] = None,
+        typical_p: Optional[float] = None,
+        tfs_z: Optional[float] = None,
+        repeat_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        penalty_last_n: Optional[int] = None,
+        mirostat: Optional[int] = None,
+        mirostat_tau: Optional[float] = None,
+        mirostat_eta: Optional[float] = None,
+        seed: Optional[int] = None,
+        n_keep: Optional[int] = None,
+        ignore_eos: Optional[bool] = None,
+        grammar: Optional[str] = None,
+        logit_bias: Optional[Dict[Union[str,int], float]] = None,
+        n_probs: Optional[int] = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        """Build URL and JSON payload for chat completion.
+
+        Returns:
+            Tuple of (url, payload)
+        """
+        url = f"{self.base_url}/v1/chat/completions"
+
+        payload: Dict[str, Any] = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": stream,
+        }
+
+        if images:
+            payload["images"] = images
+
+        if image_data:
+            payload["image_data"] = image_data
+
+        if stop:
+            payload["stop"] = stop
+
+        # Optional advanced parameters
+        opt_map = {
+            "top_k": top_k,
+            "min_p": min_p,
+            "typical_p": typical_p,
+            "tfs_z": tfs_z,
+            "repeat_penalty": repeat_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "penalty_last_n": penalty_last_n,
+            "mirostat": mirostat,
+            "mirostat_tau": mirostat_tau,
+            "mirostat_eta": mirostat_eta,
+            "seed": seed,
+            "n_keep": n_keep,
+            "ignore_eos": ignore_eos,
+            "grammar": grammar,
+            "logit_bias": logit_bias,
+            "n_probs": n_probs,
+        }
+        for k, v in opt_map.items():
+            if v is not None:
+                payload[k] = v
+
+        # Disable prompt caching for stateless runs
+        payload["cache_prompt"] = False
+
+        return url, payload
+
+    def get_last_request(self) -> Optional[Dict[str, Any]]:
+        """Return last request (url and payload) sent to llama-server."""
+        return getattr(self, "_last_request", None)
 
     def _parse_stream(self, response):
         """Parse SSE (Server-Sent Events) streaming response.

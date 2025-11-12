@@ -312,13 +312,12 @@ def display_statistics(stats: SessionStatistics) -> None:
 
 
 def display_conversation_history(session: "ConversationSession") -> None:
-    """Display conversation history in scrolling format with thinking hidden.
+    """Display conversation history in scrolling format with reasoning dimmed.
 
     Args:
         session: ConversationSession with exchanges to display
     """
     from ..models.session import ConversationSession
-    from ..utils.response_formatter import extract_thinking_blocks
 
     if not session.exchanges:
         console.print("[dim]No conversation history yet[/dim]\n")
@@ -332,9 +331,17 @@ def display_conversation_history(session: "ConversationSession") -> None:
         # User message
         console.print(f"[bold green]You:[/bold green] {exchange.user_message}")
 
-        # AI response - hide thinking blocks in history
-        _, clean_response = extract_thinking_blocks(exchange.ai_response)
-        console.print(f"[bold cyan]AI:[/bold cyan] {clean_response}")
+        # Show reasoning (dimmed) if present
+        if exchange.ai_reasoning:
+            console.print(Panel(
+                exchange.ai_reasoning.strip(),
+                title="[dim]🤔 Reasoning[/dim]",
+                border_style="dim",
+                style="dim italic"
+            ))
+
+        # AI response (clean response stored separately now)
+        console.print(f"[bold cyan]AI:[/bold cyan] {exchange.ai_response}")
 
         # Show timing if available
         if exchange.inference_time_ms > 0:

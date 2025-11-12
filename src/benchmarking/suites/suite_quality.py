@@ -15,6 +15,7 @@ Measures output quality and consistency across multiple runs:
 
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+from pathlib import Path
 from collections import Counter
 import difflib
 
@@ -25,6 +26,7 @@ from src.benchmarking.models.metric_types import SuiteType, ResultStatus, Metric
 from src.benchmarking.models.suite_configs import QualityConfig, quality_config_from_params
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
+from src.benchmarking.utils.llama_delay import apply_llama_server_delay
 from src.benchmarking.utils import MemoryOptimizer
 from src.benchmarking.suites._quality_helpers import (
     select_prompts_first_n,
@@ -123,8 +125,30 @@ class QualitySuite(BaseSuite):
             if suite_config.should_compute_metric("semantic_similarity"):
                 logger.info(f"Semantic model: {suite_config.semantic_embedding_model}")
 
-            # Prepare test data
-            all_prompts = self._get_test_data(config)
+            # Prepare test data (support explicit image-prompt pairs for VLM)
+            pairs = config.test_data.get("pairs") if config.model_type == ModelType.VLM else None
+            ordered_images = None
+            if pairs:
+                def _normalize_pairs(p):
+                    if p is None:
+                        return []
+                    if isinstance(p, dict):
+                        return list(p.items())
+                    out = []
+                    for item in p:
+                        if isinstance(item, (list, tuple)) and len(item) == 2:
+                            out.append((item[0], item[1]))
+                        elif isinstance(item, dict):
+                            img = item.get("image") or item.get("image_path") or item.get("img")
+                            pr = item.get("prompt")
+                            if img is not None and pr is not None:
+                                out.append((img, pr))
+                    return out
+                _pairs = _normalize_pairs(pairs)
+                ordered_images = [img for img, pr in _pairs]
+                all_prompts = [pr for img, pr in _pairs]
+            else:
+                all_prompts = self._get_test_data(config)
             if not all_prompts:
                 raise ValueError("No test prompts available")
 
@@ -156,14 +180,16 @@ class QualitySuite(BaseSuite):
 
                             # Get image path for VLMs - 1:1 mapping with prompts
                             if config.model_type == ModelType.VLM:
-                                images = config.test_data.get("images", [])
-                                if images and prompt_idx < len(images):
-                                    image_path = images[prompt_idx]
-                                elif images:
-                                    # Fallback to cycling if more prompts than images
-                                    image_path = images[prompt_idx % len(images)]
+                                if ordered_images:
+                                    image_path = ordered_images[prompt_idx % len(ordered_images)]
                                 else:
-                                    image_path = "-"
+                                    images = config.test_data.get("images", [])
+                                    if images and prompt_idx < len(images):
+                                        image_path = images[prompt_idx]
+                                    elif images:
+                                        image_path = images[prompt_idx % len(images)]
+                                    else:
+                                        image_path = "-"
                             else:
                                 image_path = "-"
 
@@ -314,13 +340,41 @@ class QualitySuite(BaseSuite):
             if config.model_type == ModelType.LLM:
                 input_data = prompt
                 input_image_path = "-"  # LLMs don't use images
+                used_prompt = prompt
             else:  # VLM
-                images = config.test_data.get("images", [])
-                if not images:
-                    logger.warning("No images provided for VLM benchmark")
-                    return None
-
-                input_image_path = images[run_number % len(images)]
+                pairs = config.test_data.get("pairs")
+                def _normalize_pairs(p):
+                    if p is None:
+                        return []
+                    if isinstance(p, dict):
+                        return list(p.items())
+                    out = []
+                    for item in p:
+                        if isinstance(item, (list, tuple)) and len(item) == 2:
+                            out.append((item[0], item[1]))
+                        elif isinstance(item, dict):
+                            img = item.get("image") or item.get("image_path") or item.get("img")
+                            pr = item.get("prompt")
+                            if img is not None and pr is not None:
+                                out.append((img, pr))
+                    return out
+                _pairs = _normalize_pairs(pairs)
+                if _pairs:
+                    # For quality, repeated runs for same prompt: keep prompt fixed; rotate image for safety
+                    # Find the index of the given prompt in pairs (first match)
+                    try:
+                        prompt_indices = [i for i, (_, pr) in enumerate(_pairs) if pr == prompt]
+                        base_idx = prompt_indices[0] if prompt_indices else 0
+                    except Exception:
+                        base_idx = 0
+                    input_image_path = _pairs[base_idx][0]
+                else:
+                    images = config.test_data.get("images", [])
+                    if not images:
+                        logger.warning("No images provided for VLM benchmark")
+                        return None
+                    input_image_path = images[run_number % len(images)]
+                used_prompt = prompt
                 input_data = {
                     "prompt": prompt,
                     "image_path": input_image_path
@@ -329,6 +383,9 @@ class QualitySuite(BaseSuite):
             # Execute inference with latency tracking
             import time
             start_time = time.perf_counter()
+
+            # Log request before inference
+            logger.info(f"Run {run_number} | Request: prompt='{used_prompt[:50]}...' image={Path(input_image_path).name}")
 
             result = self.executor.execute(
                 model_type=config.model_type,
@@ -349,11 +406,26 @@ class QualitySuite(BaseSuite):
             # Get output text (untruncated)
             output = result.get("output", "")
 
+            # Extract reasoning from output and format
+            from src.utils.response_formatter import extract_thinking_blocks
+            thinking_blocks, clean_output = extract_thinking_blocks(output)
+
+            # Format response with reasoning if present
+            if thinking_blocks:
+                reasoning_str = "\n\n".join(thinking_blocks)
+                formatted_output = f"Reasoning: {reasoning_str}\n\nResponse: {clean_output}"
+            else:
+                formatted_output = output
+
+            # Log response after inference
+            response_preview = clean_output[:100].replace('\n', ' ') if clean_output else "Empty"
+            logger.info(f"Run {run_number} | Response: {response_preview}..." if len(clean_output) > 100 else f"Run {run_number} | Response: {response_preview}")
+
             # Create metadata dict with full input/output details for CSV
             run_metadata = {
-                "input_prompt": prompt,
+                "input_prompt": used_prompt,
                 "input_image_path": input_image_path,
-                "raw_response": output
+                "raw_response": formatted_output  # Store formatted version with reasoning
             }
 
             # Record inference latency (consistent with other suites)
@@ -380,6 +452,11 @@ class QualitySuite(BaseSuite):
                 is_warmup=is_warmup,
                 metadata=run_metadata
             )
+
+            # Apply post-inference delay for llama-server to allow state cleanup
+            # This delay is OUTSIDE latency measurement and does not affect benchmark timing
+            provider_type = model_id.split(":")[0] if ":" in model_id else model_id
+            apply_llama_server_delay(provider_type)
 
             return output
 
@@ -415,11 +492,22 @@ class QualitySuite(BaseSuite):
             logger.warning("No outputs to compute consistency metrics")
             return
 
+        # Extract reasoning from outputs and format them
+        from src.utils.response_formatter import extract_thinking_blocks
+        formatted_outputs = []
+        for output in outputs:
+            thinking_blocks, clean_output = extract_thinking_blocks(output)
+            if thinking_blocks:
+                reasoning_str = "\n\n".join(thinking_blocks)
+                formatted_outputs.append(f"Reasoning: {reasoning_str}\n\nResponse: {clean_output}")
+            else:
+                formatted_outputs.append(output)
+
         # Create base metadata with input/output details for CSV
         base_metadata = {
             "input_prompt": prompt,
             "input_image_path": image_path,
-            "raw_response": "; ".join(outputs),  # Join all outputs for context
+            "raw_response": " | ".join(formatted_outputs),  # Join all formatted outputs
             "total_outputs": len(outputs),
             "unique_outputs": len(set(outputs))
         }

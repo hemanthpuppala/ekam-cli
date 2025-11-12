@@ -13,6 +13,8 @@ from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..models.system import SystemSpecs
 from ..services.llama_server_manager import LlamaServerManager
+from ..services.llama_cli_server_manager import LlamaCLIServerManager
+from ..config.server_config import get_llama_server_type
 from .base import BaseProvider
 
 
@@ -42,6 +44,13 @@ class QuantizedProvider(BaseProvider):
         # llama-server instances for GGUF models (enables GPU acceleration + KV cache reuse)
         self.llama_servers: Dict[str, Any] = {}  # model_path -> LlamaServerManager
         self.use_llama_server = True  # Always use server for GGUF models (GPU + cache)
+        # Session-scoped user selection of mmproj per loaded language model
+        self._session_mmproj_choice: Dict[str, Path] = {}
+        # Cache which vision API format works for each model (to avoid repeated 400/500 errors)
+        self._vision_api_format_cache: Dict[str, str] = {}  # model_path -> "openai" or "llamacpp"
+        # VLM image rescaling preferences (per-model, session-scoped)
+        # Maps model_id -> (width, height) or None to disable
+        self._rescale_resolution: Dict[str, Optional[tuple[int, int]]] = {}
 
         logger.info(f"QuantizedProvider initialized: {self.quantized_dir} (llama-server mode: ON)")
 
@@ -85,10 +94,15 @@ class QuantizedProvider(BaseProvider):
             logger.info("Quantized models directory does not exist yet")
             return models
 
-        # Discover GGUF files (exclude only macOS resource forks)
+        # Discover GGUF files (exclude resource forks and mmproj component files)
         for gguf_file in self.quantized_dir.glob("*.gguf"):
             # Skip macOS resource forks (._* files)
             if gguf_file.name.startswith("._"):
+                continue
+
+            # Skip mmproj files (VLM vision encoder components - auto-detected when loading)
+            if gguf_file.name.startswith("mmproj-"):
+                logger.debug(f"Skipping mmproj component file: {gguf_file.name}")
                 continue
 
             try:
@@ -120,6 +134,9 @@ class QuantizedProvider(BaseProvider):
         Returns:
             ModelInfo or None if invalid
         """
+        # Import required types at the top
+        from ..models.endpoints import EndpointType
+
         # Get metadata from cache (reads GGUF header and metadata file)
         cached_metadata = self.metadata_cache.get_metadata(str(gguf_path), provider="quantized")
 
@@ -162,131 +179,150 @@ class QuantizedProvider(BaseProvider):
         # Format: "quantized:gguf:/absolute/path/to/file.gguf"
         model_id = f"quantized:gguf:{gguf_path.absolute()}"
 
-        # Display name: Extract model name from filename and show quantization type
-        # New format (no timestamp): Provider_Model-Name_quanttype[_counter]
-        # Examples: 
-        #   - "Qwen_Qwen3-0.6B_q4_k_m.gguf" → "Qwen/Qwen3-0.6B"
-        #   - "allenai_OLMo-1B_q4_k_m_2.gguf" → "allenai/OLMo-1B" (with counter)
-        # Old format (backward compat): Provider_Model-Name_quanttype_YYYYMMDD_HHMMSS
-        filename_stem = gguf_path.stem
+        # Display name: Use raw filename stem (no complex parsing)
+        # Example: "Qwen_Qwen3-VL-4B-Instruct_q4_k_m_f16.gguf" → "Qwen_Qwen3-VL-4B-Instruct_q4_k_m_f16"
+        name = gguf_path.stem
 
-        # Try to extract meaningful model name from filename
-        # Pattern: Provider_Model-Name_quanttype[_timestamp][_counter](_f16)
-        name = None
+        # Detect if this is a VLM using robust 2-step verification
+        # Step 1: Check actual files/metadata (most reliable)
+        # Step 2: Fallback to name patterns (if step 1 fails)
+        # If either passes → VLM, if both fail → LLM
+        model_type = ModelType.LLM  # Default
+        capabilities = [EndpointType.TEXT]  # Default
+        detection_method = None
 
-        if "_" in filename_stem:
-            parts = filename_stem.split("_")
+        # ============ STEP 1: ROBUST FILE-BASED DETECTION ============
 
-            # Check if ends with "_f16" (FP16 GGUF intermediate file)
-            is_fp16 = len(parts) >= 1 and parts[-1] == "f16"
-            if is_fp16 and parts[-1] == "f16":
-                parts = parts[:-1]
+        # 1A. Check for mmproj file (MOST RELIABLE - VLMs always need vision encoder)
+        if model_type == ModelType.LLM:
+            mmproj_patterns = [
+                f"mmproj-{gguf_path.stem}.gguf",
+                f"mmproj-{gguf_path.stem}_f16.gguf",
+                f"mmproj-{gguf_path.stem.replace('_f16', '')}_f16.gguf",
+                # Check variations without language suffix
+                f"mmproj-{gguf_path.stem.replace('_language', '')}.gguf",
+                f"mmproj-{gguf_path.stem.replace('_language', '')}_f16.gguf",
+            ]
+            for pattern in mmproj_patterns:
+                mmproj_path = gguf_path.parent / pattern
+                if mmproj_path.exists():
+                    model_type = ModelType.VLM
+                    capabilities = [
+                        EndpointType.QA,
+                        EndpointType.CAPTION,
+                        EndpointType.DETECT,
+                        EndpointType.POINT,
+                        EndpointType.TEXT,
+                    ]
+                    detection_method = f"mmproj file present: {pattern}"
+                    logger.debug(f"✓ VLM detected - {detection_method}")
+                    break
 
-            # Remove trailing counter if present (e.g., "_2", "_3")
-            if len(parts) >= 1 and parts[-1].isdigit() and len(parts[-1]) <= 2:
-                parts = parts[:-1]
+        # 1B. Check cached metadata model_type (from GGUF header or config.json)
+        if model_type == ModelType.LLM and cached_metadata:
+            if cached_metadata.model_type == "vlm":
+                model_type = ModelType.VLM
+                capabilities = [
+                    EndpointType.QA,
+                    EndpointType.CAPTION,
+                    EndpointType.DETECT,
+                    EndpointType.POINT,
+                    EndpointType.TEXT,
+                ]
+                detection_method = "cached metadata model_type=vlm"
+                logger.debug(f"✓ VLM detected - {detection_method}")
 
-            # Remove timestamp parts (YYYYMMDD_HHMMSS) for backward compatibility
-            # Only if they look like timestamps (8 digits + 6 digits)
-            if len(parts) >= 2:
-                if (parts[-1].isdigit() and len(parts[-1]) == 6 and
-                    parts[-2].isdigit() and len(parts[-2]) == 8):
-                    parts = parts[:-2]  # Remove timestamp
+        # 1C. Check GGUF architecture field (from header)
+        if model_type == ModelType.LLM and cached_metadata and cached_metadata.architecture:
+            arch_lower = cached_metadata.architecture.lower()
+            vlm_architectures = [
+                'qwen3vl', 'qwen2vl', 'qwen2_5vl', 'qwenvl',
+                'llava', 'minicpmv', 'minicpmo',
+                'pixtral', 'smolvlm', 'smolvlm2',
+                'internvl', 'moondream', 'cogvlm',
+                'clip',  # Vision encoder architecture
+            ]
+            if any(vlm_arch in arch_lower for vlm_arch in vlm_architectures):
+                model_type = ModelType.VLM
+                capabilities = [
+                    EndpointType.QA,
+                    EndpointType.CAPTION,
+                    EndpointType.DETECT,
+                    EndpointType.POINT,
+                    EndpointType.TEXT,
+                ]
+                detection_method = f"GGUF architecture: {cached_metadata.architecture}"
+                logger.debug(f"✓ VLM detected - {detection_method}")
 
-            # Find the quantization type in the filename
-            # Some quant types are 3 parts (q4_k_m), others are 2 parts (q8_0)
-            quant_patterns_3 = ["q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k"]
-            quant_patterns_2 = ["q8_0", "q4_0", "q5_0"]
-            quant_idx = -1
+        # 1D. Check source model config (if quantized from HF model)
+        if model_type == ModelType.LLM and metadata_file.exists():
+            try:
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                    source_model_path = metadata.get("source_model_path")
 
-            # Try 3-part patterns first
-            for i, part in enumerate(parts):
-                if i + 2 < len(parts):
-                    potential_quant = "_".join(parts[i:i+3])
-                    if potential_quant in quant_patterns_3:
-                        quant_idx = i
-                        break
+                    if source_model_path:
+                        from ..models.vlm_detector import VLMDetector
+                        from pathlib import Path as P
 
-            # Try 2-part patterns if not found
-            if quant_idx == -1:
-                for i, part in enumerate(parts):
-                    if i + 1 < len(parts):
-                        potential_quant = "_".join(parts[i:i+2])
-                        if potential_quant in quant_patterns_2:
-                            quant_idx = i
-                            break
+                        source_path = P(source_model_path)
+                        if source_path.exists():
+                            vlm_info = VLMDetector.detect(source_path)
+                            if vlm_info.is_vlm:
+                                model_type = ModelType.VLM
+                                capabilities = [
+                                    EndpointType.QA,
+                                    EndpointType.CAPTION,
+                                    EndpointType.DETECT,
+                                    EndpointType.POINT,
+                                    EndpointType.TEXT,
+                                ]
+                                detection_method = f"source model VLM detector: {vlm_info.architecture.display_name}"
+                                logger.debug(f"✓ VLM detected - {detection_method}")
+            except Exception as e:
+                logger.debug(f"Could not check source model: {e}")
 
-            # Extract model name (everything before quant type)
-            if quant_idx > 0:
-                # Join parts before quantization type
-                model_name_parts = parts[:quant_idx]
+        # ============ STEP 2: FALLBACK TO NAME PATTERNS ============
+        if model_type == ModelType.LLM:
+            name_lower = gguf_path.stem.lower()
 
-                # Convert underscores to slashes for provider/model format
-                # Example: ['Qwen', 'Qwen3-0', '6B'] → "Qwen/Qwen3-0.6B"
-                if len(model_name_parts) >= 2:
-                    # First part is usually provider (Qwen, mistralai, etc.)
-                    provider = model_name_parts[0]
+            # VLM keyword patterns (comprehensive list)
+            vlm_name_patterns = [
+                '-vl-', '_vl_', '.vl.',  # Generic VL patterns
+                'qwen2-vl', 'qwen2.5-vl', 'qwen3-vl', 'qwenvl',
+                'llava', 'minicpm-v', 'minicpmv', 'moondream',
+                'internvl', 'cogvlm', 'paligemma', 'idefics',
+                'vision', 'multimodal', 'vlm',
+            ]
 
-                    # Rest is model name - rejoin with dashes
-                    model_parts = model_name_parts[1:]
+            if any(pattern in name_lower for pattern in vlm_name_patterns):
+                model_type = ModelType.VLM
+                capabilities = [
+                    EndpointType.QA,
+                    EndpointType.CAPTION,
+                    EndpointType.DETECT,
+                    EndpointType.POINT,
+                    EndpointType.TEXT,
+                ]
+                detection_method = f"filename pattern match"
+                logger.debug(f"✓ VLM detected (fallback) - {detection_method}: {gguf_path.name}")
 
-                    # Handle version numbers split by underscore (e.g., '0' '6B' → '0.6B')
-                    reconstructed = []
-                    for i, p in enumerate(model_parts):
-                        if i > 0 and model_parts[i-1].isdigit() and p and p[0].isdigit():
-                            # This looks like a version split: "3-0" + "6B" → "3-0.6B"
-                            reconstructed[-1] = reconstructed[-1] + "." + p
-                        else:
-                            reconstructed.append(p)
-
-                    model_name = "-".join(reconstructed)
-                    name = f"{provider}/{model_name}"
-                else:
-                    # Fallback: just join with dashes
-                    name = "-".join(model_name_parts)
-
-        # Final fallback: use the original filename stem
-        if not name:
-            name = filename_stem.replace("_", "-")
-
-        # Add quantization type tag - make it very clear with descriptions
-        if quant_type != "unknown":
-            if is_fp16:
-                name = f"{name} [FP16 - Half Precision]"
-            elif quant_type == "q4_k_m":
-                name = f"{name} [Q4_K_M - 4-bit Medium Quality]"
-            elif quant_type == "q4_k_s":
-                name = f"{name} [Q4_K_S - 4-bit Small Size]"
-            elif quant_type == "q5_k_m":
-                name = f"{name} [Q5_K_M - 5-bit Medium Quality]"
-            elif quant_type == "q5_k_s":
-                name = f"{name} [Q5_K_S - 5-bit Small Size]"
-            elif quant_type == "q6_k":
-                name = f"{name} [Q6_K - 6-bit High Quality]"
-            elif quant_type == "q8_0":
-                name = f"{name} [Q8_0 - 8-bit Highest Quality]"
-            elif quant_type == "int8":
-                name = f"{name} [INT8 - 8-bit Integer]"
-            elif quant_type == "int4":
-                name = f"{name} [INT4 - 4-bit Integer]"
-            else:
-                name = f"{name} [{quant_type.upper()}]"
+        # Final fallback: If still LLM, log it
+        if model_type == ModelType.LLM:
+            logger.debug(f"✗ Classified as LLM (no VLM indicators found): {gguf_path.name}")
 
         # Assess compatibility
         compatibility, compatibility_message = self._assess_compatibility_detailed(size_gb)
-
-        # Import required types
-        from ..models.endpoints import EndpointType
 
         return ModelInfo(
             model_id=model_id,
             name=name,
             provider=ProviderType.QUANTIZED,
-            model_type=ModelType.LLM,  # Assume LLM for now
+            model_type=model_type,
             size_gb=size_gb,
             params_billions=params_billions,  # From metadata cache
             ram_gb=ram_gb,  # From metadata cache
-            capabilities=[EndpointType.TEXT],  # Default to text-only
+            capabilities=capabilities,
             compatibility=compatibility,
             compatibility_message=compatibility_message,
             is_installed=True,
@@ -326,36 +362,96 @@ class QuantizedProvider(BaseProvider):
             ram_gb = cached_metadata.ram_gb
             if cached_metadata.architecture and cached_metadata.architecture != "unknown":
                 original_model = cached_metadata.architecture
-            # Check if VLM from metadata
-            if cached_metadata.model_type == "vlm":
+
+        # ============ ROBUST 2-STEP VLM DETECTION ============
+        # Step 1: Check actual files/metadata (most reliable)
+        # Step 2: Fallback to name patterns (if step 1 fails)
+        detection_method = None
+
+        # STEP 1: File-based detection
+
+        # 1A. Check cached metadata model_type
+        if cached_metadata and cached_metadata.model_type == "vlm":
+            model_type = ModelType.VLM
+            is_vlm = True
+            detection_method = "cached metadata model_type=vlm"
+            logger.debug(f"✓ VLM detected - {detection_method}")
+
+        # 1B. Check config.json for VLM indicators
+        if not is_vlm:
+            config_path = model_dir / "config.json"
+            if config_path.exists():
+                try:
+                    import json
+                    with open(config_path) as f:
+                        config = json.load(f)
+
+                    # Check architecture class names
+                    arch = config.get("architectures", [""])[0] if config.get("architectures") else ""
+                    vlm_arch_patterns = [
+                        "ForConditionalGeneration", "VisionTextDual", "VisionEncoder",
+                        "Llava", "LLaVA", "Blip", "BLIP", "Qwen2VL", "Qwen3VL",
+                        "QwenVL", "InstructBlip", "MiniCPM", "Moondream",
+                        "InternVL", "CogVLM", "PaliGemma", "Idefics"
+                    ]
+                    if any(pattern in arch for pattern in vlm_arch_patterns):
+                        model_type = ModelType.VLM
+                        is_vlm = True
+                        detection_method = f"config.json architecture: {arch}"
+                        logger.debug(f"✓ VLM detected - {detection_method}")
+
+                    # Check for vision config keys in config
+                    if not is_vlm:
+                        vision_keys = ["vision_config", "visual_config", "image_encoder", "vision_tower", "mm_vision_tower"]
+                        if any(key in config for key in vision_keys):
+                            model_type = ModelType.VLM
+                            is_vlm = True
+                            detection_method = f"config.json has vision keys"
+                            logger.debug(f"✓ VLM detected - {detection_method}")
+
+                    # Check model_type field
+                    if not is_vlm and config.get("model_type"):
+                        model_type_str = config["model_type"].lower()
+                        if "vision" in model_type_str or "vlm" in model_type_str or "multimodal" in model_type_str:
+                            model_type = ModelType.VLM
+                            is_vlm = True
+                            detection_method = f"config.json model_type: {config['model_type']}"
+                            logger.debug(f"✓ VLM detected - {detection_method}")
+
+                except Exception as e:
+                    logger.debug(f"Could not check config.json for VLM detection: {e}")
+
+        # 1C. Check for vision-related files in directory
+        if not is_vlm:
+            vision_files = ["preprocessor_config.json", "processor_config.json"]
+            for vision_file in vision_files:
+                if (model_dir / vision_file).exists():
+                    model_type = ModelType.VLM
+                    is_vlm = True
+                    detection_method = f"vision file present: {vision_file}"
+                    logger.debug(f"✓ VLM detected - {detection_method}")
+                    break
+
+        # STEP 2: Fallback to name patterns
+        if not is_vlm:
+            name_lower = model_dir.name.lower()
+            vlm_name_patterns = [
+                '-vl-', '_vl_', '.vl.',
+                'qwen2-vl', 'qwen2.5-vl', 'qwen3-vl', 'qwenvl',
+                'llava', 'minicpm-v', 'minicpmv', 'moondream',
+                'internvl', 'cogvlm', 'paligemma', 'idefics',
+                'vision', 'multimodal', 'vlm',
+            ]
+
+            if any(pattern in name_lower for pattern in vlm_name_patterns):
                 model_type = ModelType.VLM
                 is_vlm = True
-        
-        # Also check config.json directly for VLM detection
-        config_path = model_dir / "config.json"
-        if not is_vlm and config_path.exists():
-            try:
-                import json
-                with open(config_path) as f:
-                    config = json.load(f)
-                
-                # Check architecture for VLM patterns
-                arch = config.get("architectures", [""])[0]
-                vlm_patterns = [
-                    "ForConditionalGeneration", "VisionTextDual", "VisionEncoder",
-                    "Llava", "Blip", "Qwen2VL", "Qwen3VL", "InstructBlip"
-                ]
-                is_vlm = any(pattern in arch for pattern in vlm_patterns)
-                
-                # Also check for vision config keys
-                if not is_vlm:
-                    is_vlm = any(key in config for key in ["vision_config", "visual_config", "image_encoder"])
-                
-                if is_vlm:
-                    model_type = ModelType.VLM
-                    logger.info(f"Detected VLM quantized model: {arch}")
-            except Exception as e:
-                logger.debug(f"Could not check config for VLM detection: {e}")
+                detection_method = "filename pattern match"
+                logger.debug(f"✓ VLM detected (fallback) - {detection_method}: {model_dir.name}")
+
+        # Final: Log if still LLM
+        if not is_vlm:
+            logger.debug(f"✗ Classified as LLM (no VLM indicators found): {model_dir.name}")
 
         # Read JSON metadata file - this MUST override cached metadata for quantized models
         # because cached metadata reads raw dtype (bf16) while JSON has actual quant type (int4)
@@ -385,84 +481,9 @@ class QuantizedProvider(BaseProvider):
         # Format: "quantized:hf:/absolute/path/to/model_dir"
         model_id = f"quantized:hf:{model_dir.absolute()}"
 
-        # Display name: Extract clean name from directory, removing module prefixes and quant types
-        # Format: Provider_Model-Name_{module}-{quant_type}[_{counter}]
-        # Examples:
-        #   - "Qwen_Qwen3-0.6B_mlx-int4" → "Qwen/Qwen3-0.6B"
-        #   - "allenai_OLMo-1B_fp16" → "allenai/OLMo-1B"
-        #   - "Qwen_Qwen3-0.6B_mlx-int4_2" → "Qwen/Qwen3-0.6B" (with counter)
-        dir_name = model_dir.name
-        parts = dir_name.split("_")
-
-        # Remove trailing counter if present (e.g., "_2", "_3")
-        # This handles conflicts when the same model is quantized multiple times
-        if len(parts) >= 1 and parts[-1].isdigit() and len(parts[-1]) <= 2:
-            parts = parts[:-1]
-
-        # Remove timestamp parts (YYYYMMDD_HHMMSS) for backwards compatibility with old naming
-        # This handles models quantized before the timestamp removal fix
-        if len(parts) >= 2:
-            if (parts[-1].isdigit() and len(parts[-1]) == 6 and
-                parts[-2].isdigit() and len(parts[-2]) == 8):
-                parts = parts[:-2]  # Remove timestamp
-
-        # Remove module-quant_type (e.g., "mlx-int4", "openvino-int8", "fp16", "q4_k_m")
-        # Look for module prefixes or standalone quant types
-        if len(parts) >= 1:
-            last_part = parts[-1].lower()
-            # Check if last part is a quant type (with or without module prefix)
-            quant_indicators = [
-                "int4", "int8", "int2", "fp16", "bf16", "fp32",
-                "mlx-int4", "mlx-int8", "mlx-int2", "mlx-fp16",
-                "openvino-int4", "openvino-int8", "openvino-fp16",
-                # GGUF types
-                "q4_k_m", "q4_k_s", "q5_k_m", "q5_k_s", "q6_k", "q8_0",
-            ]
-            if last_part in quant_indicators:
-                parts = parts[:-1]  # Remove quant type
-
-        # Reconstruct clean model name
-        if len(parts) >= 2:
-            # First part is provider, rest is model name
-            provider = parts[0]
-            model_parts = parts[1:]
-
-            # Handle version numbers split by underscore (e.g., '0' '6B' → '0.6B')
-            reconstructed = []
-            for i, p in enumerate(model_parts):
-                if i > 0 and model_parts[i-1].isdigit() and p and p[0].isdigit():
-                    reconstructed[-1] = reconstructed[-1] + "." + p
-                else:
-                    reconstructed.append(p)
-
-            model_name = "-".join(reconstructed)
-            clean_name = f"{provider}/{model_name}"
-        else:
-            # Fallback: use what we have
-            clean_name = "-".join(parts) if parts else dir_name
-
-        # Add quantization type label
-        if quant_type != "unknown":
-            if quant_type == "fp16":
-                name = f"{clean_name} [FP16 - Half Precision]"
-            elif quant_type == "bf16":
-                name = f"{clean_name} [BF16 - Brain Float16]"
-            elif quant_type == "int8":
-                name = f"{clean_name} [INT8 - 8-bit Integer]"
-            elif quant_type == "int4":
-                if is_mlx:
-                    name = f"{clean_name} [INT4 MLX] ⚠️ Use MLX tools"
-                else:
-                    name = f"{clean_name} [INT4 - 4-bit Integer]"
-            elif quant_type == "int2":
-                if is_mlx:
-                    name = f"{clean_name} [INT2 MLX] ⚠️ Use MLX tools"
-                else:
-                    name = f"{clean_name} [INT2 - 2-bit Integer]"
-            else:
-                name = f"{clean_name} [{quant_type.upper()}]"
-        else:
-            name = clean_name
+        # Display name: Use raw directory name (no complex parsing)
+        # Example: "Qwen_Qwen3-VL-4B-Instruct_mlx-int4" → "Qwen_Qwen3-VL-4B-Instruct_mlx-int4"
+        name = model_dir.name
 
         # Assess compatibility
         if is_mlx:
@@ -547,6 +568,7 @@ class QuantizedProvider(BaseProvider):
         Returns:
             Tuple of (compatibility status, message)
         """
+        # O(1) time and space complexity - simple division and comparison
         recommended_size = self.system_specs.recommended_model_size_gb
         ratio = model_size_gb / recommended_size
 
@@ -563,7 +585,7 @@ class QuantizedProvider(BaseProvider):
         else:
             return (
                 CompatibilityStatus.TOO_LARGE,
-                f"Model exceeds recommended size by {(ratio-1)*100:.0f}% ({model_size_gb:.1f}GB vs {recommended_size:.1f}GB). May cause OOM errors."
+                f"Model is {ratio:.1f}x larger than recommended ({model_size_gb:.1f}GB vs {recommended_size:.1f}GB). May cause OOM errors."
             )
 
     def load_model(self, model_id: str, device: str) -> Any:
@@ -599,6 +621,167 @@ class QuantizedProvider(BaseProvider):
         else:
             raise ValueError(f"Unknown quantized model format: {model_format}")
 
+    def _normalize_vlm_base(self, name: str) -> str:
+        """Normalize a VLM family base name for robust mmproj↔language matching.
+
+        Strategy:
+        - Lowercase and unify separators to underscores
+        - Trim leading "mmproj-" if present
+        - Iteratively strip trailing role/quantization suffixes (supports multi-token like q4_k_m)
+        - Return the stable family base (e.g., "qwen_qwen3-vl-2b-instruct")
+        """
+        import re
+
+        n = name.lower()
+        if n.startswith("mmproj-"):
+            n = n[len("mmproj-"):]
+
+        # Unify separators
+        n = re.sub(r"[\s\-/]+", "_", n)
+        tokens = [t for t in n.split("_") if t]
+
+        # Known suffix tokens
+        role_suffixes = {
+            "language", "vision", "text", "model", "encoder", "projector", "mmproj",
+        }
+        quant_suffixes = {
+            # 3-token quant patterns
+            "q5_k_m", "q5_k_s", "q4_k_m", "q4_k_s", "q3_k_m", "q3_k_s", "q3_k_l",
+            # 2-token
+            "q5_0", "q5_1", "q4_0", "q4_1", "q3_k", "q2_k", "q6_k", "q8_0",
+            # IQ/TQ variants
+            "iq4_xs", "iq4_nl", "iq3_xs", "iq3_xxs", "iq3_s", "iq3_m",
+            "iq2_xs", "iq2_xxs", "iq2_s", "iq2_m", "iq1_m", "iq1_s",
+            "tq1_0", "tq2_0",
+            # Precision
+            "bf16", "fp16", "f16", "f32",
+        }
+
+        def strip_suffixes(parts: list[str]) -> list[str]:
+            changed = True
+            while parts and changed:
+                changed = False
+                # Try multi-token quant suffixes first (3, then 2)
+                if len(parts) >= 3 and "_".join(parts[-3:]) in quant_suffixes:
+                    parts = parts[:-3]
+                    changed = True
+                    continue
+                if len(parts) >= 2 and "_".join(parts[-2:]) in quant_suffixes:
+                    parts = parts[:-2]
+                    changed = True
+                    continue
+                # Single-token suffix (quant or role)
+                if parts[-1] in role_suffixes or parts[-1] in quant_suffixes:
+                    parts = parts[:-1]
+                    changed = True
+            return parts
+
+        base_tokens = strip_suffixes(tokens)
+        return "_".join(base_tokens)
+
+    def _find_mmproj_candidates(self, model_path: Path) -> list[Path]:
+        """Find all mmproj candidates across results/quantizations for this language model.
+
+        Scans the entire quantization library for files matching the normalized base name.
+        """
+        if not model_path.exists() or not model_path.is_file():
+            return []
+
+        lang_base = self._normalize_vlm_base(model_path.stem)
+        candidates: list[Path] = []
+
+        # Search entire quantized_dir recursively for mmproj-*.gguf (skip macOS resource forks)
+        for mmproj in self.quantized_dir.rglob("mmproj-*.gguf"):
+            if mmproj.name.startswith("._"):
+                continue
+            # Normalize candidate base: remove prefix and normalize
+            cand_base = self._normalize_vlm_base(mmproj.stem[len("mmproj-"):])
+            # Strict match or robust containment in either direction
+            if cand_base == lang_base or cand_base in lang_base or lang_base in cand_base:
+                candidates.append(mmproj)
+
+        # Also check local directory patterns (backward compatibility)
+        local_single = self._find_mmproj_file_legacy(model_path)
+        if local_single and local_single not in candidates:
+            candidates.append(local_single)
+
+        # De-duplicate while preserving order
+        uniq = []
+        seen = set()
+        for p in candidates:
+            key = str(p.resolve())
+            if key not in seen:
+                seen.add(key)
+                uniq.append(p)
+        return uniq
+
+    def _find_mmproj_file_legacy(self, model_path: Path) -> Optional[Path]:
+        """Legacy local-directory mmproj finder for backward compatibility."""
+        try:
+            model_dir = model_path.parent
+            model_name = model_path.stem
+            mmproj_path = model_dir / f"mmproj-{model_name}.gguf"
+            if mmproj_path.exists():
+                return mmproj_path
+            base_name = model_name.replace("_language", "")
+            for mmproj_candidate in model_dir.glob(f"mmproj-{base_name}*.gguf"):
+                return mmproj_candidate
+            metadata_file = model_path.with_suffix('.json')
+            if metadata_file.exists():
+                import json
+                with open(metadata_file) as f:
+                    metadata = json.load(f)
+                    if "vlm_vision_file" in metadata:
+                        path = Path(metadata["vlm_vision_file"])
+                        if path.exists():
+                            return path
+        except Exception:
+            pass
+        return None
+
+    def _find_language_candidates(self, model_path: Path) -> list[Path]:
+        """Find candidate language-decoder GGUF files that match the selected model family.
+
+        Excludes mmproj files and excludes CLIP/vision-only architectures.
+        """
+        lang_base = self._normalize_vlm_base(model_path.stem)
+        candidates: list[Path] = []
+
+        for gguf in self.quantized_dir.rglob("*.gguf"):
+            if gguf.name.startswith("._"):
+                continue
+            if gguf.name.startswith("mmproj-"):
+                continue
+            # Normalize base and filter by family
+            cand_base = self._normalize_vlm_base(gguf.stem)
+            if not (cand_base == lang_base or cand_base in lang_base or lang_base in cand_base):
+                continue
+            # Inspect architecture and exclude CLIP/projector
+            meta = self.metadata_cache.get_metadata(str(gguf), provider="gguf")
+            arch = (meta.architecture or "unknown").lower() if meta else "unknown"
+            if "clip" in arch:
+                continue
+            candidates.append(gguf)
+
+        # Ensure current path is included if it is NOT a CLIP/projector
+        if model_path.exists() and model_path.is_file():
+            try:
+                meta = self.metadata_cache.get_metadata(str(model_path), provider="gguf")
+                arch = (meta.architecture or "unknown").lower() if meta else "unknown"
+                if "clip" not in arch and model_path not in candidates:
+                    candidates.insert(0, model_path)
+            except Exception:
+                pass
+        # De-duplicate
+        seen = set()
+        uniq: list[Path] = []
+        for p in candidates:
+            key = str(p.resolve())
+            if key not in seen:
+                seen.add(key)
+                uniq.append(p)
+        return uniq
+
     def _load_gguf_model(self, model_path: Path, device: str) -> Any:
         """Load GGUF quantized model using llama-server for GPU acceleration.
 
@@ -628,6 +811,43 @@ class QuantizedProvider(BaseProvider):
             # Determine GPU layers based on device
             n_gpu_layers = -1 if device in ["cuda", "mps"] else 0
 
+            # Context length (n_ctx): prompt user in interactive mode, use default in benchmark mode
+            import os
+            min_ctx, max_ctx = 256, 32768
+            default_ctx = 4096
+            n_ctx = default_ctx
+
+            try:
+                if not os.getenv("EKAM_BENCHMARKING"):
+                    # Interactive mode: always prompt user
+                    from ..cli.text_input import professional_prompt
+                    from ..cli.tui_manager import tui
+                    tui.console.print("\n[cyan]Context Window (n_ctx)[/cyan] — tokens kept in memory per request")
+                    tui.console.print(
+                        f"[dim]Min:[/dim] {min_ctx}   [dim]Max:[/dim] {max_ctx}   "
+                        f"[dim]Default:[/dim] {default_ctx}   [dim]Recommended:[/dim] {default_ctx}"
+                    )
+                    tui.console.print("[dim]Higher values increase RAM/VRAM usage and may reduce throughput.[/dim]")
+                    n_ctx = professional_prompt.get_numeric(
+                        "Context length (tokens)",
+                        min_val=min_ctx,
+                        max_val=max_ctx,
+                        default=default_ctx,
+                        style="cyan",
+                    )
+                else:
+                    # Benchmark mode: use env var if set, otherwise default
+                    env_ctx = os.getenv("EKAM_N_CTX")
+                    if env_ctx:
+                        n_ctx = max(min_ctx, min(max_ctx, int(env_ctx)))
+
+                logger.info(
+                    f"Using context length (n_ctx): {n_ctx} tokens (min {min_ctx}, max {max_ctx}; recommended {default_ctx})"
+                )
+            except Exception as e:
+                logger.warning(f"Error setting context length: {e}. Using default {default_ctx}")
+                n_ctx = default_ctx
+
             # PERFORMANCE: Use optimized thread count (physical cores, capped at 8)
             physical_cores = self.system_specs.cpu_cores_physical
             optimal_threads = min(physical_cores, 8)
@@ -639,24 +859,273 @@ class QuantizedProvider(BaseProvider):
                 s.bind(('', 0))
                 port = s.getsockname()[1]
 
-            # Create and start llama-server
-            server = LlamaServerManager(
-                model_path=str(model_path),
-                host="127.0.0.1",
-                port=port,
-            )
+            # Sanity check: ensure main model is not a CLIP/projector file
+            try:
+                lang_meta = self.metadata_cache.get_metadata(str(model_path), provider="gguf")
+            except Exception:
+                lang_meta = None
 
-            success = server.start(
-                n_gpu_layers=n_gpu_layers,
-                n_ctx=4096,
-                n_batch=2048,
-                n_ubatch=512,
-                n_threads=optimal_threads,
-                n_threads_batch=optimal_threads_batch,
-            )
+            lang_arch = (lang_meta.architecture or "unknown").lower() if lang_meta else "unknown"
+            if "clip" in lang_arch:
+                from ..cli.text_input import professional_prompt
+                from ..cli.tui_manager import tui
+                tui.console.print("[yellow]\nWarning: The selected GGUF appears to be a vision projector (CLIP).\nIt cannot be used as the main language model.[/yellow]")
+
+                lang_candidates = self._find_language_candidates(model_path)
+                if not lang_candidates:
+                    raise RuntimeError(
+                        "Selected file is a CLIP projector. No matching language decoder GGUF found.\n"
+                        "Please re-quantize with the latest EKAM (fixes component roles), then try again."
+                    )
+
+                options = []
+                for p in lang_candidates:
+                    meta = self.metadata_cache.get_metadata(str(p), provider="gguf")
+                    size_gb = p.stat().st_size / (1024 ** 3)
+                    arch = (meta.architecture or "unknown").upper() if meta else "UNKNOWN"
+                    label = f"[green]{p.name}[/green]"
+                    desc = f"{size_gb:.2f} GB • {arch}"
+                    options.append((str(p), label, desc))
+
+                choice = professional_prompt.get_arrow_selection(
+                    options=options,
+                    title="Select Language Decoder GGUF",
+                    instructions="Use ↑/↓ arrows, Enter to select, q to cancel",
+                )
+                if choice is None:
+                    raise RuntimeError("Model load cancelled: language decoder selection required")
+                model_path = Path(choice)
+                logger.info(f"User selected language decoder: {model_path.name}")
+
+            # Check for mmproj file(s) (VLM vision encoder)
+            mmproj_path: Optional[Path] = None
+
+            # Reuse session selection if present for this language model
+            model_key = str(model_path)
+            if model_key in self._session_mmproj_choice:
+                sel = self._session_mmproj_choice[model_key]
+                if sel.exists():
+                    mmproj_path = sel
+                    logger.info(f"Using previously selected mmproj: {mmproj_path.name}")
+                else:
+                    # Clear stale selection
+                    del self._session_mmproj_choice[model_key]
+
+            if mmproj_path is None:
+                candidates = self._find_mmproj_candidates(model_path)
+                if len(candidates) == 1:
+                    mmproj_path = candidates[0]
+                    logger.info(f"Detected VLM - using mmproj file: {mmproj_path.name}")
+                elif len(candidates) > 1:
+                    # Interactive selection using arrow keys
+                    from ..cli.text_input import professional_prompt
+                    from ..cli.tui_manager import tui
+                    import sys
+                    import os
+
+                    # Build option tuples (value, label, description)
+                    options = []
+                    for p in candidates:
+                        meta = self.metadata_cache.get_metadata(str(p), provider="gguf")
+                        size_gb = p.stat().st_size / (1024 ** 3)
+                        quant = (meta.quantization.upper() if meta else "UNKNOWN")
+                        label = f"[green]{p.name}[/green]"
+                        desc = f"{size_gb:.2f} GB • {quant}"
+                        options.append((str(p), label, desc))
+
+                    # Non-interactive (CI/benchmarking): auto-select highest precision
+                    if (not sys.stdin.isatty()) or os.getenv("EKAM_BENCHMARKING") == "1":
+                        tui.console.print("[yellow]Non-interactive: selecting highest-precision mmproj automatically[/yellow]")
+                        def rank(q: str) -> int:
+                            order = [
+                                "f32", "f16", "q8_0", "q6_k", "q5_k_m", "q5_k_s", "q5_1", "q5_0",
+                                "q4_k_m", "q4_k_s", "q4_1", "q4_0", "q3_k_m", "q3_k_s", "q2_k",
+                            ]
+                            ql = q.lower()
+                            return order.index(ql) if ql in order else len(order)
+                        # Pick best by quant rank, then by largest size
+                        def key_for(pth: Path):
+                            m = self.metadata_cache.get_metadata(str(pth), provider="gguf")
+                            q = m.quantization if m else "unknown"
+                            return (rank(q), -pth.stat().st_size)
+                        mmproj_path = sorted(candidates, key=key_for)[0]
+                        logger.info(f"Auto-selected mmproj: {mmproj_path.name}")
+                    else:
+                        import os as _os
+                        # In benchmarking mode, never prompt — auto-select best to avoid UI interruption
+                        if _os.getenv("EKAM_BENCHMARK_MODE"):
+                            def _rank(q: str) -> int:
+                                order = [
+                                    "f32", "f16", "q8_0", "q6_k", "q5_k_m", "q5_k_s", "q5_1", "q5_0",
+                                    "q4_k_m", "q4_k_s", "q4_1", "q4_0", "q3_k_m", "q3_k_s", "q2_k",
+                                ]
+                            
+                                ql = q.lower()
+                                return order.index(ql) if ql in order else len(order)
+                            def _key_for(pth: Path):
+                                m = self.metadata_cache.get_metadata(str(pth), provider="gguf")
+                                q = getattr(m, 'quantization', 'unknown') if m else 'unknown'
+                                return (_rank(q), -pth.stat().st_size)
+                            mmproj_path = sorted(candidates, key=_key_for)[0]
+                            logger.info(f"Auto-selected mmproj (benchmark mode): {mmproj_path.name}")
+                        else:
+                            tui.console.print("\n[cyan]Multiple vision encoders found for this model[/cyan]")
+                            tui.console.print("Select which mmproj (vision encoder) to use:")
+                            choice = professional_prompt.get_arrow_selection(
+                                options=options,
+                                title="Select Vision Encoder (mmproj)",
+                                instructions="Use ↑/↓ arrows, Enter to select, q to cancel",
+                            )
+                            if choice is None:
+                                # User cancelled: abort load
+                                raise RuntimeError("Model load cancelled: mmproj selection required")
+                            mmproj_path = Path(choice)
+                            logger.info(f"User selected mmproj: {mmproj_path.name}")
+
+                    # Remember for this session until unload
+                    if mmproj_path is not None:
+                        self._session_mmproj_choice[model_key] = mmproj_path
+
+            # VLM Image Rescaling Configuration (only for VLM models)
+            # Ask user for target resolution to normalize input images
+            is_vlm_model = mmproj_path is not None
+            rescale_width, rescale_height = None, None
+            model_id_for_rescale = str(model_path)  # Use full path as key
+            if is_vlm_model and model_id_for_rescale not in self._rescale_resolution:
+                # Default rescaling resolution
+                default_resolution = "1280x1024"
+                try:
+                    # In benchmark mode, resolution is set via benchmark config (not here)
+                    # In regular inference mode, prompt user
+                    if not os.getenv("EKAM_BENCHMARK_MODE"):
+                        from ..cli.text_input import professional_prompt
+                        from ..cli.tui_manager import tui
+                        tui.clear_screen()
+                        tui.console.print("\n[cyan]VLM Image Rescaling[/cyan] — normalize input image resolution")
+                        tui.console.print(
+                            f"[dim]Images will be rescaled to consistent resolution (maintains aspect ratio with padding)[/dim]"
+                        )
+                        tui.console.print(
+                            f"[dim]Default:[/dim] {default_resolution}   [dim]Range:[/dim] 256x256 to 4096x4096"
+                        )
+                        tui.console.print(
+                            "[dim]Enter resolution as WIDTHxHEIGHT (e.g., 1280x1024) or press Enter for default[/dim]"
+                        )
+
+                        resolution_input = professional_prompt.get_input(
+                            f"Image resolution (default: {default_resolution})",
+                            style="cyan",
+                            allow_multiline=False,
+                            show_instructions=False
+                        )
+
+                        # Use default if user pressed Enter without input
+                        if not resolution_input.strip():
+                            resolution_input = default_resolution
+
+                        # Parse resolution (WIDTHxHEIGHT)
+                        import re
+                        match = re.match(r'(\d+)x(\d+)', resolution_input.strip())
+                        if match:
+                            rescale_width, rescale_height = int(match.group(1)), int(match.group(2))
+                            # Validate range (256-4096 per dimension)
+                            if not (256 <= rescale_width <= 4096 and 256 <= rescale_height <= 4096):
+                                logger.warning(
+                                    f"Resolution {rescale_width}x{rescale_height} out of range (256-4096). "
+                                    f"Using default {default_resolution}"
+                                )
+                                rescale_width, rescale_height = 1280, 1024
+                        else:
+                            logger.warning(f"Invalid resolution format '{resolution_input}'. Using default {default_resolution}")
+                            rescale_width, rescale_height = 1280, 1024
+                    else:
+                        # Benchmark mode - use default (will be overridden by benchmark config)
+                        rescale_width, rescale_height = 1280, 1024
+
+                    # Store rescaling preference for this model
+                    if rescale_width and rescale_height:
+                        self._rescale_resolution[model_id_for_rescale] = (rescale_width, rescale_height)
+                        logger.info(f"VLM image rescaling enabled: {rescale_width}x{rescale_height}")
+                except Exception as e:
+                    logger.warning(f"Error configuring image rescaling: {e}. Disabling rescaling.")
+                    self._rescale_resolution[model_id_for_rescale] = None
+
+            # Show loading box only if not in benchmark mode
+            import os
+            if not os.getenv("EKAM_BENCHMARKING"):
+                from ..cli.tui_manager import tui as _tui
+                _tui.clear_screen()
+                _tui.show_message(
+                    f"Loading model: {model_path.name}\n\n[dim]Please wait...[/dim]",
+                    title="Loading",
+                    style="cyan",
+                )
+
+            # Determine which server implementation to use
+            # In interactive mode (non-VLM), ask user; otherwise use config
+            server_type = get_llama_server_type()
+
+            # For LLMs (non-VLM): always ask user to choose server type
+            # VLMs automatically use subprocess mode (no choice needed)
+            if not mmproj_path:
+                from ..cli.text_input import professional_prompt
+                from ..cli.tui_manager import tui
+                tui.console.print("\n[cyan]Server Type Selection[/cyan] — choose llama-server implementation")
+                tui.console.print("[dim]Two modes available for text models:[/dim]")
+
+                choice = professional_prompt.get_arrow_selection(
+                    options=[
+                        ("subprocess", "Subprocess (llama-server binary)", "Uses patched llama-server binary - no Flask dependency, same as VLMs"),
+                        ("python", "Python (llama-cpp-python + Flask)", "Uses Python bindings with Flask HTTP wrapper - better integration")
+                    ],
+                    title="Select Server Type",
+                    instructions="Use ↑/↓ arrows, Enter to select",
+                )
+
+                if choice == "subprocess":
+                    server_type = "llama-server"
+                    logger.info("User selected: subprocess llama-server binary")
+                elif choice == "python":
+                    server_type = "llama-cli-server"
+                    logger.info("User selected: Python bindings + Flask server")
+                # If user cancels (None), use default from config
+
+            if server_type == "llama-cli-server":
+                # Use custom CLI server with isolated mtmd_context (supports both LLM and VLM)
+                # Server type will be logged once at startup by the server itself
+                server = LlamaCLIServerManager(
+                    model_path=str(model_path),
+                    host="127.0.0.1",
+                    port=port,
+                )
+            else:
+                # Use legacy llama-server (has vision model bugs)
+                # Server type will be logged once at startup by the server itself
+                server = LlamaServerManager(
+                    model_path=str(model_path),
+                    host="127.0.0.1",
+                    port=port,
+                )
+
+            # Build start parameters (device only for LlamaCLIServerManager)
+            start_params = {
+                "n_gpu_layers": n_gpu_layers,
+                "n_ctx": n_ctx,
+                "n_batch": 2048,
+                "n_ubatch": 512,
+                "n_threads": optimal_threads,
+                "n_threads_batch": optimal_threads_batch,
+                "mmproj_path": str(mmproj_path.resolve()) if mmproj_path else None,
+            }
+
+            # Only pass device to LlamaCLIServerManager (legacy LlamaServerManager doesn't support it)
+            if isinstance(server, LlamaCLIServerManager):
+                start_params["device"] = device
+
+            success = server.start(**start_params)
 
             if not success:
-                raise RuntimeError(f"Failed to start llama-server for {model_path}")
+                raise RuntimeError(f"Failed to start {server_type} for {model_path}")
 
             # Store server instance
             self.llama_servers[model_key] = server
@@ -664,12 +1133,14 @@ class QuantizedProvider(BaseProvider):
             logger.info(
                 f"✓ llama-server started on port {port} "
                 f"(GPU layers={n_gpu_layers}, threads={optimal_threads}, "
-                f"ctx=4096, batch=2048, KV cache=GPU VRAM)"
+                f"ctx={n_ctx}, batch=2048, KV cache=GPU VRAM)"
             )
             return server
 
         except Exception as e:
+            import traceback
             logger.error(f"Failed to start llama-server: {e}")
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
             raise RuntimeError(f"Failed to load GGUF model via server: {e}")
 
     def _load_hf_model(self, model_path: Path, device: str) -> Any:
@@ -1454,13 +1925,20 @@ class QuantizedProvider(BaseProvider):
             model_handle: Model instance (LlamaServerManager, tuple of (model, processor), or single model)
         """
         try:
-            # Stop llama-server if this is a server instance
-            if isinstance(model_handle, LlamaServerManager):
+            # Stop server if this is a server instance (works for both types)
+            if isinstance(model_handle, (LlamaServerManager, LlamaCLIServerManager)):
                 model_key = str(model_handle.model_path)
                 if model_key in self.llama_servers:
                     model_handle.stop()
                     del self.llama_servers[model_key]
-                    logger.info(f"llama-server stopped for {model_handle.model_path.name}")
+                    # Clear any session mmproj selection for this model
+                    if model_key in self._session_mmproj_choice:
+                        try:
+                            del self._session_mmproj_choice[model_key]
+                        except Exception:
+                            pass
+                    server_type = "custom CLI server" if isinstance(model_handle, LlamaCLIServerManager) else "llama-server"
+                    logger.info(f"{server_type} stopped for {model_handle.model_path.name}")
                 return
 
             # Handle tuple (model, processor/tokenizer)
@@ -1491,7 +1969,11 @@ class QuantizedProvider(BaseProvider):
         model_handle: Any,
         image: Any,
         question: str,
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        custom_parameters: Optional[dict] = None,
+        timeout: Optional[float] = None,
+        stream_callback: Optional[callable] = None,
+        session_id: Optional[str] = None,
     ) -> str:
         """Run question answering on quantized VLM.
 
@@ -1500,10 +1982,23 @@ class QuantizedProvider(BaseProvider):
             image: PIL Image
             question: Question text
             conversation_history: Optional conversation history
+            custom_parameters: Custom inference parameters
+            timeout: Optional timeout in seconds (not used, for API compatibility)
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
+            session_id: Optional session ID for KV cache (None = stateless)
 
         Returns:
             Answer text
         """
+        # Extract streaming callback from both direct parameter and custom_parameters (for backward compatibility)
+        if stream_callback is None and custom_parameters:
+            stream_callback = custom_parameters.get("_stream_callback")
+
+        # Check if we're in benchmark mode - disable streaming if so
+        import os
+        is_benchmark = os.getenv("EKAM_BENCHMARK_MODE") == "1"
+        effective_callback = None if is_benchmark else stream_callback
+
         # Check if this is a 3-tuple (new format with metadata)
         if isinstance(model_handle, tuple) and len(model_handle) == 3:
             model, processor_or_tokenizer, metadata = model_handle
@@ -1520,9 +2015,9 @@ class QuantizedProvider(BaseProvider):
 
             # Route to appropriate inference method
             if is_mlx:
-                return self._run_qa_mlx(model, processor_or_tokenizer, image, question, conversation_history, metadata)
+                return self._run_qa_mlx(model, processor_or_tokenizer, image, question, conversation_history, metadata, effective_callback)
             else:
-                return self._run_qa_transformers(model, processor_or_tokenizer, image, question, conversation_history)
+                return self._run_qa_transformers(model, processor_or_tokenizer, image, question, conversation_history, effective_callback)
 
         # Backward compatibility: 2-tuple format (legacy)
         elif isinstance(model_handle, tuple) and len(model_handle) == 2:
@@ -1636,12 +2131,666 @@ class QuantizedProvider(BaseProvider):
                     "The model was quantized as an LLM without vision capabilities.\n"
                     "To use vision tasks, quantize a VLM (e.g., LLaVA, Qwen2-VL, BLIP)."
                 )
-        
-        # GGUF models don't support VLM yet
-        raise NotImplementedError(
-            "QA endpoint requires HuggingFace format quantized VLM.\n"
-            "GGUF quantized models don't support vision inference yet."
-        )
+
+        # GGUF models (LlamaServerManager) - use llama-server API with mmproj for vision
+        # model_handle is the LlamaServerManager instance directly (not a tuple)
+        return self._run_qa_gguf_server(model_handle, None, image, question, conversation_history, custom_parameters, session_id)
+
+    def _run_qa_gguf_server(
+        self,
+        model: Any,
+        processor: Any,
+        image: Any,
+        question: str,
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        custom_parameters: Optional[dict] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Run QA inference using GGUF model via llama-server with --mmproj.
+
+        EXPERIMENTAL: Supports GGUF VLMs (Qwen3-VL, LLaVA, etc.) with mmproj files.
+
+        Args:
+            model: LlamaServerManager instance
+            processor: Not used (llama-server handles tokenization)
+            image: PIL Image
+            question: Question text
+            conversation_history: Optional conversation history
+
+        Returns:
+            Answer text
+        """
+        from ..services.llama_server_manager import LlamaServerManager
+        from ..services.llama_cli_server_manager import LlamaCLIServerManager
+        from ..benchmarking.utils.llama_delay import apply_llama_server_delay
+        import base64
+        from io import BytesIO
+        import time
+
+        logger.info("Running GGUF VLM inference via llama-server...")
+
+        # WORKAROUND: Add throttling between vision requests to reduce race conditions
+        # NOTE: This is only needed for legacy llama-server. Custom CLI server has isolated contexts.
+        if not hasattr(self, '_last_vision_request_time'):
+            self._last_vision_request_time = {}
+
+        model_key = str(model.model_path) if hasattr(model, 'model_path') else 'default'
+        last_request_time = self._last_vision_request_time.get(model_key, 0)
+        time_since_last = time.time() - last_request_time
+
+        # Only throttle for legacy llama-server (custom server doesn't need this)
+        if isinstance(model, LlamaServerManager):
+            min_interval = 0.05  # 50ms minimum between requests for legacy server
+            if time_since_last < min_interval:
+                sleep_time = min_interval - time_since_last
+                logger.debug(f"Throttling (legacy server): sleeping {sleep_time:.3f}s to avoid race condition")
+                time.sleep(sleep_time)
+
+        self._last_vision_request_time[model_key] = time.time()
+
+        # Verify model is a server instance (either type)
+        if not isinstance(model, (LlamaServerManager, LlamaCLIServerManager)):
+            raise TypeError(f"Expected LlamaServerManager or LlamaCLIServerManager, got {type(model).__name__}")
+
+        # Apply VLM image rescaling if configured for this model
+        model_path = str(model.model_path) if hasattr(model, 'model_path') else None
+        if model_path and model_path in self._rescale_resolution:
+            rescale_config = self._rescale_resolution[model_path]
+            if rescale_config:  # Not None (None = disabled)
+                target_width, target_height = rescale_config
+                original_size = image.size
+                # Only rescale if image is different size
+                if image.size != (target_width, target_height):
+                    from ..utils.image import rescale_image_with_padding
+                    image = rescale_image_with_padding(image, target_width, target_height)
+                    logger.info(
+                        f"Rescaled image from {original_size[0]}x{original_size[1]} to "
+                        f"{target_width}x{target_height} (with aspect ratio preservation)"
+                    )
+
+        # Prepare image in multiple formats for llama-server API
+        # 1. Save to temporary file for file:// URL (native llama.cpp format)
+        import tempfile
+        import os
+        temp_image_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                image.save(tmp.name, format="JPEG")
+                temp_image_path = tmp.name
+        except Exception as e:
+            logger.warning(f"Could not save temp image file: {e}")
+
+        # 2. Convert to base64 data URL for OpenAI-style format
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_bytes = buffered.getvalue()
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        img_data_url = f"data:image/jpeg;base64,{img_base64}"
+
+        # Debug logging
+        logger.debug(f"Image encoding: {len(img_bytes)} bytes → {len(img_base64)} base64 chars")
+        logger.debug(f"Image size: {image.size}, mode: {image.mode}")
+        if temp_image_path:
+            logger.debug(f"Temp image saved to: {temp_image_path}")
+
+        # Build messages array with vision content
+        # llama-server with --mmproj supports OpenAI-style vision messages
+        messages = []
+
+        # System prompt (from /config)
+        sys_prompt = None
+        if custom_parameters and isinstance(custom_parameters.get("system_prompt"), str):
+            sys_prompt = custom_parameters.get("system_prompt")
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+            logger.debug(f"System prompt (raw): {sys_prompt}")
+
+        # Add conversation history (text-only, no images in history)
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-3:]:  # Last 3 turns
+                messages.append({"role": "user", "content": user_msg})
+                messages.append({"role": "assistant", "content": bot_msg})
+
+        # Add current question with image
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": img_data_url}}
+            ]
+        })
+
+        logger.debug(f"Sending vision request to llama-server with {len(messages)} messages")
+
+        # Gather advanced parameters from custom_parameters
+        extra = {}
+        if custom_parameters:
+            for key in [
+                "top_k","min_p","typical_p","tfs_z","repeat_penalty",
+                "presence_penalty","frequency_penalty","penalty_last_n",
+                "mirostat","mirostat_tau","mirostat_eta","seed","n_keep",
+                "ignore_eos","grammar","logit_bias","n_probs",
+            ]:
+                if key in custom_parameters:
+                    extra[key] = custom_parameters[key]
+
+        # Check if we've cached which format works for this model
+        model_key = str(model.model_path) if hasattr(model, 'model_path') else None
+        cached_format = self._vision_api_format_cache.get(model_key) if model_key else None
+
+        # IMPORTANT: Always include image in message content to ensure llama-server processes it
+        # The top-level `images` parameter is unreliable and sometimes ignored
+
+        # Extract just base64 data for proprietary format (remove data URL prefix)
+        img_base64_only = img_base64  # Already have this from line 2039
+
+        # ============================================================================
+        # 2025 llama.cpp STANDARD FORMAT: OpenAI-compatible image_url content parts
+        # ============================================================================
+        # Reference: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/utils.hpp:616-660
+        # The llama.cpp server supports OpenAI-compatible format with image_url in content array:
+        # - data:image/*;base64,<base64> (standard, portable, proven to work)
+        # - http:// or https:// URLs (downloads remote images automatically)
+        # - file:// URLs (experimental, may not be supported in all versions)
+        #
+        # Priority order (as requested by user):
+        # 1. PRIMARY: OpenAI base64 data URL format (most compatible with llama.cpp web UI)
+        # 2. FALLBACK: Proprietary [img-1] format (for compatibility with older code)
+        # ============================================================================
+
+        # Format 1: OpenAI-compatible format with base64 data URL (PRIMARY)
+        # This is what the llama.cpp web UI uses internally
+        openai_messages = []
+        if sys_prompt:
+            openai_messages.append({"role": "system", "content": sys_prompt})
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-3:]:
+                openai_messages.append({"role": "user", "content": user_msg})
+                openai_messages.append({"role": "assistant", "content": bot_msg})
+        openai_messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": img_data_url}}
+            ]
+        })
+
+        # Format 2: Proprietary llama.cpp format with [img-1] placeholder (FALLBACK for compatibility)
+        # This is a custom format not part of standard llama.cpp
+        # Keeping as fallback for any edge cases where OpenAI format might not work
+        proprietary_messages = []
+        if sys_prompt:
+            proprietary_messages.append({"role": "system", "content": sys_prompt})
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-3:]:
+                proprietary_messages.append({"role": "user", "content": user_msg})
+                proprietary_messages.append({"role": "assistant", "content": bot_msg})
+        proprietary_messages.append({
+            "role": "user",
+            "content": f"[img-1]\n{question}"
+        })
+        proprietary_image_data = [{"id": 1, "data": img_base64}]
+
+        # ============================================================================
+        # CACHE MIGRATION: Clear old "proprietary" cache to force OpenAI format retry
+        # ============================================================================
+        # Since we've changed the priority order to prefer OpenAI format first,
+        # we need to clear any cached "proprietary" formats and force re-detection.
+        # This ensures the new OpenAI-first priority takes effect.
+        # ============================================================================
+        if cached_format == "proprietary":
+            logger.info(
+                "⚠️  Migrating from cached 'proprietary' format → forcing re-detection with OpenAI-first priority"
+            )
+            if model_key and model_key in self._vision_api_format_cache:
+                del self._vision_api_format_cache[model_key]
+            cached_format = None  # Force format detection below
+
+        # Try cached format first (only for openai_base64, which is our PRIMARY format)
+        if cached_format == "proprietary_old_disabled":
+            # This block is disabled - proprietary format is now FALLBACK only
+            # Use cached proprietary format (DEPRECATED - now using OpenAI first)
+            try:
+                # Build and log exact HTTP request
+                try:
+                    url, payload = model.build_chat_payload(
+                        messages=proprietary_messages,
+                        image_data=proprietary_image_data,
+                        max_tokens=1024,
+                        temperature=0.7,
+                        top_p=0.9,
+                        stream=False,
+                        **extra,
+                    )
+                    # Log request (proprietary format)
+                    img_src_path = getattr(image, "_source_path", None)
+                    logger.debug(f"Request: POST {url} | format=proprietary | image={Path(img_src_path).name if img_src_path else 'unknown'}")
+                except Exception:
+                    pass
+
+                response = model.chat_completion(
+                    messages=proprietary_messages,
+                    image_data=proprietary_image_data,
+                    max_tokens=1024,
+                    temperature=0.7,
+                    stream=False,
+                    session_id=session_id,
+                    **extra,
+                )
+
+                if isinstance(response, dict) and "choices" in response:
+                    answer = response["choices"][0]["message"]["content"]
+                    error_keywords = [
+                        "not a valid image", "invalid image", "unable to process",
+                        "cannot", "no image", "do not see an image"
+                    ]
+                    if any(k in answer.lower() for k in error_keywords):
+                        logger.warning("Cached proprietary format produced suspected error response; clearing cache and retrying detection")
+                        if model_key and model_key in self._vision_api_format_cache:
+                            del self._vision_api_format_cache[model_key]
+                    else:
+                        logger.info("✓ GGUF VLM inference successful (cached proprietary format)")
+                        # Clean up temp file before returning
+                        if temp_image_path:
+                            try:
+                                os.unlink(temp_image_path)
+                            except Exception:
+                                pass
+                        return answer.strip()
+                else:
+                    # Truncate response to prevent logging huge base64 payloads
+                    response_str = str(response)
+                    truncated_response = response_str[:200] + "..." if len(response_str) > 200 else response_str
+                    logger.error(f"Unexpected response format: {truncated_response}")
+                    raise RuntimeError("Failed to get response from llama-server")
+            except Exception as e:
+                logger.warning(f"Cached format failed: {e}. Re-detecting format...")
+                # Clear cache and fall through to format detection
+                if model_key and model_key in self._vision_api_format_cache:
+                    del self._vision_api_format_cache[model_key]
+
+        # Handle renamed cached formats for backward compatibility
+        if cached_format == "openai":
+            cached_format = "openai_base64"
+            logger.info("Migrating cached format 'openai' → 'openai_base64'")
+
+        if cached_format == "openai_base64":
+            # Use cached OpenAI base64 format (PRIMARY format - standard llama.cpp)
+            # WORKAROUND: Add retry logic for intermittent mtmd_encode_chunk() failures
+            max_retries = 3
+            retry_count = 0
+            last_error = None
+
+            while retry_count < max_retries:
+                try:
+                    # Build and log exact HTTP request
+                    try:
+                        url, payload = model.build_chat_payload(
+                            messages=openai_messages,
+                            max_tokens=1024,
+                            temperature=0.7,
+                            top_p=0.9,
+                            stream=False,
+                            **extra,
+                        )
+                        # Log request (OpenAI format)
+                        img_src_path = getattr(image, "_source_path", None)
+                        logger.debug(f"Request: POST {url} | format=openai_base64 | image={Path(img_src_path).name if img_src_path else 'unknown'} | attempt={retry_count+1}/{max_retries}")
+                    except Exception:
+                        pass
+
+                    response = model.chat_completion(
+                        messages=openai_messages,
+                        max_tokens=1024,
+                        temperature=0.7,
+                        stream=False,
+                        session_id=session_id,
+                        **extra,
+                    )
+                    # Success - record it and break out of retry loop
+                    if hasattr(model, 'record_inference_success'):
+                        model.record_inference_success()
+                    break
+
+                except Exception as e:
+                    last_error = e
+                    retry_count += 1
+
+                    # Check if this is the intermittent image encoding error (HTTP 500)
+                    is_encoding_error = False
+                    if hasattr(e, 'response') and e.response is not None:
+                        status_code = getattr(e.response, 'status_code', 0)
+                        if status_code == 500:
+                            try:
+                                error_body = getattr(e.response, 'text', '')
+                                if 'failed to process image' in error_body.lower():
+                                    is_encoding_error = True
+                            except:
+                                pass
+
+                    if is_encoding_error and retry_count < max_retries:
+                        import time
+                        backoff_delay = 0.1 * (2 ** (retry_count - 1))  # Exponential backoff: 0.1s, 0.2s, 0.4s
+                        logger.warning(
+                            f"⚠️  mtmd_encode_chunk() failure detected (HTTP 500) - "
+                            f"attempt {retry_count}/{max_retries}. "
+                            f"Retrying after {backoff_delay:.2f}s delay..."
+                        )
+                        time.sleep(backoff_delay)
+
+                        # Health check before retry
+                        try:
+                            if not model.is_running():
+                                logger.error("llama-server died, cannot retry")
+                                raise last_error
+                        except:
+                            pass
+                        continue
+                    else:
+                        # Not an encoding error, or max retries reached
+                        raise
+
+            # If we exhausted retries, record failure and potentially restart server
+            if retry_count >= max_retries:
+                logger.error(f"Failed after {max_retries} retry attempts")
+
+                # Track consecutive failures and check if restart is needed
+                if hasattr(model, 'record_inference_failure'):
+                    should_restart = model.record_inference_failure()
+
+                    if should_restart and hasattr(model, 'restart'):
+                        logger.warning("Attempting automatic server restart...")
+                        restart_success = model.restart()
+
+                        if restart_success:
+                            logger.info("Server restarted successfully. Retrying inference once...")
+                            # Try one more time with fresh server
+                            try:
+                                response = model.chat_completion(
+                                    messages=openai_messages,
+                                    max_tokens=1024,
+                                    temperature=0.7,
+                                    stream=False,
+                                    session_id=session_id,
+                                    **extra,
+                                )
+                                # Success after restart
+                                if hasattr(model, 'record_inference_success'):
+                                    model.record_inference_success()
+                                logger.info("✓ Inference successful after server restart")
+                                # Continue to response processing below
+                            except Exception as retry_error:
+                                logger.error(f"Inference failed even after restart: {retry_error}")
+                                raise last_error
+                        else:
+                            logger.error("Server restart failed")
+                            raise last_error
+                    else:
+                        raise last_error
+                else:
+                    raise last_error
+
+            # Response validation
+            try:
+                if isinstance(response, dict) and "choices" in response:
+                    answer = response["choices"][0]["message"]["content"]
+                    error_keywords = [
+                        "not a valid image", "invalid image", "unable to process",
+                        "cannot", "no image", "do not see an image"
+                    ]
+                    if any(k in answer.lower() for k in error_keywords):
+                        logger.warning("Cached OpenAI base64 format produced suspected error response; clearing cache and retrying detection")
+                        if model_key and model_key in self._vision_api_format_cache:
+                            del self._vision_api_format_cache[model_key]
+                    else:
+                        logger.info("✓ GGUF VLM inference successful (cached openai_base64 format)")
+                        # Clean up temp file before returning
+                        if temp_image_path:
+                            try:
+                                os.unlink(temp_image_path)
+                            except Exception:
+                                pass
+                        # Force Metal backend synchronization to free fragmented memory buffers
+                        try:
+                            import requests
+                            health_url = f"{model.base_url}/health"
+                            requests.get(health_url, timeout=0.5)
+                            logger.debug("Metal backend sync triggered via /health endpoint")
+                        except Exception as e:
+                            logger.debug(f"Metal sync call failed (non-critical): {e}")
+                        # Apply post-inference delay for llama-server state cleanup
+                        apply_llama_server_delay("quantized")
+                        return answer.strip()
+                else:
+                    # Truncate response to prevent logging huge base64 payloads
+                    response_str = str(response)
+                    truncated_response = response_str[:200] + "..." if len(response_str) > 200 else response_str
+                    logger.error(f"Unexpected response format: {truncated_response}")
+                    raise RuntimeError("Failed to get response from llama-server")
+            except Exception as e:
+                logger.warning(f"Cached format failed: {e}. Re-detecting format...")
+                # Clear cache and fall through to format detection
+                if model_key and model_key in self._vision_api_format_cache:
+                    del self._vision_api_format_cache[model_key]
+
+        # ============================================================================
+        # BENCHMARK MODE: Strict format locking
+        # ============================================================================
+        # Check if we're in benchmark mode (set by benchmark_runner.py)
+        import os
+        is_benchmark_mode = os.getenv("EKAM_BENCHMARK_MODE") == "1"
+
+        # In benchmark mode with cached format: skip format detection, use cached only
+        # This ensures consistent methodology across all counted runs (no fallback attempts)
+        if is_benchmark_mode and cached_format:
+            logger.info(f"🔒 Benchmark strict mode: locked to '{cached_format}' format (no fallbacks)")
+            # Skip format detection loop - will only run cached format block above
+            # If cached format already succeeded above, we returned
+            # If we're here, cached format failed - let it raise exception for retry logic
+            raise RuntimeError(
+                f"Benchmark strict mode: cached format '{cached_format}' failed. "
+                "This run will be retried once, then skipped if fails again."
+            )
+
+        # Format detection: Try formats in priority order (as requested by user)
+        # Priority: OpenAI base64 (PRIMARY - standard llama.cpp web UI format) → Proprietary [img-1] (FALLBACK)
+        # Note: This loop is SKIPPED in benchmark mode when we have a cached format
+        formats_to_try = []
+        formats_to_try.append(("openai_base64", openai_messages, None))  # PRIMARY: Standard OpenAI format with base64
+        formats_to_try.append(("proprietary", proprietary_messages, proprietary_image_data))  # FALLBACK: Custom [img-1] format
+
+        last_error = None
+        for format_tuple in formats_to_try:
+            format_name = format_tuple[0]
+            test_messages = format_tuple[1]
+            test_image_data = format_tuple[2] if len(format_tuple) > 2 else None
+
+            try:
+                logger.info(f"Trying vision format: {format_name}")
+                logger.debug(f"Request messages: {test_messages}")
+                if test_image_data:
+                    logger.debug(f"Image data parameter: {len(test_image_data)} items")
+
+                # Build kwargs for chat_completion
+                chat_kwargs = {
+                    "messages": test_messages,
+                    "max_tokens": 1024,
+                    "temperature": 0.7,
+                    "stream": False,
+                    "session_id": session_id,
+                }
+                chat_kwargs.update(extra)
+                if test_image_data:
+                    chat_kwargs["image_data"] = test_image_data
+
+                # WORKAROUND: Add retry logic for format detection (same as cached format)
+                max_retries = 2  # Fewer retries for format detection
+                retry_count = 0
+                format_last_error = None
+
+                while retry_count < max_retries:
+                    try:
+                        # Log exact request built for llama.cpp
+                        try:
+                            url, payload = model.build_chat_payload(**chat_kwargs)
+                            # Log request (format detection)
+                            img_src_path = getattr(image, "_source_path", None)
+                            logger.debug(f"Request: POST {url} | format={format_name} | image={Path(img_src_path).name if img_src_path else 'unknown'} | attempt={retry_count+1}/{max_retries}")
+                        except Exception:
+                            pass
+
+                        response = model.chat_completion(**chat_kwargs)
+                        # Success - record it and break out of retry loop
+                        if hasattr(model, 'record_inference_success'):
+                            model.record_inference_success()
+                        break
+
+                    except Exception as retry_e:
+                        format_last_error = retry_e
+                        retry_count += 1
+
+                        # Check for encoding error
+                        is_encoding_error = False
+                        if hasattr(retry_e, 'response') and retry_e.response is not None:
+                            status_code = getattr(retry_e.response, 'status_code', 0)
+                            if status_code == 500:
+                                try:
+                                    error_body = getattr(retry_e.response, 'text', '')
+                                    if 'failed to process image' in error_body.lower():
+                                        is_encoding_error = True
+                                except:
+                                    pass
+
+                        if is_encoding_error and retry_count < max_retries:
+                            backoff_delay = 0.1 * (2 ** (retry_count - 1))
+                            logger.debug(f"Format detection: retry after {backoff_delay:.2f}s")
+                            time.sleep(backoff_delay)
+                            continue
+                        else:
+                            # Not encoding error or max retries - raise to try next format
+                            raise
+
+                # Check if we exhausted retries
+                if retry_count >= max_retries:
+                    raise format_last_error
+
+                if isinstance(response, dict) and "choices" in response:
+                    answer = response["choices"][0]["message"]["content"]
+                    # Validate content before caching to avoid poisoning cache
+                    error_keywords = [
+                        "not a valid image", "invalid image", "unable to process",
+                        "cannot", "no image", "do not see an image"
+                    ]
+                    if any(k in answer.lower() for k in error_keywords):
+                        logger.warning(f"Format {format_name} produced suspected error response; trying next format")
+                        last_error = RuntimeError(f"{format_name} returned suspected error response")
+                        continue
+                    # Cache this format as working
+                    if model_key:
+                        self._vision_api_format_cache[model_key] = format_name
+                    logger.info(f"✓ GGUF VLM inference successful ({format_name} format)")
+                    logger.debug(f"Cached format '{format_name}' for future requests")
+                    # Clean up temp file before returning
+                    if temp_image_path:
+                        try:
+                            os.unlink(temp_image_path)
+                        except Exception:
+                            pass
+                    # Force Metal backend synchronization to free fragmented memory buffers
+                    try:
+                        import requests
+                        health_url = f"{model.base_url}/health"
+                        requests.get(health_url, timeout=0.5)
+                        logger.debug("Metal backend sync triggered via /health endpoint")
+                    except Exception as e:
+                        logger.debug(f"Metal sync call failed (non-critical): {e}")
+                    # Apply post-inference delay for llama-server state cleanup
+                    apply_llama_server_delay("quantized")
+                    return answer.strip()
+                else:
+                    logger.warning(f"Format {format_name}: Unexpected response format")
+                    last_error = RuntimeError(f"Unexpected response format from {format_name}")
+                    continue
+
+            except Exception as e:
+                logger.error(f"Format {format_name} failed with error: {type(e).__name__}: {e}")
+                # Try to extract more details from HTTP errors
+                error_details = None
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        status_code = getattr(e.response, 'status_code', 'unknown')
+                        error_body = getattr(e.response, 'text', None) or str(getattr(e.response, 'content', ''))
+                        # Truncate error body to prevent huge base64 dumps in logs
+                        truncated_body = error_body[:500] + "..." if len(error_body) > 500 else error_body
+                        logger.error(f"HTTP {status_code} Error Response Body: {truncated_body}")
+                        error_details = error_body
+                    except Exception as parse_err:
+                        logger.debug(f"Could not parse error response: {parse_err}")
+                # Try to get llama-server's output for debugging
+                try:
+                    if hasattr(model, 'get_recent_output'):
+                        server_output = model.get_recent_output(max_lines=20)
+                        if server_output:
+                            logger.error(f"llama-server output:\n{server_output}")
+                except:
+                    pass
+                last_error = (e, error_details)
+                continue
+
+        # All formats failed - track failure and potentially restart server
+        # Clean up temp file before raising
+        if temp_image_path:
+            try:
+                os.unlink(temp_image_path)
+                logger.debug(f"Cleaned up temp image: {temp_image_path}")
+            except Exception as cleanup_err:
+                logger.debug(f"Could not clean up temp image: {cleanup_err}")
+
+        # Track consecutive failures and check if restart is needed
+        if hasattr(model, 'record_inference_failure'):
+            should_restart = model.record_inference_failure()
+
+            if should_restart and hasattr(model, 'restart'):
+                logger.warning("All formats failed. Attempting automatic server restart...")
+                restart_success = model.restart()
+
+                if restart_success:
+                    logger.info("Server restarted. Retrying with OpenAI base64 format...")
+                    # Try one more time with fresh server (use primary format only)
+                    try:
+                        response = model.chat_completion(
+                            messages=openai_messages,
+                            max_tokens=1024,
+                            temperature=0.7,
+                            stream=False,
+                            session_id=session_id,
+                            **extra,
+                        )
+                        # Success after restart
+                        if hasattr(model, 'record_inference_success'):
+                            model.record_inference_success()
+
+                        if isinstance(response, dict) and "choices" in response:
+                            answer = response["choices"][0]["message"]["content"]
+                            logger.info("✓ GGUF VLM inference successful after server restart")
+                            # Apply post-inference delay
+                            apply_llama_server_delay("quantized")
+                            return answer.strip()
+                    except Exception as retry_error:
+                        logger.error(f"Inference failed even after restart: {retry_error}")
+
+        if last_error:
+            logger.error(f"All vision formats failed. Last error: {last_error}")
+            logger.warning(
+                "Your llama-server might not support vision inference with --mmproj yet.\n"
+                "This is an experimental feature. Try:\n"
+                "1. Update llama.cpp to the latest version\n"
+                "2. Rebuild llama-server with vision support\n"
+                "3. Or use HuggingFace format VLMs instead"
+            )
+            raise last_error
+        else:
+            raise RuntimeError("All vision formats failed with no specific error")
 
     def _run_qa_mlx(
         self,
@@ -1650,7 +2799,8 @@ class QuantizedProvider(BaseProvider):
         image: Any,
         question: str,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        metadata: Optional[dict] = None
+        metadata: Optional[dict] = None,
+        stream_callback: Optional[callable] = None
     ) -> str:
         """Run QA inference using MLX framework.
 
@@ -1661,6 +2811,7 @@ class QuantizedProvider(BaseProvider):
             question: Question text
             conversation_history: Optional conversation history
             metadata: Optional metadata dict with model_path
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Answer text
@@ -1749,21 +2900,63 @@ class QuantizedProvider(BaseProvider):
                 else:
                     prompt = question
 
-            # Generate response using MLX VLM
+            # Generate response using MLX VLM with optional streaming
             # CORRECT Signature: generate(model, processor, prompt, image, **kwargs)
             # Note: 'image' can be a single path or list of paths
             # MEMORY FIX: Reduced max_tokens from 1024 to 256 to prevent OOM crashes on 8GB systems
             # MLX VLM accepts temperature and top_p as kwargs (passed to generate_step)
-            response = generate(
-                model,
-                processor,
-                prompt,  # Prompt comes BEFORE image in MLX VLM
-                image_path,  # Image path comes AFTER prompt
-                max_tokens=256,  # Reduced from 1024 to fit in 8GB RAM
-                temperature=0.7,
-                top_p=0.9,
-                verbose=False
-            )
+            # verbose=True enables token-by-token streaming
+            if stream_callback:
+                # Enable streaming mode
+                response_text = ""
+                is_first_token = True
+                for chunk in generate(
+                    model,
+                    processor,
+                    prompt,
+                    image_path,
+                    max_tokens=256,
+                    temperature=0.7,
+                    top_p=0.9,
+                    verbose=True  # Returns generator for streaming
+                ):
+                    # Extract text from chunk
+                    if hasattr(chunk, 'text'):
+                        token_text = chunk.text
+                    elif isinstance(chunk, str):
+                        token_text = chunk
+                    else:
+                        token_text = str(chunk)
+
+                    response_text += token_text
+                    stream_callback(token_text, is_first=is_first_token)
+                    is_first_token = False
+            else:
+                # Non-streaming mode
+                response = generate(
+                    model,
+                    processor,
+                    prompt,
+                    image_path,
+                    max_tokens=256,
+                    temperature=0.7,
+                    top_p=0.9,
+                    verbose=False
+                )
+
+                # PRODUCTION FIX: Extract text from MLX GenerationResult
+                # MLX VLM returns a GenerationResult object with .text attribute
+                if hasattr(response, 'text'):
+                    # It's a GenerationResult object - extract the text
+                    response_text = response.text
+                    logger.debug(f"Extracted text from GenerationResult (tokens: {getattr(response, 'generation_tokens', 'N/A')})")
+                elif isinstance(response, str):
+                    # Already a string
+                    response_text = response
+                else:
+                    # Fallback: Convert to string
+                    response_text = str(response)
+                    logger.warning(f"Unexpected response type: {type(response)}, converting to string")
 
             # Clean up temp file if we created one
             if hasattr(image, 'save'):
@@ -1773,20 +2966,6 @@ class QuantizedProvider(BaseProvider):
                     pass
 
             logger.info("✓ MLX response generated")
-
-            # PRODUCTION FIX: Extract text from MLX GenerationResult
-            # MLX VLM returns a GenerationResult object with .text attribute
-            if hasattr(response, 'text'):
-                # It's a GenerationResult object - extract the text
-                response_text = response.text
-                logger.debug(f"Extracted text from GenerationResult (tokens: {getattr(response, 'generation_tokens', 'N/A')})")
-            elif isinstance(response, str):
-                # Already a string
-                response_text = response
-            else:
-                # Fallback: Convert to string
-                response_text = str(response)
-                logger.warning(f"Unexpected response type: {type(response)}, converting to string")
             
             # Clean response
             response_text = response_text.strip()
@@ -1807,7 +2986,8 @@ class QuantizedProvider(BaseProvider):
         processor: Any,
         image: Any,
         question: str,
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        stream_callback: Optional[callable] = None
     ) -> str:
         """Run QA inference using HuggingFace transformers.
 
@@ -1817,6 +2997,7 @@ class QuantizedProvider(BaseProvider):
             image: PIL Image
             question: Question text
             conversation_history: Optional conversation history
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Answer text
@@ -1893,17 +3074,58 @@ class QuantizedProvider(BaseProvider):
         if str(model_device) == 'cpu':
             logger.warning("⏳ Running inference on CPU - this will be SLOW (30s-2min)")
 
-        # Generate
+        # Generate with optional streaming
         logger.info("Generating response...")
         max_tokens = 512 if str(model_device) == 'cpu' else 1024
 
-        with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=max_tokens)
+        if stream_callback:
+            # Use streaming with TextIteratorStreamer (llama.cpp-style token-by-token)
+            from transformers import TextIteratorStreamer
+            from threading import Thread
 
-        logger.info("✓ Response generated")
+            # llama.cpp-style streaming configuration
+            streamer = TextIteratorStreamer(
+                processor.tokenizer,
+                skip_prompt=True,  # Don't yield input prompt tokens
+                skip_special_tokens=True,
+                timeout=None  # Wait for each token immediately (no buffering)
+            )
 
-        # Decode
-        response = processor.batch_decode(output, skip_special_tokens=True)[0]
+            # Run generation in background thread (required for streaming)
+            generation_kwargs = {**inputs, "max_new_tokens": max_tokens, "streamer": streamer}
+            generation_thread = Thread(
+                target=model.generate,
+                kwargs=generation_kwargs,
+                daemon=True
+            )
+            generation_thread.start()
+
+            # Stream tokens and invoke callback (immediate token-by-token like llama.cpp)
+            response = ""
+            is_first_token = True
+            try:
+                for new_text in streamer:
+                    if new_text:  # Only send non-empty tokens
+                        response += new_text
+                        stream_callback(new_text, is_first=is_first_token)
+                        is_first_token = False
+            except Exception as stream_error:
+                logger.error(f"VLM streaming error: {stream_error}", exc_info=True)
+                # Continue with partial response
+
+            # Wait for generation to complete
+            generation_thread.join(timeout=600)  # 10 minute timeout for VLMs
+            if generation_thread.is_alive():
+                logger.warning("VLM generation thread still alive after timeout")
+        else:
+            # Non-streaming generation
+            with torch.no_grad():
+                output = model.generate(**inputs, max_new_tokens=max_tokens)
+
+            logger.info("✓ Response generated")
+
+            # Decode
+            response = processor.batch_decode(output, skip_special_tokens=True)[0]
 
         # Extract answer
         if conversation_history and "A:" in response:
@@ -1922,7 +3144,8 @@ class QuantizedProvider(BaseProvider):
         max_tokens: int,
         temperature: float,
         top_p: float,
-        repetition_penalty: float
+        repetition_penalty: float,
+        stream_callback: Optional[callable] = None
     ) -> str:
         """Run text generation using MLX framework.
 
@@ -1935,6 +3158,7 @@ class QuantizedProvider(BaseProvider):
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
             repetition_penalty: Repetition penalty (not used by MLX)
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Generated text
@@ -1964,15 +3188,33 @@ class QuantizedProvider(BaseProvider):
             min_tokens_to_keep=1
         )
 
-        # MLX generate function - pass sampler instead of individual parameters
-        response = generate(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=formatted_prompt,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            verbose=False
-        )
+        # MLX generate function with optional streaming
+        # MLX's generate returns a generator when verbose=True, enabling token-by-token streaming
+        if stream_callback:
+            # Enable streaming by setting verbose=True to get token-by-token generation
+            response = ""
+            is_first_token = True
+            for token_text in generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=formatted_prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                verbose=True  # Returns generator for streaming
+            ):
+                response += token_text
+                stream_callback(token_text, is_first=is_first_token)
+                is_first_token = False
+        else:
+            # Non-streaming generation
+            response = generate(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=formatted_prompt,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                verbose=False
+            )
 
         logger.info("✓ MLX text response generated")
 
@@ -2101,22 +3343,46 @@ class QuantizedProvider(BaseProvider):
                 from transformers import TextIteratorStreamer
                 from threading import Thread
 
-                streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True)
+                # llama.cpp-style streaming: token-by-token with immediate display
+                # Key settings:
+                # - skip_prompt=True: Don't yield the input prompt tokens
+                # - skip_special_tokens=True: Clean output
+                # - timeout=None: Wait indefinitely for each token (no buffering)
+                streamer = TextIteratorStreamer(
+                    tokenizer,
+                    skip_prompt=True,  # Critical: Don't stream the input prompt
+                    skip_special_tokens=True,
+                    timeout=None  # Wait for each token immediately
+                )
                 gen_kwargs["streamer"] = streamer
 
-                # Run generation in background thread
-                generation_thread = Thread(target=model.generate, kwargs={**inputs, **gen_kwargs})
+                # Run generation in background thread (required for streaming)
+                generation_kwargs = {**inputs, **gen_kwargs}
+                generation_thread = Thread(
+                    target=model.generate,
+                    kwargs=generation_kwargs,
+                    daemon=True  # Don't block program exit
+                )
                 generation_thread.start()
 
-                # Stream tokens and invoke callback
+                # Stream tokens and invoke callback (llama.cpp-style: immediate token-by-token)
                 response = ""
                 is_first_token = True
-                for new_text in streamer:
-                    response += new_text
-                    stream_callback(new_text, is_first=is_first_token)
-                    is_first_token = False
+                try:
+                    for new_text in streamer:
+                        if new_text:  # Only send non-empty tokens
+                            response += new_text
+                            stream_callback(new_text, is_first=is_first_token)
+                            is_first_token = False
+                except Exception as stream_error:
+                    logger.error(f"Streaming error: {stream_error}", exc_info=True)
+                    # Continue with partial response
 
-                generation_thread.join()
+                # Wait for generation to complete
+                generation_thread.join(timeout=300)  # 5 minute timeout
+                if generation_thread.is_alive():
+                    logger.warning("Generation thread still alive after timeout")
+                    # Thread will be terminated when daemon thread exits
             else:
                 # Non-streaming generation
                 with torch.no_grad():
@@ -2153,19 +3419,21 @@ class QuantizedProvider(BaseProvider):
         model_handle: Any,
         image: Any,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        detail_level: str = "detailed"
+        detail_level: str = "detailed",
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate image caption with quantized VLM.
-        
+
         Args:
             model_handle: Loaded model
             image: PIL Image
             conversation_history: Optional conversation history
             detail_level: "detailed" or "short"
-            
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
+
         Returns:
             Caption text
-            
+
         Raises:
             NotImplementedError: If model is not a VLM
         """
@@ -2174,19 +3442,26 @@ class QuantizedProvider(BaseProvider):
             if detail_level == "detailed"
             else "Describe this image briefly."
         )
-        return self.run_qa(model_handle, image, prompt, conversation_history)
+        return self.run_qa(model_handle, image, prompt, conversation_history, stream_callback=stream_callback)
 
-    def run_detect(self, model_handle: Any, image: Any, object_name: str) -> list[dict]:
+    def run_detect(
+        self,
+        model_handle: Any,
+        image: Any,
+        object_name: str,
+        timeout: Optional[float] = None
+    ) -> list[dict]:
         """Detect objects with quantized VLM.
-        
+
         Args:
             model_handle: Loaded model
             image: PIL Image
             object_name: Object to detect
-            
+            timeout: Optional timeout in seconds (not used, for API compatibility)
+
         Returns:
             List of detections
-            
+
         Raises:
             NotImplementedError: If model is not a VLM
         """
@@ -2214,17 +3489,24 @@ class QuantizedProvider(BaseProvider):
         
         return detections
 
-    def run_point(self, model_handle: Any, image: Any, object_name: str) -> dict:
+    def run_point(
+        self,
+        model_handle: Any,
+        image: Any,
+        object_name: str,
+        timeout: Optional[float] = None
+    ) -> dict:
         """Point to object location with quantized VLM.
-        
+
         Args:
             model_handle: Loaded model
             image: PIL Image
             object_name: Object to locate
-            
+            timeout: Optional timeout in seconds (not used, for API compatibility)
+
         Returns:
             Coordinates dict
-            
+
         Raises:
             NotImplementedError: If model is not a VLM
         """
@@ -2254,7 +3536,8 @@ class QuantizedProvider(BaseProvider):
         model_handle: Any,
         prompt: str,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        custom_parameters: Optional[dict] = None
+        custom_parameters: Optional[dict] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Run text generation on quantized model with conversation history support.
 
@@ -2263,6 +3546,7 @@ class QuantizedProvider(BaseProvider):
             prompt: Input text
             conversation_history: Optional list of (user_msg, bot_response) tuples
             custom_parameters: Optional custom generation parameters (temperature, top_p, max_tokens, etc.)
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Generated text
@@ -2276,8 +3560,15 @@ class QuantizedProvider(BaseProvider):
         frequency_penalty = 0.0
         presence_penalty = 0.0
 
-        # Extract streaming callback for timing metrics (if provided by benchmark suite)
-        stream_callback = None
+        # Extract streaming callback from both direct parameter and custom_parameters (for backward compatibility)
+        if stream_callback is None and custom_parameters:
+            stream_callback = custom_parameters.get("_stream_callback")
+
+        # Check if we're in benchmark mode - disable streaming if so
+        import os
+        is_benchmark = os.getenv("EKAM_BENCHMARK_MODE") == "1"
+        effective_callback = None if is_benchmark else stream_callback
+
         if custom_parameters:
             max_tokens = custom_parameters.get("max_tokens", max_tokens)
             temperature = custom_parameters.get("temperature", temperature)
@@ -2285,7 +3576,6 @@ class QuantizedProvider(BaseProvider):
             repetition_penalty = custom_parameters.get("repetition_penalty", repetition_penalty)
             frequency_penalty = custom_parameters.get("frequency_penalty", frequency_penalty)
             presence_penalty = custom_parameters.get("presence_penalty", presence_penalty)
-            stream_callback = custom_parameters.get("_stream_callback")
 
         # Check if this is a 3-tuple (new format with metadata)
         if isinstance(model_handle, tuple) and len(model_handle) == 3:
@@ -2296,13 +3586,14 @@ class QuantizedProvider(BaseProvider):
             if is_mlx:
                 return self._run_text_mlx(
                     model, tokenizer, prompt, conversation_history,
-                    max_tokens, temperature, top_p, repetition_penalty
+                    max_tokens, temperature, top_p, repetition_penalty,
+                    effective_callback
                 )
             else:
                 return self._run_text_transformers(
                     model, tokenizer, prompt, conversation_history,
                     max_tokens, temperature, top_p, repetition_penalty,
-                    stream_callback
+                    effective_callback
                 )
 
         # Backward compatibility: 2-tuple format (legacy)
@@ -2423,8 +3714,8 @@ class QuantizedProvider(BaseProvider):
             
             return response if response else "I don't have a response."
         
-        elif isinstance(model_handle, LlamaServerManager):
-            # llama-server (GGUF via HTTP API for GPU acceleration + KV cache reuse)
+        elif isinstance(model_handle, (LlamaServerManager, LlamaCLIServerManager)):
+            # llama-server or custom CLI server (GGUF via HTTP API for GPU acceleration + KV cache reuse)
             # Extract model name from server's model path
             model_path_str = str(model_handle.model_path).lower()
 
@@ -2447,9 +3738,12 @@ class QuantizedProvider(BaseProvider):
             messages = []
 
             # System message
+            sys_prompt = None
+            if custom_parameters and isinstance(custom_parameters.get("system_prompt"), str):
+                sys_prompt = custom_parameters.get("system_prompt")
             messages.append({
                 "role": "system",
-                "content": "You are a helpful AI assistant. Provide clear, accurate, and concise responses."
+                "content": sys_prompt or "You are a helpful assistant."
             })
 
             # Add conversation history
@@ -2477,6 +3771,18 @@ class QuantizedProvider(BaseProvider):
 
             try:
                 # Use llama-server's chat completion API (GPU + KV cache reuse!)
+                # Gather advanced parameters from custom_parameters
+                extra = {}
+                if custom_parameters:
+                    for key in [
+                        "top_k","min_p","typical_p","tfs_z","repeat_penalty",
+                        "presence_penalty","frequency_penalty","penalty_last_n",
+                        "mirostat","mirostat_tau","mirostat_eta","seed","n_keep",
+                        "ignore_eos","grammar","logit_bias","n_probs",
+                    ]:
+                        if key in custom_parameters:
+                            extra[key] = custom_parameters[key]
+
                 response_stream = model_handle.chat_completion(
                     messages=messages,
                     max_tokens=max_tokens,
@@ -2484,6 +3790,7 @@ class QuantizedProvider(BaseProvider):
                     top_p=top_p,
                     stop=stop_tokens,
                     stream=True,
+                    **extra,
                 )
 
                 # Accumulate streaming chunks into full response
@@ -2524,6 +3831,15 @@ class QuantizedProvider(BaseProvider):
             from ..utils.response_cleaner import clean_model_response
 
             response_text = response["choices"][0]["text"]
+
+            # LOG RAW RESPONSE FROM LLAMA.CPP (BEFORE ANY PROCESSING)
+            logger.info("="*80)
+            logger.info(f"[LLAMA.CPP RAW RESPONSE] ({len(response_text)} chars)")
+            logger.info(response_text)
+            logger.info("="*80)
+            logger.info(f"[LLAMA.CPP] Has <think> tags: {'<think>' in response_text.lower()}")
+            logger.info(f"[LLAMA.CPP] Has </think> tags: {'</think>' in response_text.lower()}")
+
             cleaned_response = clean_model_response(response_text, aggressive=True)
 
             return cleaned_response

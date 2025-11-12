@@ -276,6 +276,81 @@ class BenchmarkMenu:
                 logger.info("User cancelled model selection")
                 return None
 
+            # If VLMs selected, pre-select mmproj for any quantized GGUF VLMs with multiple candidates
+            if model_type == ModelType.VLM:
+                try:
+                    from ..models.endpoints import ProviderType
+                    id_to_model = {m.model_id: m for m in all_models}
+                    quant_provider = session_manager.model_discovery.get_provider(ProviderType.QUANTIZED)
+                    # Only proceed if quantized provider is available and supports mmproj selection helpers
+                    if quant_provider is not None and hasattr(quant_provider, "_find_mmproj_candidates"):
+                        from ..cli.text_input import professional_prompt
+                        from ..cli.tui_manager import tui as _tui
+                        from pathlib import Path
+
+                        # Iterate each selected model; if quantized GGUF, ask for mmproj when multiple candidates
+                        for mid in model_ids:
+                            m = id_to_model.get(mid)
+                            if not m:
+                                continue
+                            provider_obj = getattr(m, "provider", None)
+                            provider_name = str(provider_obj.value if hasattr(provider_obj, "value") else provider_obj).lower()
+                            if not (provider_obj == ProviderType.QUANTIZED or provider_name == "quantized"):
+                                continue
+                            # Parse quantized model-id: quantized:gguf:/abs/path or quantized:hf:/path
+                            parts = str(mid).split(":", 2)
+                            if len(parts) != 3 or parts[1] != "gguf":
+                                continue  # mmproj relevant for gguf
+                            lang_path = Path(parts[2])
+
+                            # Find mmproj candidates across results/quantizations
+                            try:
+                                candidates = quant_provider._find_mmproj_candidates(lang_path)
+                            except Exception as e:
+                                logger.debug(f"Could not enumerate mmproj for {lang_path}: {e}")
+                                continue
+
+                            if not candidates:
+                                continue
+
+                            # If single candidate, remember it for session to avoid prompt later
+                            if len(candidates) == 1:
+                                quant_provider._session_mmproj_choice[str(lang_path)] = candidates[0]
+                                logger.info(f"Auto-selected mmproj for {lang_path.name}: {candidates[0].name}")
+                                continue
+
+                            # Multiple candidates — ask user via arrow menu
+                            options = []
+                            for p in candidates:
+                                try:
+                                    meta = quant_provider.metadata_cache.get_metadata(str(p), provider="gguf")
+                                except Exception:
+                                    meta = None
+                                size_gb = 0.0
+                                try:
+                                    size_gb = p.stat().st_size / (1024 ** 3)
+                                except Exception:
+                                    pass
+                                quant = (meta.quantization.upper() if meta and getattr(meta, "quantization", None) else "UNKNOWN")
+                                label = f"[green]{p.name}[/green]"
+                                desc = f"{size_gb:.2f} GB • {quant}"
+                                options.append((str(p), label, desc))
+
+                            _tui.console.print(f"\n[cyan]Select vision encoder (mmproj) for[/cyan] [yellow]{lang_path.name}[/yellow]")
+                            choice = professional_prompt.get_arrow_selection(
+                                options=options,
+                                title="Select Vision Encoder (mmproj)",
+                                instructions="Use ↑/↓ arrows, Enter to select, q to cancel",
+                            )
+                            if not choice:
+                                _tui.console.print("[yellow]Skipping mmproj assignment (will auto-detect later)[/yellow]")
+                                continue
+                            sel_path = Path(choice)
+                            quant_provider._session_mmproj_choice[str(lang_path)] = sel_path
+                            logger.info(f"User selected mmproj for {lang_path.name}: {sel_path.name}")
+                except Exception as mm_err:
+                    logger.debug(f"mmproj pre-selection skipped due to: {mm_err}")
+
         except Exception as e:
             logger.error(f"Failed to discover models: {e}", exc_info=True)
             tui.show_error(
@@ -291,8 +366,8 @@ class BenchmarkMenu:
         else:
             endpoint = "vision/analyze"
 
-        # Step 4: Test data
-        tui.console.print(f"\n[cyan]Step 3: Test Data[/cyan]")
+        # Step 3: Test Data
+        tui.console.print(f"\n[cyan]Step 3/8: Test Data[/cyan]")
         use_default_choice = tui.prompt("Use default test prompts? [Y/n]:", style="cyan").strip().lower()
         use_default = use_default_choice != "n"
 
@@ -316,8 +391,81 @@ class BenchmarkMenu:
                 prompts = [prompt]
                 tui.console.print(f"[dim]✓ Prompt accepted ({len(prompt)} chars)[/dim]")
 
-        # Step 5: Number of runs
-        tui.console.print(f"\n[cyan]Step 4: Number of Runs[/cyan]")
+        # Step 4 (VLM only): Select test images
+        images: list[str] = []
+        if model_type == ModelType.VLM:
+            tui.console.print(f"\n[cyan]Step 4/8: Test Images (VLM)[/cyan]")
+            tui.console.print("Enter one or more image file paths (comma-separated). Must exist.")
+            from pathlib import Path as _P
+            while True:
+                img_in = tui.prompt("Images:", style="cyan").strip()
+                imgs = [p.strip() for p in img_in.split(',') if p.strip()]
+                valid = [p for p in imgs if _P(p).exists()]
+                if valid:
+                    images = valid
+                    tui.console.print(f"[dim]✓ Using {len(images)} image(s)[/dim]")
+                    break
+                tui.show_error("No valid image paths provided. Please enter at least one valid file path.")
+
+        # Step 5: Number of Prompts (Speed only)
+        if suite_type == SuiteType.SPEED:
+            tui.console.print(f"\n[cyan]Step 5/8: Number of Prompts[/cyan]")
+            current_prompts = len(prompts)
+            target_prompts = min(10, current_prompts) if current_prompts > 0 else 1
+            from rich.table import Table as _Table
+            ptbl = _Table.grid(padding=(0, 2))
+            ptbl.add_column(style="cyan")
+            ptbl.add_column(style="white")
+            ptbl.add_row("Parameter", "Current Value")
+            ptbl.add_row("Prompts", f"{target_prompts}")
+            tui.console.print(ptbl)
+            tui.console.print("[dim]Range: 1-50 | Default: 10[/dim]")
+
+            from ..cli.text_input import ProfessionalPrompt as _PP
+            _pp = _PP()
+            while True:
+                choice = _pp.get_arrow_selection(
+                    options=[
+                        ("edit", "Edit number of prompts", "Specify how many prompts to use (1-50)"),
+                        ("default", "Use default", "Reset to default value (10)"),
+                        ("continue", "Continue to Step 6 →", "Proceed to parameter selection"),
+                        ("prev", "← Previous", "Back to endpoint selection"),
+                        ("cancel", "Cancel", "Cancel benchmark configuration"),
+                    ],
+                    title="Configure number of prompts",
+                    instructions="Use ↑/↓ arrows to navigate, Enter to select"
+                )
+                if choice == "edit":
+                    val = tui.prompt("Enter number of prompts [1-50]:", style="cyan").strip()
+                    try:
+                        n = int(val)
+                        if n < 1 or n > 50:
+                            raise ValueError
+                        target_prompts = max(1, min(50, n))
+                    except Exception:
+                        tui.show_error("Invalid number. Please enter an integer between 1 and 50.")
+                        continue
+                elif choice == "default":
+                    target_prompts = min(10, current_prompts) if current_prompts > 0 else 1
+                elif choice == "continue":
+                    break
+                elif choice in ("prev", None):
+                    return None
+                elif choice == "cancel":
+                    return None
+                # refresh table
+                ptbl = _Table.grid(padding=(0, 2))
+                ptbl.add_column(style="cyan")
+                ptbl.add_column(style="white")
+                ptbl.add_row("Parameter", "Current Value")
+                ptbl.add_row("Prompts", f"{target_prompts}")
+                tui.clear_and_show_with_status(ptbl, "Range: 1-50 | Default: 10")
+
+            if len(prompts) > target_prompts:
+                prompts = prompts[:target_prompts]
+
+        # Step 6: Number of Runs
+        tui.console.print(f"\n[cyan]Step 6/8: Number of Runs[/cyan]")
         num_runs_input = tui.prompt("Number of runs [1-100] (default: 5):", style="cyan").strip()
         try:
             num_runs = int(num_runs_input) if num_runs_input else 5
@@ -326,7 +474,7 @@ class BenchmarkMenu:
             num_runs = 5
             tui.console.print(f"[dim]Invalid input, using default: {num_runs}[/dim]")
 
-        # Step 6: Warmup runs
+        # Step 7: Warmup runs & Parameters
         warmup_input = tui.prompt("Number of warmup runs [0-10] (default: 2):", style="cyan").strip()
         try:
             num_warmup = int(warmup_input) if warmup_input else 2
@@ -438,38 +586,47 @@ class BenchmarkMenu:
             else:
                 tui.console.print(f"[dim]✓ Complete suite configured with custom run counts per sub-suite[/dim]")
 
-        # Step 7: Execution mode
-        tui.console.print(f"\n[cyan]Step 5: Execution Mode[/cyan]")
-        tui.console.print()
-
-        execution_mode_options = [
-            ("foreground", "[green]Foreground[/green]", "Blocking with real-time progress display"),
-            ("background", "[yellow]Background[/yellow]", "Non-blocking, run in background"),
-        ]
-
-        execution_mode_choice = professional_prompt.get_arrow_selection(
-            options=execution_mode_options,
-            title="Execution Mode",
-            instructions="Use ↑/↓ arrows to navigate, Enter to select"
-        )
-
-        if execution_mode_choice is None:
-            return None
-
-        execution_mode = ExecutionMode.FOREGROUND if execution_mode_choice == "foreground" else ExecutionMode.BACKGROUND
-
-        # Create configuration
-        test_data = {"prompts": prompts}
-        if model_type == ModelType.VLM:
-            test_data["images"] = []
+        # Default to foreground execution
+        execution_mode = ExecutionMode.FOREGROUND
 
         # Create endpoints dictionary for all selected models
         endpoints = {model_id: [endpoint] for model_id in model_ids}
 
+        # Step 7/8: Benchmark Parameters (tabular, editable)
+        tui.console.print(f"\n[cyan]Step 7/8: Benchmark Parameters[/cyan]")
+        temp_in = tui.prompt("Temperature [0.0-1.0] (default: 0.7):", style="cyan").strip()
+        top_p_in = tui.prompt("Top-p [0.0-1.0] (default: 0.9):", style="cyan").strip()
+        top_k_in = tui.prompt("Top-k [0-200] (default: 50):", style="cyan").strip()
+        max_tok_in = tui.prompt("Max tokens [16-8192] (default: 512):", style="cyan").strip()
+        n_ctx_in = tui.prompt("n_ctx [256-32768] (default: 4096):", style="cyan").strip()
+
+        def _parse_float(val: str, d: float, lo: float, hi: float) -> float:
+            try:
+                x = float(val) if val else d
+                return max(lo, min(hi, x))
+            except Exception:
+                return d
+
+        def _parse_int(val: str, d: int, lo: int, hi: int) -> int:
+            try:
+                x = int(val) if val else d
+                return max(lo, min(hi, x))
+            except Exception:
+                return d
+
+        temperature = _parse_float(temp_in, 0.7, 0.0, 1.0)
+        top_p = _parse_float(top_p_in, 0.9, 0.0, 1.0)
+        top_k = _parse_int(top_k_in, 50, 0, 200)
+        max_tokens = _parse_int(max_tok_in, 512, 16, 8192)
+        n_ctx_val = _parse_int(n_ctx_in, 4096, 256, 32768)
+
         # Build parameters with inference settings and suite-specific config
         parameters = {
-            "temperature": 0.7,
-            "max_tokens": 512,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_tokens": max_tokens,
+            "n_ctx": n_ctx_val,
             **suite_config  # Add suite-specific configuration
         }
 
@@ -486,7 +643,7 @@ class BenchmarkMenu:
             export_formats=["json", "csv"]
         )
 
-        # Show summary and confirm
+        # Final Step: Configuration Review
         tui.clear_screen()
         model_list = "\n".join([f"  • {mid}" for mid in model_ids])
 
@@ -526,24 +683,59 @@ class BenchmarkMenu:
 [cyan]Benchmark Runs:[/cyan] {num_runs} runs × {len(model_ids)} model(s) = {num_runs * len(model_ids)} total
 [cyan]Warmup Runs:[/cyan] {num_warmup}"""
 
-        summary = f"""[bold green]Configuration Summary[/bold green]
+        from rich.table import Table as _Table
+        review_tbl = _Table.grid(padding=(0, 2))
+        review_tbl.add_column(style="cyan")
+        review_tbl.add_column(style="white")
+        review_tbl.add_row("Setting", "Value")
+        review_tbl.add_row("Model Type", model_type.value.upper())
+        review_tbl.add_row("Suite", suite_type.display_name())
+        review_tbl.add_row("Models", str(len(model_ids)))
+        runs_per_model = len(prompts) if suite_type == SuiteType.SPEED else num_runs
+        review_tbl.add_row("Runs per model", str(runs_per_model))
+        review_tbl.add_row("Warmup runs", str(num_warmup))
+        review_tbl.add_row("Execution mode", execution_mode.value.title())
+        review_tbl.add_row("Temperature", str(temperature))
+        review_tbl.add_row("Top-p", str(top_p))
+        review_tbl.add_row("Top-k", str(top_k))
+        review_tbl.add_row("Max tokens", str(max_tokens))
+        review_tbl.add_row("n_ctx", str(n_ctx_val))
 
-[cyan]Models ({len(model_ids)}):[/cyan]
-{model_list}
+        from rich.panel import Panel as _Panel
+        tui.show_panel(review_tbl, title="Final Step: Configuration Review", border_style="green")
+        tui.console.print(f"Selected models:\n{model_list}")
 
-[cyan]Type:[/cyan] {model_type.value.upper()}
-[cyan]Suite:[/cyan] {suite_type.value.upper()}
-[cyan]Test Prompts:[/cyan] {len(prompts)}{suite_summary}
-[cyan]Mode:[/cyan] {execution_mode.value.upper()}"""
+        from ..cli.text_input import ProfessionalPrompt as _PP2
+        _p2 = _PP2()
+        choice = _p2.get_arrow_selection(
+            options=[
+                ("START", "Start Benchmark", "Begin benchmark execution with this configuration"),
+                ("SAVE", "Save Configuration", "Save this configuration to file for later use"),
+                ("EDIT", "Edit Configuration", "Go back to parameters to make changes"),
+                ("CANCEL", "Cancel", "Cancel benchmark and return to main menu"),
+            ],
+            title="Review Complete - Ready to Start?",
+            instructions="Use ↑/↓ arrows to navigate, Enter to select"
+        )
 
-        tui.show_panel(summary, title="Summary", border_style="green")
-
-        confirm_choice = tui.prompt("\nStart benchmark? [Y/n]:", style="green").strip().lower()
-        if confirm_choice == "n":
-            logger.info("User cancelled benchmark configuration")
+        if choice == "START":
+            return config
+        if choice == "SAVE":
+            try:
+                from pathlib import Path as _Path
+                out_dir = _Path("results/configs")
+                out_dir.mkdir(parents=True, exist_ok=True)
+                cfg_path = out_dir / f"{config.benchmark_id}.json"
+                cfg_path.write_text(config.to_json(), encoding="utf-8")
+                tui.show_message(f"Saved configuration to {cfg_path}", title="Saved", style="green")
+            except Exception as e:
+                tui.show_error(f"Failed to save configuration: {e}")
             return None
+        if choice == "EDIT":
+            return None
+        return None
 
-        return config
+        return None
 
     @staticmethod
     def run_benchmark(config: BenchmarkConfig, session_manager: SessionManager) -> None:
@@ -556,25 +748,27 @@ class BenchmarkMenu:
         """
         runner = BenchmarkRunner(session_manager=session_manager)
 
-        def progress_callback(message: str):
-            tui.console.print(f"[dim]{message}[/dim]")
-
         tui.clear_screen()
         tui.console.print(f"\n[bold cyan]Starting {config.suite_type.value.upper()} Benchmark...[/bold cyan]\n")
 
         try:
-            result = runner.run(config, progress_callback=progress_callback)
+            result = runner.run(config)
 
-            tui.clear_screen()
+            # Summary
             tui.console.print(f"\n[bold green]✓ Benchmark Complete![/bold green]")
             tui.console.print(f"[cyan]Status:[/cyan] {result.status.value}")
             tui.console.print(f"[cyan]Duration:[/cyan] {result.duration_seconds:.2f}s")
             tui.console.print(f"[cyan]Successful runs:[/cyan] {result.successful_runs}/{result.total_runs}")
 
-            # Ask if user wants to see detailed results
-            show_details = tui.prompt("\nShow detailed results? [Y/n]:", style="green").strip().lower() != "n"
-
-            if show_details:
+            # Next action prompt
+            from ..cli.text_input import ProfessionalPrompt
+            prompt = ProfessionalPrompt()
+            next_choice = prompt.get_arrow_selection(
+                options=[("DETAILS", "[green]Show Detailed Results[/green]", "Open detailed view"), ("BACK", "[dim]◄ Go back[/dim]", "Return")],
+                title="Next Action",
+                instructions="Use ↑/↓ to navigate, Enter to select"
+            )
+            if next_choice == "DETAILS":
                 runner.print_result(result, detailed=True)
 
         except Exception as e:

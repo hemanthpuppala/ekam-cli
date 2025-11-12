@@ -10,7 +10,7 @@ providers:
     - cuda
     - mps
     - cpu
-    hf_token: "<REDACTED>"
+    # hf_token: "<REDACTED>"  # Commented out - will use .env file instead
   lm_studio:
     enabled: false
     host: http://localhost:1234

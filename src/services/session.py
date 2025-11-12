@@ -124,6 +124,16 @@ class SessionManager:
         if self.state.loaded_model:
             model_id = self.state.loaded_model.model_info.model_id
             logger.info(f"Unloading model {model_id}")
+
+            # Call provider's unload_model to properly cleanup resources (e.g., stop llama-server)
+            provider = self.get_current_provider()
+            if provider and self.state.loaded_model._handle is not None:
+                try:
+                    provider.unload_model(self.state.loaded_model._handle)
+                except Exception as e:
+                    logger.warning(f"Error during provider unload: {e}")
+
+            # Clear model from session state
             self.state.unload_model()
             logger.info(f"Model {model_id} unloaded")
 

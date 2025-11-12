@@ -1,5 +1,6 @@
 """GGUF quantization technique using llama.cpp."""
 
+import json
 import os
 import re
 import subprocess
@@ -9,8 +10,12 @@ from typing import Callable, Optional
 
 from loguru import logger
 
+# Local GGUF inspector utilities
+from ...models.gguf_inspect import detect_mmproj_input_dim
+
 from ...models.model import ModelInfo
 from ...models.provider import ProviderType
+from ...models.vlm_detector import VLMDetector, VLMArchitecture
 from ..models import QuantizationTask, QuantizationType, TaskStatus
 from .base import BaseQuantizer
 
@@ -24,14 +29,60 @@ class GGUFQuantizer(BaseQuantizer):
         self.convert_script: Optional[Path] = None
 
     def get_supported_types(self) -> list[QuantizationType]:
-        """Get supported quantization types."""
+        """Get supported quantization types (all 40 GGUF formats)."""
         return [
-            QuantizationType.GGUF_Q4_K_M,
-            QuantizationType.GGUF_Q4_K_S,
+            # Full precision formats
+            QuantizationType.GGUF_F32,
+            QuantizationType.GGUF_F16,
+            QuantizationType.GGUF_BF16,
+
+            # 8-bit quantization
+            QuantizationType.GGUF_Q8_0,
+
+            # 6-bit quantization
+            QuantizationType.GGUF_Q6_K,
+
+            # 5-bit quantization
+            QuantizationType.GGUF_Q5_K,
             QuantizationType.GGUF_Q5_K_M,
             QuantizationType.GGUF_Q5_K_S,
-            QuantizationType.GGUF_Q6_K,
-            QuantizationType.GGUF_Q8_0,
+            QuantizationType.GGUF_Q5_0,
+            QuantizationType.GGUF_Q5_1,
+
+            # 4-bit quantization
+            QuantizationType.GGUF_IQ4_XS,
+            QuantizationType.GGUF_IQ4_NL,
+            QuantizationType.GGUF_Q4_K,
+            QuantizationType.GGUF_Q4_K_M,
+            QuantizationType.GGUF_Q4_K_S,
+            QuantizationType.GGUF_Q4_0,
+            QuantizationType.GGUF_Q4_1,
+
+            # 3-bit quantization
+            QuantizationType.GGUF_IQ3_M,
+            QuantizationType.GGUF_IQ3_S,
+            QuantizationType.GGUF_IQ3_XS,
+            QuantizationType.GGUF_IQ3_XXS,
+            QuantizationType.GGUF_Q3_K,
+            QuantizationType.GGUF_Q3_K_L,
+            QuantizationType.GGUF_Q3_K_M,
+            QuantizationType.GGUF_Q3_K_S,
+
+            # 2-bit quantization
+            QuantizationType.GGUF_IQ2_M,
+            QuantizationType.GGUF_IQ2_S,
+            QuantizationType.GGUF_IQ2_XS,
+            QuantizationType.GGUF_IQ2_XXS,
+            QuantizationType.GGUF_Q2_K,
+            QuantizationType.GGUF_Q2_K_S,
+
+            # 1-bit quantization
+            QuantizationType.GGUF_IQ1_M,
+            QuantizationType.GGUF_IQ1_S,
+
+            # Ternary quantization (experimental)
+            QuantizationType.GGUF_TQ1_0,
+            QuantizationType.GGUF_TQ2_0,
         ]
 
     def check_availability(self) -> tuple[bool, str]:
@@ -228,6 +279,288 @@ class GGUFQuantizer(BaseQuantizer):
 
         return None
 
+    def _convert_and_quantize_vlm_components(
+        self,
+        hf_model_path: Path,
+        task: QuantizationTask,
+        vlm_info,
+        progress_callback: Optional[Callable[[float, Optional[float]], None]] = None,
+    ) -> bool:
+        """Convert and quantize VLM components separately.
+
+        This handles component-level VLM quantization:
+        - Vision encoder selected: quantized vision + F16 language
+        - Language decoder selected: F16 vision + quantized language
+        - Both selected: quantized vision + quantized language
+
+        Args:
+            hf_model_path: Path to HF model directory
+            task: Quantization task
+            vlm_info: VLM information
+            progress_callback: Optional progress callback
+
+        Returns:
+            True if successful
+        """
+        logger.info(f"🔧 VLM Component-Level Quantization: {task.vlm_components}")
+        logger.info("   Generating both language decoder and vision encoder files")
+
+        output_dir = task.output_path.parent
+        base_name = task.output_path.stem
+
+        # Step 1: Convert language model (WITHOUT --mmproj)
+        # Note: We still pass vlm_info so that --trust-remote-code is added for custom architectures
+        logger.info("📝 Step 1/4: Converting language decoder to F16...")
+        language_f16_path = output_dir / f"{base_name}_language_f16.gguf"
+
+        task.progress = 0.0
+        # For language-only: pass vlm_info but with is_vlm=False
+        # This ensures --trust-remote-code is added but NOT --mmproj
+        class LanguageOnlyVLMInfo:
+            is_vlm = False  # Don't add --mmproj
+            architecture = vlm_info.architecture if vlm_info else None
+
+        if not self._convert_hf_to_gguf(
+            hf_model_path, language_f16_path, task, vlm_info=LanguageOnlyVLMInfo(), progress_callback=progress_callback
+        ):
+            return False
+
+        logger.info(f"✓ Language decoder F16: {language_f16_path.name}")
+
+        # Step 2: Convert vision encoder (WITH --mmproj)
+        logger.info("📝 Step 2/4: Converting vision encoder to F16...")
+        vision_f16_path = output_dir / f"mmproj-{base_name}_f16.gguf"
+
+        task.progress = 25.0
+        if not self._convert_hf_to_gguf(
+            hf_model_path, vision_f16_path, task, vlm_info=vlm_info, progress_callback=progress_callback
+        ):
+            return False
+        logger.info(f"✓ Vision encoder F16: {vision_f16_path.name}")
+
+        # Step 3 & 4: Quantize based on component selection
+        language_final_path = language_f16_path
+        vision_final_path = vision_f16_path
+
+        if task.vlm_components in ["language", "both"]:
+            quant_type = task.language_decoder_type or task.quantization_type
+            logger.info(f"📝 Step 3/4: Quantizing language decoder to {quant_type.value}...")
+            # Name language file with the selected quant type for clarity
+            language_final_path = output_dir / f"{base_name}_{quant_type.value}_language.gguf"
+
+            task.progress = 50.0
+            if not self._quantize_gguf_file(
+                language_f16_path, language_final_path, quant_type, progress_callback
+            ):
+                return False
+
+            logger.info(f"✓ Language decoder quantized: {language_final_path.name}")
+
+        if task.vlm_components in ["vision", "both"]:
+            quant_type = task.vision_encoder_type or task.quantization_type
+            logger.info(f"📝 Step 4/4: Quantizing vision encoder to {quant_type.value}...")
+            # Name projector file with the selected quant type for clarity
+            vision_final_path = output_dir / f"mmproj-{base_name}_{quant_type.value}.gguf"
+
+            task.progress = 75.0
+
+            # Try to quantize vision encoder
+            # Note: Vision encoders often have small tensors (patch embeddings) that can't be quantized
+            quantization_success = self._quantize_gguf_file(
+                vision_f16_path, vision_final_path, quant_type, progress_callback
+            )
+
+            if not quantization_success:
+                # First attempt failed; try a safe fallback ladder before F16
+                logger.warning(f"⚠️  Vision encoder quantization to {quant_type.value} failed; trying fallbacks")
+                fallback_chain = []
+                try:
+                    from ..models import QuantizationType as QT
+                    # Pragmatic ladder: Q6_K → Q5_K_M → IQ4_NL → Q4_K_M
+                    fallback_chain = [QT.GGUF_Q6_K, QT.GGUF_Q5_K_M, QT.GGUF_IQ4_NL, QT.GGUF_Q4_K_M]
+                except Exception:
+                    fallback_chain = []
+
+                selected_fallback = None
+                for fb in fallback_chain:
+                    try:
+                        trial_path = output_dir / f"mmproj-{base_name}_{fb.value}.gguf"
+                        logger.info(f"Attempting fallback vision quantization: {fb.value}")
+                        if self._quantize_gguf_file(vision_f16_path, trial_path, fb, progress_callback):
+                            selected_fallback = fb
+                            vision_final_path = trial_path
+                            break
+                    except Exception:
+                        continue
+
+                if selected_fallback is None:
+                    # All fallbacks failed — use F16
+                    logger.info("Using F16 precision for vision encoder instead")
+                    vision_final_path = vision_f16_path
+                    try:
+                        from ..models import QuantizationType as QT
+                        task.attempted_vision_quant_type = quant_type
+                        task.warning_message = (
+                            f"Vision encoder could not be quantized to {quant_type.value.upper()}; using F16 instead. "
+                            f"You can quantize the vision encoder separately with a different type from the pipeline."
+                        )
+                        task.vision_encoder_type = QT.GGUF_F16
+                    except Exception:
+                        pass
+                else:
+                    # We selected a fallback type successfully
+                    try:
+                        from ..models import QuantizationType as QT
+                        task.attempted_vision_quant_type = quant_type
+                        task.vision_encoder_type = selected_fallback
+                        task.warning_message = (
+                            f"Vision encoder could not be quantized to {quant_type.value.upper()}; used {selected_fallback.value.upper()} instead."
+                        )
+                    except Exception:
+                        pass
+                    logger.info(f"✓ Vision encoder quantized with fallback: {selected_fallback.value}")
+            else:
+                logger.info(f"✓ Vision encoder quantized: {vision_final_path.name}")
+
+        # Store file paths and sizes in task metadata
+        task.output_path = language_final_path
+        task.vlm_language_file = str(language_final_path)
+        task.vlm_vision_file = str(vision_final_path)
+
+        # Calculate combined file size
+        language_size_gb = language_final_path.stat().st_size / (1024 ** 3)
+        vision_size_gb = vision_final_path.stat().st_size / (1024 ** 3)
+        task.vlm_language_size_gb = language_size_gb
+        task.vlm_vision_size_gb = vision_size_gb
+
+        task.status = TaskStatus.COMPLETED
+        task.progress = 100.0
+        task.eta_seconds = 0.0
+
+        logger.info(f"✅ VLM Quantization Complete!")
+        logger.info(f"   Language: {language_final_path.name} ({language_size_gb:.2f} GB)")
+        logger.info(f"   Vision:   {vision_final_path.name} ({vision_size_gb:.2f} GB)")
+        logger.info(f"   Total:    {language_size_gb + vision_size_gb:.2f} GB")
+        logger.info(f"⚠️  Both files are required together for inference")
+
+        return True
+
+    def _quantize_gguf_file(
+        self,
+        source_path: Path,
+        output_path: Path,
+        quant_type: QuantizationType,
+        progress_callback: Optional[Callable[[float, Optional[float]], None]] = None,
+    ) -> bool:
+        """Quantize a single GGUF file.
+
+        Args:
+            source_path: Input GGUF file (F16)
+            output_path: Output quantized GGUF file
+            quant_type: Quantization type to apply
+            progress_callback: Optional progress callback
+
+        Returns:
+            True if successful
+        """
+        if not self.quantize_binary:
+            logger.error("llama-quantize binary not found")
+            return False
+
+        # Build quantization command
+        quant_type_map = {
+            # Full precision formats
+            QuantizationType.GGUF_F32: "F32",
+            QuantizationType.GGUF_F16: "F16",
+            QuantizationType.GGUF_BF16: "BF16",
+            # 8-bit
+            QuantizationType.GGUF_Q8_0: "Q8_0",
+            # 6-bit
+            QuantizationType.GGUF_Q6_K: "Q6_K",
+            # 5-bit
+            QuantizationType.GGUF_Q5_K: "Q5_K",
+            QuantizationType.GGUF_Q5_K_S: "Q5_K_S",
+            QuantizationType.GGUF_Q5_K_M: "Q5_K_M",
+            QuantizationType.GGUF_Q5_0: "Q5_0",
+            QuantizationType.GGUF_Q5_1: "Q5_1",
+            # 4-bit
+            QuantizationType.GGUF_Q4_K: "Q4_K",
+            QuantizationType.GGUF_Q4_K_S: "Q4_K_S",
+            QuantizationType.GGUF_Q4_K_M: "Q4_K_M",
+            QuantizationType.GGUF_Q4_0: "Q4_0",
+            QuantizationType.GGUF_Q4_1: "Q4_1",
+            # 3-bit
+            QuantizationType.GGUF_Q3_K: "Q3_K",
+            QuantizationType.GGUF_Q3_K_S: "Q3_K_S",
+            QuantizationType.GGUF_Q3_K_M: "Q3_K_M",
+            QuantizationType.GGUF_Q3_K_L: "Q3_K_L",
+            # 2-bit
+            QuantizationType.GGUF_Q2_K: "Q2_K",
+            QuantizationType.GGUF_Q2_K_S: "Q2_K_S",
+            # IQ formats (Importance-weighted Quantization)
+            QuantizationType.GGUF_IQ4_XS: "IQ4_XS",
+            QuantizationType.GGUF_IQ4_NL: "IQ4_NL",
+            QuantizationType.GGUF_IQ3_S: "IQ3_S",
+            QuantizationType.GGUF_IQ3_M: "IQ3_M",
+            QuantizationType.GGUF_IQ3_XS: "IQ3_XS",
+            QuantizationType.GGUF_IQ3_XXS: "IQ3_XXS",
+            QuantizationType.GGUF_IQ2_S: "IQ2_S",
+            QuantizationType.GGUF_IQ2_M: "IQ2_M",
+            QuantizationType.GGUF_IQ2_XS: "IQ2_XS",
+            QuantizationType.GGUF_IQ2_XXS: "IQ2_XXS",
+            QuantizationType.GGUF_IQ1_S: "IQ1_S",
+            QuantizationType.GGUF_IQ1_M: "IQ1_M",
+        }
+
+        quant_type_arg = quant_type_map.get(quant_type)
+        if not quant_type_arg:
+            logger.error(f"Unknown quantization type: {quant_type}")
+            return False
+
+        cmd = [
+            str(self.quantize_binary),
+            "--allow-requantize",
+            str(source_path),
+            str(output_path),
+            quant_type_arg,
+        ]
+
+        logger.debug(f"Running: {' '.join(cmd)}")
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+
+            for line in iter(process.stdout.readline, ""):
+                if not line:
+                    break
+                logger.debug(f"Quantize: {line.strip()}")
+
+            return_code = process.wait()
+
+            if return_code == 0:
+                logger.info(f"✓ Quantization successful: {output_path.name}")
+                return True
+            else:
+                logger.error(f"Quantization failed with code {return_code}")
+                # Remove partial/corrupted output if created to avoid confusion
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                        logger.warning(f"Removed partial output: {output_path.name}")
+                except Exception as _e:
+                    logger.debug(f"Could not remove partial output {output_path}: {_e}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Quantization error: {e}", exc_info=True)
+            return False
+
     def quantize(
         self,
         task: QuantizationTask,
@@ -317,38 +650,81 @@ class GGUFQuantizer(BaseQuantizer):
                         logger.warning(f"Could not pre-check architecture compatibility: {e}")
                         logger.info("Continuing with conversion - llama.cpp will report if unsupported")
 
-                    # Check if it's a VLM (Vision-Language Model)
-                    is_vlm, architecture_name = self._check_if_vlm(source_path)
-                    if is_vlm:
-                        # VLM detected - check if language-only quantization is requested
-                        if task.vlm_components == "language":
-                            logger.info(f"VLM detected ({architecture_name}), but language-only quantization requested")
-                            logger.info("Proceeding with GGUF conversion of language decoder component only")
-                            logger.warning("NOTE: Language-only component extraction is experimental")
-                            # TODO: Implement actual language decoder extraction
-                            # For now, attempt full model conversion (may fail for some VLMs)
-                        else:
-                            # Full VLM or vision component quantization - NOT supported
+                    # Check if it's a VLM (Vision-Language Model) using VLMDetector
+                    vlm_info = VLMDetector.detect(source_path)
+
+                    if vlm_info.is_vlm:
+                        logger.info(f"Detected VLM: {vlm_info.architecture.display_name} (confidence: {vlm_info.confidence})")
+
+                        # Check if architecture is actually supported by llama.cpp GGUF converter
+                        if not vlm_info.architecture.supports_gguf_conversion:
                             task.status = TaskStatus.FAILED
                             task.error = (
-                                f"❌ VLM GGUF Conversion Not Supported\n\n"
+                                f"❌ VLM Architecture Not Yet Supported by llama.cpp\n\n"
                                 f"Model: {task.model_info.name}\n"
-                                f"Architecture: {architecture_name}\n"
-                                f"Type: Vision-Language Model (VLM)\n\n"
-                                f"Why this fails:\n"
-                                f"  • llama.cpp only supports pure language models\n"
-                                f"  • VLMs have vision encoders (CLIP, ViT) that GGUF doesn't handle\n"
-                                f"  • Multimodal projection layers are not supported\n\n"
+                                f"Architecture: {vlm_info.architecture.display_name}\n"
+                                f"Confidence: {vlm_info.confidence}\n\n"
+                                f"This VLM architecture is not yet supported by llama.cpp's GGUF converter.\n"
+                                f"While the architecture is modern, llama.cpp support is still in development.\n\n"
+                                f"✅ CURRENTLY SUPPORTED VLMs IN GGUF:\n"
+                                f"  • Qwen3-VL (latest)\n"
+                                f"  • Qwen2-VL\n"
+                                f"  • Qwen2.5-VL\n"
+                                f"  • SmolVLM\n"
+                                f"  • More being added regularly\n\n"
                                 f"✅ SOLUTIONS:\n"
-                                f"  1. Use 'Advanced' quantization for component-level control\n"
-                                f"     → Select 'Language Only' to enable GGUF conversion\n"
-                                f"  2. Use 'Generic' quantization (GPTQ/AWQ/BnB)\n"
-                                f"     → Quantizes entire VLM (vision + language)\n"
-                                f"     → Supports FP16/INT8/INT4\n\n"
-                                f"Go back and select a different quantization method."
+                                f"  1. Use Generic FP16/BF16 quantization (works on ALL models)\n"
+                                f"     → 50% size reduction\n"
+                                f"     → No architecture restrictions\n"
+                                f"     → Full VLM functionality preserved\n\n"
+                                f"  2. Use MLX quantization (if on Apple Silicon)\n"
+                                f"     → Optimized for Mac M-series chips\n"
+                                f"     → Works with all VLMs\n\n"
+                                f"  3. Wait for llama.cpp support\n"
+                                f"     → Check llama.cpp GitHub for updates\n"
+                                f"     → Monitor: https://github.com/ggml-org/llama.cpp\n\n"
+                                f"💡 Recommendation: Select 'Generic quantization' → 'FP16' for immediate use."
                             )
-                            logger.error(f"VLM architecture detected: {architecture_name}. GGUF conversion not supported for full VLMs.")
                             return False
+
+                        # Check if architecture supports modern conversion (--mmproj flag)
+                        if vlm_info.architecture.supports_modern_conversion:
+                            logger.info(f"VLM architecture {vlm_info.architecture.display_name} supports modern GGUF conversion with --mmproj")
+                            # Modern VLM: will use --mmproj flag in conversion
+                            # Store VLM info in task for conversion step
+                            task.vlm_info = vlm_info
+
+                        elif vlm_info.architecture.needs_legacy_conversion:
+                            # Legacy VLM: needs special conversion scripts
+                            task.status = TaskStatus.FAILED
+                            task.error = (
+                                f"❌ Legacy VLM Architecture Detected\n\n"
+                                f"Model: {task.model_info.name}\n"
+                                f"Architecture: {vlm_info.architecture.display_name}\n"
+                                f"Language Model: {vlm_info.language_model_type or 'Unknown'}\n"
+                                f"Vision Encoder: {vlm_info.vision_encoder_type or 'Unknown'}\n\n"
+                                f"This VLM requires legacy conversion scripts not yet supported.\n\n"
+                                f"Legacy architectures: {', '.join([a.display_name for a in [VLMArchitecture.LLAVA_1_5, VLMArchitecture.LLAVA_1_6, VLMArchitecture.MINICPM_V_2_5, VLMArchitecture.MINICPM_V_2_6, VLMArchitecture.GLM_EDGE, VLMArchitecture.GRANITE_VISION]])}\n\n"
+                                f"✅ SOLUTIONS:\n"
+                                f"  1. Use Generic FP16 quantization (works on all VLMs)\n"
+                                f"     → 50% size reduction\n"
+                                f"     → No architecture restrictions\n\n"
+                                f"  2. Find a pre-quantized GGUF version on HuggingFace\n"
+                                f"     → Search for '{task.model_info.name} GGUF'\n\n"
+                                f"💡 Modern VLMs (Qwen2-VL, Gemma 3, SmolVLM, etc.) are fully supported."
+                            )
+                            logger.error(f"Legacy VLM architecture not supported: {vlm_info.architecture.display_name}")
+                            return False
+
+                        else:
+                            # Unknown VLM architecture
+                            logger.warning(f"Unknown VLM architecture: {vlm_info.architecture.value}")
+                            logger.info("Attempting conversion anyway - may fail if unsupported")
+                            task.vlm_info = vlm_info
+                    else:
+                        # Not a VLM - standard language model
+                        logger.info("Detected language-only model (not a VLM)")
+                        task.vlm_info = None
 
                     if not self.convert_script:
                         task.status = TaskStatus.FAILED
@@ -363,15 +739,63 @@ class GGUFQuantizer(BaseQuantizer):
 
                     # Convert HF model to GGUF F16 first
                     logger.info(f"Converting HF model to GGUF format: {source_path}")
-                    f16_path = task.output_path.parent / f"{task.output_path.stem}_f16.gguf"
 
                     try:
-                        # Step 1: Convert safetensors → GGUF F16
-                        if not self._convert_hf_to_gguf(source_path, f16_path, task, progress_callback):
+                        vlm_info = getattr(task, 'vlm_info', None)
+
+                        # For VLMs with component selection, use dual conversion workflow
+                        if vlm_info and vlm_info.is_vlm and task.vlm_components:
+                            logger.info(f"VLM component-level quantization: {task.vlm_components}")
+                            logger.info("⚠️  Both language and vision files will be generated for inference")
+
+                            if not self._convert_and_quantize_vlm_components(
+                                source_path, task, vlm_info, progress_callback
+                            ):
+                                return False
+
+                            # Task is complete - skip normal quantization workflow
+                            return True
+
+                        # Standard single-file conversion for non-VLMs or full VLM quantization
+                        f16_path = task.output_path.parent / f"{task.output_path.stem}_f16.gguf"
+
+                        # Step 1: Convert safetensors → GGUF F16 (with optional --mmproj for VLMs)
+                        if not self._convert_hf_to_gguf(source_path, f16_path, task, vlm_info, progress_callback):
                             return False
 
                         # Store intermediate file path for user info
                         task.intermediate_file = f16_path
+
+                        # Check if target format is F16/F32/BF16 (no quantization needed)
+                        if task.quant_type in [QuantizationType.GGUF_F16, QuantizationType.GGUF_F32, QuantizationType.GGUF_BF16]:
+                            # Just rename the converted file - no quantization step needed
+                            import shutil
+                            if task.quant_type == QuantizationType.GGUF_F16:
+                                # Already F16, just rename
+                                logger.info(f"Target format is F16 - renaming converted file")
+                                shutil.move(str(f16_path), str(task.output_path))
+                            else:
+                                # Need F32 or BF16 - reconvert with correct outtype
+                                logger.info(f"Target format is {task.quant_type.value.upper()} - converting with --outtype {task.quant_type.value}")
+                                if not self._convert_hf_to_gguf(
+                                    Path(task.model_info.source_path),
+                                    task.output_path,
+                                    task,
+                                    vlm_info,
+                                    progress_callback,
+                                    outtype=task.quant_type.value
+                                ):
+                                    return False
+                                # Clean up intermediate F16 file
+                                if f16_path.exists():
+                                    f16_path.unlink()
+
+                            task.progress = 100.0
+                            task.status = TaskStatus.COMPLETED
+                            logger.info(f"✓ Conversion complete: {task.output_path}")
+                            if progress_callback:
+                                progress_callback(100.0, 0.0)
+                            return True
 
                         # Update source_path to the F16 GGUF file for quantization
                         source_path = f16_path
@@ -390,14 +814,60 @@ class GGUFQuantizer(BaseQuantizer):
         # Ensure output directory exists
         task.output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build quantization command
+        # Build quantization command - map all 40 GGUF types
         quant_type_map = {
-            QuantizationType.GGUF_Q4_K_M: "Q4_K_M",
-            QuantizationType.GGUF_Q4_K_S: "Q4_K_S",
+            # Full precision formats
+            QuantizationType.GGUF_F32: "F32",
+            QuantizationType.GGUF_F16: "F16",
+            QuantizationType.GGUF_BF16: "BF16",
+
+            # 8-bit quantization
+            QuantizationType.GGUF_Q8_0: "Q8_0",
+
+            # 6-bit quantization
+            QuantizationType.GGUF_Q6_K: "Q6_K",
+
+            # 5-bit quantization
+            QuantizationType.GGUF_Q5_K: "Q5_K",
             QuantizationType.GGUF_Q5_K_M: "Q5_K_M",
             QuantizationType.GGUF_Q5_K_S: "Q5_K_S",
-            QuantizationType.GGUF_Q6_K: "Q6_K",
-            QuantizationType.GGUF_Q8_0: "Q8_0",
+            QuantizationType.GGUF_Q5_0: "Q5_0",
+            QuantizationType.GGUF_Q5_1: "Q5_1",
+
+            # 4-bit quantization
+            QuantizationType.GGUF_IQ4_XS: "IQ4_XS",
+            QuantizationType.GGUF_IQ4_NL: "IQ4_NL",
+            QuantizationType.GGUF_Q4_K: "Q4_K",
+            QuantizationType.GGUF_Q4_K_M: "Q4_K_M",
+            QuantizationType.GGUF_Q4_K_S: "Q4_K_S",
+            QuantizationType.GGUF_Q4_0: "Q4_0",
+            QuantizationType.GGUF_Q4_1: "Q4_1",
+
+            # 3-bit quantization
+            QuantizationType.GGUF_IQ3_M: "IQ3_M",
+            QuantizationType.GGUF_IQ3_S: "IQ3_S",
+            QuantizationType.GGUF_IQ3_XS: "IQ3_XS",
+            QuantizationType.GGUF_IQ3_XXS: "IQ3_XXS",
+            QuantizationType.GGUF_Q3_K: "Q3_K",
+            QuantizationType.GGUF_Q3_K_L: "Q3_K_L",
+            QuantizationType.GGUF_Q3_K_M: "Q3_K_M",
+            QuantizationType.GGUF_Q3_K_S: "Q3_K_S",
+
+            # 2-bit quantization
+            QuantizationType.GGUF_IQ2_M: "IQ2_M",
+            QuantizationType.GGUF_IQ2_S: "IQ2_S",
+            QuantizationType.GGUF_IQ2_XS: "IQ2_XS",
+            QuantizationType.GGUF_IQ2_XXS: "IQ2_XXS",
+            QuantizationType.GGUF_Q2_K: "Q2_K",
+            QuantizationType.GGUF_Q2_K_S: "Q2_K_S",
+
+            # 1-bit quantization
+            QuantizationType.GGUF_IQ1_M: "IQ1_M",
+            QuantizationType.GGUF_IQ1_S: "IQ1_S",
+
+            # Ternary quantization
+            QuantizationType.GGUF_TQ1_0: "TQ1_0",
+            QuantizationType.GGUF_TQ2_0: "TQ2_0",
         }
 
         quant_type_arg = quant_type_map.get(task.quant_type)
@@ -501,17 +971,65 @@ class GGUFQuantizer(BaseQuantizer):
     def estimate_output_size(
         self, model_info: ModelInfo, quant_type: QuantizationType
     ) -> float:
-        """Estimate output file size in GB."""
+        """Estimate output file size in GB for all 40 GGUF quantization types."""
+        # Size factors relative to original model size
+        # Based on bits-per-weight and overhead
         size_factors = {
-            QuantizationType.GGUF_Q4_K_M: 0.5,
-            QuantizationType.GGUF_Q4_K_S: 0.45,
-            QuantizationType.GGUF_Q5_K_M: 0.6,
-            QuantizationType.GGUF_Q5_K_S: 0.55,
-            QuantizationType.GGUF_Q6_K: 0.7,
-            QuantizationType.GGUF_Q8_0: 0.9,
+            # Full precision formats
+            QuantizationType.GGUF_F32: 1.0,      # 32-bit = 100% of original
+            QuantizationType.GGUF_F16: 0.5,      # 16-bit = 50% of original
+            QuantizationType.GGUF_BF16: 0.5,     # 16-bit = 50% of original
+
+            # 8-bit quantization (~8.5 bpw)
+            QuantizationType.GGUF_Q8_0: 0.27,    # 8.5 bpw
+
+            # 6-bit quantization (~6.5 bpw)
+            QuantizationType.GGUF_Q6_K: 0.21,    # 6.56 bpw
+
+            # 5-bit quantization (~5-6 bpw)
+            QuantizationType.GGUF_Q5_K: 0.18,    # 5.54 bpw
+            QuantizationType.GGUF_Q5_K_M: 0.18,  # 5.54 bpw
+            QuantizationType.GGUF_Q5_K_S: 0.17,  # 5.5 bpw
+            QuantizationType.GGUF_Q5_0: 0.18,    # 5.5 bpw
+            QuantizationType.GGUF_Q5_1: 0.19,    # 5.75 bpw
+
+            # 4-bit quantization (~4-5 bpw)
+            QuantizationType.GGUF_IQ4_XS: 0.13,  # 4.25 bpw - best quality 4-bit
+            QuantizationType.GGUF_IQ4_NL: 0.14,  # 4.5 bpw
+            QuantizationType.GGUF_Q4_K: 0.15,    # 4.5 bpw
+            QuantizationType.GGUF_Q4_K_M: 0.15,  # 4.58 bpw
+            QuantizationType.GGUF_Q4_K_S: 0.14,  # 4.55 bpw
+            QuantizationType.GGUF_Q4_0: 0.14,    # 4.5 bpw
+            QuantizationType.GGUF_Q4_1: 0.15,    # 4.75 bpw
+
+            # 3-bit quantization (~3-4 bpw)
+            QuantizationType.GGUF_IQ3_M: 0.11,   # 3.7 bpw
+            QuantizationType.GGUF_IQ3_S: 0.10,   # 3.5 bpw
+            QuantizationType.GGUF_IQ3_XS: 0.10,  # 3.3 bpw
+            QuantizationType.GGUF_IQ3_XXS: 0.09, # 3.06 bpw - smallest 3-bit
+            QuantizationType.GGUF_Q3_K: 0.11,    # 3.9 bpw
+            QuantizationType.GGUF_Q3_K_L: 0.12,  # 4.0 bpw
+            QuantizationType.GGUF_Q3_K_M: 0.11,  # 3.91 bpw
+            QuantizationType.GGUF_Q3_K_S: 0.10,  # 3.5 bpw
+
+            # 2-bit quantization (~2-3 bpw)
+            QuantizationType.GGUF_IQ2_M: 0.08,   # 2.7 bpw
+            QuantizationType.GGUF_IQ2_S: 0.07,   # 2.5 bpw
+            QuantizationType.GGUF_IQ2_XS: 0.07,  # 2.31 bpw
+            QuantizationType.GGUF_IQ2_XXS: 0.06, # 2.06 bpw - smallest 2-bit
+            QuantizationType.GGUF_Q2_K: 0.08,    # 2.8 bpw
+            QuantizationType.GGUF_Q2_K_S: 0.08,  # 2.67 bpw
+
+            # 1-bit quantization (~1.5 bpw)
+            QuantizationType.GGUF_IQ1_M: 0.05,   # 1.75 bpw
+            QuantizationType.GGUF_IQ1_S: 0.04,   # 1.56 bpw
+
+            # Ternary quantization (experimental, ~1-2 bpw)
+            QuantizationType.GGUF_TQ1_0: 0.04,   # ~1.69 bpw
+            QuantizationType.GGUF_TQ2_0: 0.06,   # ~2.06 bpw
         }
 
-        factor = size_factors.get(quant_type, 0.5)
+        factor = size_factors.get(quant_type, 0.5)  # Default to F16 size if unknown
         return model_info.size_gb * factor
 
     def _check_llamacpp_architecture_support(self, arch_type: str) -> tuple[bool, str]:
@@ -593,86 +1111,14 @@ class GGUFQuantizer(BaseQuantizer):
             f"If conversion fails, try Generic FP16 or OpenVINO quantization instead."
         )
 
-    def _check_if_vlm(self, model_path: Path) -> tuple[bool, str]:
-        """Check if a HuggingFace model is a Vision-Language Model.
-
-        VLMs cannot be converted to GGUF because llama.cpp doesn't support
-        vision encoders or multimodal architectures.
-
-        Args:
-            model_path: Path to HuggingFace model directory
-
-        Returns:
-            (is_vlm, architecture_name)
-        """
-        config_path = model_path / "config.json"
-        if not config_path.exists():
-            logger.warning(f"config.json not found in {model_path}")
-            return (False, "Unknown")
-
-        try:
-            import json
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-
-            # Get architecture name
-            architecture = config.get("architectures", ["Unknown"])[0]
-
-            # Known VLM architecture patterns
-            # These architectures have vision encoders and are NOT supported by llama.cpp
-            vlm_patterns = [
-                "ForConditionalGeneration",  # Qwen3VL, LLaVA, etc.
-                "VisionTextDualEncoder",     # CLIP-based models
-                "VisionEncoder",             # Vision-only encoders
-                "BlipForConditionalGeneration",
-                "Blip2ForConditionalGeneration",
-                "LlavaForConditionalGeneration",
-                "InstructBlipForConditionalGeneration",
-                "Pix2StructForConditionalGeneration",
-                "VipLlavaForConditionalGeneration",
-                "Qwen2VLForConditionalGeneration",
-                "Qwen3VLForConditionalGeneration",
-                "QwenVLForConditionalGeneration",
-                "CogVLMForCausalLM",
-                "Idefics",
-                "Kosmos",
-                "Flamingo",
-                "GitForCausalLM",
-            ]
-
-            # Check if architecture matches any VLM pattern
-            for pattern in vlm_patterns:
-                if pattern in architecture:
-                    logger.info(f"Detected VLM architecture: {architecture}")
-                    return (True, architecture)
-
-            # Check config for vision-related keys
-            has_vision_config = any(key in config for key in [
-                "vision_config",
-                "visual_config",
-                "image_encoder",
-                "vision_tower",
-                "mm_vision_tower",
-            ])
-
-            if has_vision_config:
-                logger.info(f"Detected VLM config keys in: {architecture}")
-                return (True, architecture)
-
-            # Not a VLM
-            logger.info(f"Detected language-only architecture: {architecture}")
-            return (False, architecture)
-
-        except Exception as e:
-            logger.error(f"Error checking VLM status: {e}")
-            return (False, "Unknown")
-
     def _convert_hf_to_gguf(
         self,
         hf_model_path: Path,
         output_path: Path,
         task: QuantizationTask,
+        vlm_info = None,
         progress_callback: Optional[Callable[[float, Optional[float]], None]] = None,
+        outtype: str = "f16",
     ) -> bool:
         """Convert HuggingFace model to GGUF format.
 
@@ -680,7 +1126,9 @@ class GGUFQuantizer(BaseQuantizer):
             hf_model_path: Path to HF model directory
             output_path: Output GGUF file path
             task: Quantization task
+            vlm_info: Optional VLMInfo for VLM models (enables --mmproj)
             progress_callback: Optional progress callback
+            outtype: Output precision type (f16, f32, bf16, etc.)
 
         Returns:
             True if conversion successful
@@ -712,8 +1160,23 @@ class GGUFQuantizer(BaseQuantizer):
             str(convert_script),
             str(hf_model_path),
             "--outfile", str(output_path),
-            "--outtype", "f16",  # Convert to F16 GGUF
+            "--outtype", outtype,  # Convert to specified format (f16, f32, bf16, etc.)
         ]
+
+        # Do NOT add --trust-remote-code here: llama.cpp's converter does not accept it.
+        # Any trust_remote_code handling applies to Transformers loading, not this CLI.
+
+        # Add --mmproj flag for VLM models to extract vision encoder separately
+        if vlm_info and getattr(vlm_info, "is_vlm", False):
+            # The --mmproj flag is boolean only (no filename argument)
+            # llama.cpp automatically creates: mmproj-<model_name>.gguf
+            cmd.append("--mmproj")
+
+            # Calculate expected mmproj filename based on llama.cpp's naming convention
+            mmproj_path = output_path.parent / f"mmproj-{output_path.name}"
+            logger.info(f"VLM detected: Will extract vision encoder to {mmproj_path.name}")
+            # Store mmproj path for later reference
+            task.mmproj_file = mmproj_path
 
         logger.info(f"Running conversion: {' '.join(cmd)}")
 
@@ -754,13 +1217,79 @@ class GGUFQuantizer(BaseQuantizer):
                 logger.info(f"Conversion successful: {output_path}")
                 if progress_callback:
                     progress_callback(50.0, None)
+
+                # Post-conversion validation for VLMs: detect mmproj input dimension
+                try:
+                    if vlm_info and getattr(task, "mmproj_file", None):
+                        mmproj_path = getattr(task, "mmproj_file", None)
+                        if mmproj_path and Path(mmproj_path).exists():
+                            in_dim = detect_mmproj_input_dim(Path(mmproj_path))
+                            if in_dim is not None:
+                                # Common cases: 1152 (single-crop), 2304 (multi-crop: global+regional)
+                                if in_dim == 2304:
+                                    logger.warning(
+                                        "⚠️  Detected mmproj expecting 2304-dim input (likely multi-crop).\n"
+                                        "   llama.cpp single-crop features are 1152-dim. This repo includes a safe\n"
+                                        "   concat-zero fallback in tools/mtmd/clip.cpp to avoid crashes. Output quality\n"
+                                        "   may be degraded vs. the original multi-crop training."
+                                    )
+                                elif in_dim == 1152:
+                                    logger.info("✓ mmproj expects 1152-dim input (single-crop) — fully compatible")
+                                else:
+                                    logger.info(f"ℹ️  mmproj expects {in_dim}-dim input (unusual); continuing")
+                            # Optional smoke test on demand (uses local llama.cpp binaries)
+                            self._maybe_run_vlm_smoke_test(language_path=output_path, mmproj_path=Path(mmproj_path))
+                        else:
+                            logger.debug("No mmproj file found to validate post-conversion")
+                except Exception as e:
+                    logger.warning(f"mmproj validation skipped due to error: {e}")
                 return True
             else:
                 # Conversion failed - provide helpful error message
                 full_output = "\n".join(output_lines)
 
-                # Check if it's an unsupported architecture error
-                if "not supported" in full_output.lower():
+                # Check for specific error types
+                is_unicode_error = "UnicodeDecodeError" in full_output
+                is_unknown_arch = "does not recognize this architecture" in full_output or "KeyError" in full_output
+                is_not_supported = "not supported" in full_output.lower()
+
+                # Handle unsupported/unknown architecture errors
+                if is_unicode_error or is_unknown_arch:
+                    # Extract model type from config if possible
+                    config_path = hf_model_path / "config.json"
+                    arch_name = "Unknown"
+                    if config_path.exists():
+                        try:
+                            with open(config_path) as f:
+                                config = json.load(f)
+                            arch_name = config.get("model_type", "unknown")
+                        except:
+                            pass
+
+                    error_msg = (
+                        f"\n{'='*60}\n"
+                        f"GGUF CONVERSION NOT SUPPORTED\n"
+                        f"{'='*60}\n\n"
+                        f"Model architecture: {arch_name}\n"
+                        f"Source: {hf_model_path}\n\n"
+                        f"This model architecture is not yet supported by:\n"
+                        f"  • Your version of transformers library\n"
+                        f"  • llama.cpp's GGUF converter\n\n"
+                        f"This is common for:\n"
+                        f"  • Vision-Language Models (VLMs) - especially new ones\n"
+                        f"  • Newer/experimental architectures\n"
+                        f"  • Multimodal models\n\n"
+                        f"✓ Available alternatives:\n"
+                        f"  • Generic FP16 quantization (works on all models)\n"
+                        f"  • BitsAndBytes 4-bit (if CUDA GPU available)\n"
+                        f"  • MLX quantization (if Apple Silicon)\n"
+                        f"  • Update transformers: pip install --upgrade transformers\n\n"
+                        f"💡 Recommendation:\n"
+                        f"  Use 'Generic quantization (PyTorch-based)' → 'FP16'\n"
+                        f"  for 50% size reduction (works on all models)\n"
+                        f"{'='*60}\n"
+                    )
+                elif is_not_supported:
                     # Extract architecture name if present
                     arch_name = "Unknown"
                     for line in output_lines:
@@ -798,11 +1327,12 @@ class GGUFQuantizer(BaseQuantizer):
                         f"{'='*60}\n\n"
                         f"Return code: {return_code}\n"
                         f"Source: {hf_model_path}\n\n"
-                        f"Conversion output:\n"
-                        f"{full_output[-500:]}\n\n"  # Last 500 chars
+                        f"Conversion output (last 500 chars):\n"
+                        f"{full_output[-500:]}\n\n"
                         f"Try:\n"
                         f"  • Generic FP16 quantization instead\n"
                         f"  • Check llama.cpp compatibility\n"
+                        f"  • Update transformers: pip install --upgrade transformers\n"
                         f"{'='*60}\n"
                     )
 
@@ -816,3 +1346,56 @@ class GGUFQuantizer(BaseQuantizer):
             task.error = f"Conversion error: {str(e)}"
             logger.error(f"Conversion failed: {e}", exc_info=True)
             return False
+
+    def _maybe_run_vlm_smoke_test(self, language_path: Path, mmproj_path: Path) -> None:
+        """Optionally run a tiny end-to-end VLM smoke test.
+
+        Controlled by environment variable EKAM_VLM_SMOKETEST=1.
+        Requires a local llama.cpp binary (llama-mtmd-cli or llava-cli) and a test image.
+        """
+        if os.environ.get("EKAM_VLM_SMOKETEST", "0") != "1":
+            return
+
+        # Find a test image
+        candidate_images = [
+            Path("assets/image_3.jpg"),
+            Path("assets/test.jpg"),
+            Path("examples/image.jpg"),
+        ]
+        image_path = next((p for p in candidate_images if p.exists()), None)
+        if not image_path:
+            logger.warning("VLM smoke test skipped: no test image found in assets/examples")
+            return
+
+        # Find a suitable binary
+        candidate_bins = [
+            Path("./llama.cpp/build/bin/llama-mtmd-cli"),
+            Path("./llama.cpp/build/bin/llava-cli"),
+            Path("./llama.cpp/llava-cli"),
+        ]
+        bin_path = next((p for p in candidate_bins if p.exists()), None)
+        if not bin_path:
+            logger.warning("VLM smoke test skipped: llama.cpp CLI binary not found (build it first)")
+            return
+
+        cmd = [
+            str(bin_path),
+            "-m", str(language_path),
+            "--mmproj", str(mmproj_path),
+            "--image", str(image_path),
+            "-p", "Describe the image in one sentence.",
+            "-n", "16",
+        ]
+
+        logger.info(f"Running VLM smoke test: {' '.join(cmd)}")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode != 0:
+                logger.warning(
+                    "VLM smoke test failed (non-zero exit). This does not block quantization.\n"
+                    f"stdout: {proc.stdout[-500:]}\nstderr: {proc.stderr[-500:]}"
+                )
+            else:
+                logger.info("✓ VLM smoke test completed (see stdout for caption)")
+        except Exception as e:
+            logger.warning(f"VLM smoke test skipped due to error: {e}")

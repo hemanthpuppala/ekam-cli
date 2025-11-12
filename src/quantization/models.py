@@ -34,12 +34,58 @@ class QuantizationType(Enum):
     INT2 = "int2"  # 2-bit integer - 12.5% size, significant quality loss (MLX)
 
     # GGUF quantizations (llama.cpp)
-    GGUF_Q4_K_M = "q4_k_m"
-    GGUF_Q4_K_S = "q4_k_s"
-    GGUF_Q5_K_M = "q5_k_m"
-    GGUF_Q5_K_S = "q5_k_s"
-    GGUF_Q6_K = "q6_k"
-    GGUF_Q8_0 = "q8_0"
+    # Full precision formats
+    GGUF_F32 = "f32"        # Float32 - full precision (26GB @ 7B)
+    GGUF_F16 = "f16"        # Float16 - half precision (14GB @ 7B)
+    GGUF_BF16 = "bf16"      # BFloat16 - brain float16 (14GB @ 7B)
+
+    # 8-bit quantization
+    GGUF_Q8_0 = "q8_0"      # 8-bit quantization (7.96GB @ 7B, +0.0026 ppl)
+
+    # 6-bit quantization
+    GGUF_Q6_K = "q6_k"      # 6-bit K-quant (6.14GB @ 7B, +0.0217 ppl)
+
+    # 5-bit quantization
+    GGUF_Q5_K = "q5_k"      # Alias for Q5_K_M
+    GGUF_Q5_K_M = "q5_k_m"  # 5-bit K-quant Medium (5.33GB @ 7B, +0.0569 ppl)
+    GGUF_Q5_K_S = "q5_k_s"  # 5-bit K-quant Small (5.21GB @ 7B, +0.1049 ppl)
+    GGUF_Q5_0 = "q5_0"      # 5-bit original (5.21GB @ 7B, +0.1316 ppl)
+    GGUF_Q5_1 = "q5_1"      # 5-bit improved (5.65GB @ 7B, +0.1062 ppl)
+
+    # 4-bit quantization
+    GGUF_IQ4_XS = "iq4_xs"  # 4.25 bpw importance quantization
+    GGUF_IQ4_NL = "iq4_nl"  # 4.50 bpw non-linear quantization
+    GGUF_Q4_K = "q4_k"      # Alias for Q4_K_M
+    GGUF_Q4_K_M = "q4_k_m"  # 4-bit K-quant Medium (4.58GB @ 7B, +0.1754 ppl)
+    GGUF_Q4_K_S = "q4_k_s"  # 4-bit K-quant Small (4.37GB @ 7B, +0.2689 ppl)
+    GGUF_Q4_0 = "q4_0"      # 4-bit original (4.34GB @ 7B, +0.4685 ppl)
+    GGUF_Q4_1 = "q4_1"      # 4-bit improved (4.78GB @ 7B, +0.4511 ppl)
+
+    # 3-bit quantization
+    GGUF_IQ3_M = "iq3_m"    # 3.66 bpw importance quantization mix
+    GGUF_IQ3_S = "iq3_s"    # 3.44 bpw importance quantization
+    GGUF_IQ3_XS = "iq3_xs"  # 3.3 bpw importance quantization
+    GGUF_IQ3_XXS = "iq3_xxs" # 3.06 bpw importance quantization
+    GGUF_Q3_K = "q3_k"      # Alias for Q3_K_M
+    GGUF_Q3_K_L = "q3_k_l"  # 3-bit K-quant Large (4.03GB @ 7B, +0.5562 ppl)
+    GGUF_Q3_K_M = "q3_k_m"  # 3-bit K-quant Medium (3.74GB @ 7B, +0.6569 ppl)
+    GGUF_Q3_K_S = "q3_k_s"  # 3-bit K-quant Small (3.41GB @ 7B, +1.6321 ppl)
+
+    # 2-bit quantization
+    GGUF_IQ2_M = "iq2_m"    # 2.7 bpw importance quantization
+    GGUF_IQ2_S = "iq2_s"    # 2.5 bpw importance quantization
+    GGUF_IQ2_XS = "iq2_xs"  # 2.31 bpw importance quantization
+    GGUF_IQ2_XXS = "iq2_xxs" # 2.06 bpw importance quantization
+    GGUF_Q2_K = "q2_k"      # 2-bit K-quant (2.96GB @ 7B, +3.5199 ppl)
+    GGUF_Q2_K_S = "q2_k_s"  # 2-bit K-quant Small (2.96GB @ 7B, +3.1836 ppl)
+
+    # 1-bit quantization
+    GGUF_IQ1_M = "iq1_m"    # 1.75 bpw importance quantization
+    GGUF_IQ1_S = "iq1_s"    # 1.56 bpw importance quantization
+
+    # Ternary quantization (experimental)
+    GGUF_TQ1_0 = "tq1_0"    # 1.69 bpw ternary quantization
+    GGUF_TQ2_0 = "tq2_0"    # 2.06 bpw ternary quantization
 
     # GPTQ quantizations (GPU-optimized)
     GPTQ_4BIT = "gptq_4bit"
@@ -71,13 +117,58 @@ class QuantizationType(Enum):
             self.INT4: "INT4 - 4-bit Integer",
             self.INT3: "INT3 - 3-bit Integer",
             self.INT2: "INT2 - 2-bit Integer",
-            # GGUF
-            self.GGUF_Q4_K_M: "Q4_K_M - 4-bit Medium",
-            self.GGUF_Q4_K_S: "Q4_K_S - 4-bit Small",
-            self.GGUF_Q5_K_M: "Q5_K_M - 5-bit Medium",
-            self.GGUF_Q5_K_S: "Q5_K_S - 5-bit Small",
-            self.GGUF_Q6_K: "Q6_K - 6-bit",
-            self.GGUF_Q8_0: "Q8_0 - 8-bit",
+            # GGUF - Full precision
+            self.GGUF_F32: "F32 - Full Precision (26GB @ 7B)",
+            self.GGUF_F16: "F16 - Half Precision (14GB @ 7B)",
+            self.GGUF_BF16: "BF16 - Brain Float16 (14GB @ 7B)",
+
+            # GGUF - 8-bit
+            self.GGUF_Q8_0: "Q8_0 - 8-bit (7.96GB @ 7B)",
+
+            # GGUF - 6-bit
+            self.GGUF_Q6_K: "Q6_K - 6-bit (6.14GB @ 7B)",
+
+            # GGUF - 5-bit
+            self.GGUF_Q5_K: "Q5_K - 5-bit Medium (alias)",
+            self.GGUF_Q5_K_M: "Q5_K_M - 5-bit Medium (5.33GB @ 7B)",
+            self.GGUF_Q5_K_S: "Q5_K_S - 5-bit Small (5.21GB @ 7B)",
+            self.GGUF_Q5_0: "Q5_0 - 5-bit Original (5.21GB @ 7B)",
+            self.GGUF_Q5_1: "Q5_1 - 5-bit Improved (5.65GB @ 7B)",
+
+            # GGUF - 4-bit
+            self.GGUF_IQ4_XS: "IQ4_XS - 4-bit Importance (4.25 bpw)",
+            self.GGUF_IQ4_NL: "IQ4_NL - 4-bit Non-Linear (4.50 bpw)",
+            self.GGUF_Q4_K: "Q4_K - 4-bit Medium (alias)",
+            self.GGUF_Q4_K_M: "Q4_K_M - 4-bit Medium (4.58GB @ 7B)",
+            self.GGUF_Q4_K_S: "Q4_K_S - 4-bit Small (4.37GB @ 7B)",
+            self.GGUF_Q4_0: "Q4_0 - 4-bit Original (4.34GB @ 7B)",
+            self.GGUF_Q4_1: "Q4_1 - 4-bit Improved (4.78GB @ 7B)",
+
+            # GGUF - 3-bit
+            self.GGUF_IQ3_M: "IQ3_M - 3-bit Importance Mix (3.66 bpw)",
+            self.GGUF_IQ3_S: "IQ3_S - 3-bit Importance (3.44 bpw)",
+            self.GGUF_IQ3_XS: "IQ3_XS - 3-bit Importance XS (3.3 bpw)",
+            self.GGUF_IQ3_XXS: "IQ3_XXS - 3-bit Importance XXS (3.06 bpw)",
+            self.GGUF_Q3_K: "Q3_K - 3-bit Medium (alias)",
+            self.GGUF_Q3_K_L: "Q3_K_L - 3-bit Large (4.03GB @ 7B)",
+            self.GGUF_Q3_K_M: "Q3_K_M - 3-bit Medium (3.74GB @ 7B)",
+            self.GGUF_Q3_K_S: "Q3_K_S - 3-bit Small (3.41GB @ 7B)",
+
+            # GGUF - 2-bit
+            self.GGUF_IQ2_M: "IQ2_M - 2-bit Importance (2.7 bpw)",
+            self.GGUF_IQ2_S: "IQ2_S - 2-bit Importance (2.5 bpw)",
+            self.GGUF_IQ2_XS: "IQ2_XS - 2-bit Importance XS (2.31 bpw)",
+            self.GGUF_IQ2_XXS: "IQ2_XXS - 2-bit Importance XXS (2.06 bpw)",
+            self.GGUF_Q2_K: "Q2_K - 2-bit (2.96GB @ 7B)",
+            self.GGUF_Q2_K_S: "Q2_K_S - 2-bit Small (2.96GB @ 7B)",
+
+            # GGUF - 1-bit
+            self.GGUF_IQ1_M: "IQ1_M - 1-bit Importance (1.75 bpw)",
+            self.GGUF_IQ1_S: "IQ1_S - 1-bit Importance (1.56 bpw)",
+
+            # GGUF - Ternary (experimental)
+            self.GGUF_TQ1_0: "TQ1_0 - Ternary 1-bit (1.69 bpw)",
+            self.GGUF_TQ2_0: "TQ2_0 - Ternary 2-bit (2.06 bpw)",
             # GPTQ
             self.GPTQ_8BIT: "GPTQ 8-bit",
             self.GPTQ_4BIT: "GPTQ 4-bit",
@@ -99,7 +190,10 @@ class QuantizationType(Enum):
     @property
     def file_extension(self) -> str:
         """File extension for this quantization type."""
-        if self.value.startswith("q"):  # GGUF
+        # GGUF formats (quantized + full precision)
+        if self.value.startswith("q") or self.value.startswith("iq") or self.value.startswith("tq"):
+            return ".gguf"
+        elif self.value in ["f32", "f16", "bf16"]:  # GGUF full precision
             return ".gguf"
         elif self.value in ["fp16", "int8", "int6", "int4", "int3", "int2"]:  # Generic PyTorch/HF
             return ".safetensors"
@@ -126,8 +220,10 @@ class QuantizationType(Enum):
         # Generic integer quantization (2/3/4/6/8-bit) - works across multiple frameworks
         if self.value in ["fp16", "int8", "int6", "int4", "int3", "int2"]:
             return "Generic"
-        # GGUF quantization (llama.cpp format)
-        elif self.value.startswith("q"):
+        # GGUF quantization (llama.cpp format) - includes quantized and full precision
+        elif self.value.startswith("q") or self.value.startswith("iq") or self.value.startswith("tq"):
+            return "GGUF"
+        elif self.value in ["f32", "f16", "bf16"]:  # GGUF full precision
             return "GGUF"
         # GPTQ quantization (GPU-optimized)
         elif "gptq" in self.value:
@@ -226,7 +322,12 @@ class QuantizationTask:
     background: bool = False
     intermediate_file: Optional[Path] = None  # For GGUF: FP16 intermediate file
     vlm_components: Optional[str] = None  # For VLMs: "vision", "language", "both", or None
+    vision_encoder_type: Optional[QuantizationType] = None  # For VLM component-level: vision encoder quant type
+    language_decoder_type: Optional[QuantizationType] = None  # For VLM component-level: language decoder quant type
     quantizer_directive: Optional[str] = None  # From orchestrator: "skip", "quantize", "quantize_int8", etc.
+    # UX: record if a component fell back to a safer precision
+    attempted_vision_quant_type: Optional[QuantizationType] = None
+    warning_message: Optional[str] = None
 
     @property
     def elapsed_seconds(self) -> Optional[float]:
@@ -272,7 +373,11 @@ class QuantizationTask:
             "background": self.background,
             "intermediate_file": str(self.intermediate_file) if self.intermediate_file else None,
             "vlm_components": self.vlm_components,
+            "vision_encoder_type": self.vision_encoder_type.value if self.vision_encoder_type else None,
+            "language_decoder_type": self.language_decoder_type.value if self.language_decoder_type else None,
             "quantizer_directive": self.quantizer_directive,
+            "attempted_vision_quant_type": self.attempted_vision_quant_type.value if self.attempted_vision_quant_type else None,
+            "warning_message": self.warning_message,
         }
 
     @classmethod
@@ -366,7 +471,11 @@ class QuantizationTask:
             background=data.get("background", False),
             intermediate_file=Path(data["intermediate_file"]) if data.get("intermediate_file") else None,
             vlm_components=data.get("vlm_components"),
+            vision_encoder_type=QuantizationType(data["vision_encoder_type"]) if data.get("vision_encoder_type") else None,
+            language_decoder_type=QuantizationType(data["language_decoder_type"]) if data.get("language_decoder_type") else None,
             quantizer_directive=data.get("quantizer_directive"),
+            attempted_vision_quant_type=QuantizationType(data["attempted_vision_quant_type"]) if data.get("attempted_vision_quant_type") else None,
+            warning_message=data.get("warning_message"),
         )
 
         # Restore timestamps

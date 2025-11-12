@@ -40,6 +40,7 @@ class ProfessionalPrompt:
             "quit": "Exit the application",
             "back": "Go back",
             "help": "Show available commands",
+            "/clear": "Clear chat history (endpoints with history)",
             "/info": "Show model information",
             "/config": "Show configuration",
             "/status": "Show status",
@@ -369,7 +370,7 @@ class ProfessionalPrompt:
         self,
         options: List[Tuple[str, str, str]],
         title: str = "Select an option",
-        instructions: str = "Use ↑/↓ arrows to navigate, Enter to select, q to quit",
+        instructions: str = "Use ↑/↓ arrows, PgUp/PgDn to scroll, Enter to select, q to cancel",
     ) -> Optional[str]:
         """Get user selection using arrow keys for navigation.
 
@@ -393,14 +394,40 @@ class ProfessionalPrompt:
             selection = prompt.get_arrow_selection(options, "Main Menu")
         """
         selected_index = [0]  # Use list to allow modification in nested function
+        window_start = [0]
         result = [None]  # Store the result
+
+        def compute_max_display() -> int:
+            try:
+                from .tui_manager import tui
+                width, height = tui.get_terminal_size()
+                # Reserve ~8 lines for headers/footers; each item uses ~3 lines (label, desc, spacer)
+                usable = max(6, height - 8)
+                return max(1, min(len(options), usable // 3))
+            except Exception:
+                return min(len(options), 10)
+
+        def clamp_window():
+            max_display = compute_max_display()
+            if selected_index[0] < window_start[0]:
+                window_start[0] = selected_index[0]
+            elif selected_index[0] >= window_start[0] + max_display:
+                window_start[0] = selected_index[0] - max_display + 1
+            # Keep within bounds
+            window_start[0] = max(0, min(window_start[0], max(0, len(options) - max_display)))
 
         def get_formatted_menu():
             """Generate formatted menu text with current selection highlighted."""
             lines = []
             lines.append(f"[bold cyan]{title}[/bold cyan]\n")
 
-            for idx, (value, label, description) in enumerate(options):
+            max_display = compute_max_display()
+            clamp_window()
+            start = window_start[0]
+            end = min(start + max_display, len(options))
+
+            for visible_idx, (value, label, description) in enumerate(options[start:end]):
+                idx = start + visible_idx
                 if idx == selected_index[0]:
                     # Highlighted selection with pointer
                     lines.append(f"[black on cyan]  ▶ {label}[/black on cyan]")
@@ -410,10 +437,12 @@ class ProfessionalPrompt:
                     lines.append(f"    {label}")
                     lines.append(f"[dim]    {description}[/dim]")
 
-                if idx < len(options) - 1:
+                if idx < end - 1:
                     lines.append("")  # Add spacing between options
-
-            lines.append(f"\n[dim]{instructions}[/dim]")
+            # Footer with range info
+            lines.append("")
+            lines.append(f"[dim]Showing {start + 1}-{end} of {len(options)}[/dim]")
+            lines.append(f"[dim]{instructions}[/dim]")
             return "\n".join(lines)
 
         # Create key bindings
@@ -423,6 +452,7 @@ class ProfessionalPrompt:
         def move_up(event):
             """Move selection up."""
             selected_index[0] = (selected_index[0] - 1) % len(options)
+            clamp_window()
             # Refresh display
             event.app.invalidate()
 
@@ -430,7 +460,23 @@ class ProfessionalPrompt:
         def move_down(event):
             """Move selection down."""
             selected_index[0] = (selected_index[0] + 1) % len(options)
+            clamp_window()
             # Refresh display
+            event.app.invalidate()
+
+        # Page down/up for faster scrolling
+        @kb.add(Keys.PageDown)
+        def page_down(event):
+            step = compute_max_display()
+            selected_index[0] = min(len(options) - 1, selected_index[0] + step)
+            clamp_window()
+            event.app.invalidate()
+
+        @kb.add(Keys.PageUp)
+        def page_up(event):
+            step = compute_max_display()
+            selected_index[0] = max(0, selected_index[0] - step)
+            clamp_window()
             event.app.invalidate()
 
         @kb.add(Keys.Enter)
@@ -524,6 +570,153 @@ class ProfessionalPrompt:
         except KeyboardInterrupt:
             return None
 
+        return result[0]
+
+    def get_card_grid_selection(
+        self,
+        cards: List[Tuple[str, str, List[str]]],
+        title: str = "Select",
+        instructions: str = "Use ←/→/↑/↓ to move, Enter to select, q to cancel",
+        card_width: int = 22,
+        h_spacing: int = 3,
+    ) -> Optional[str]:
+        """Interactive selection over a grid of "cards" navigated by arrow keys.
+
+        Args:
+            cards: List of (value, title, body_lines) where body_lines are short strings
+            title: Title displayed at the top
+            instructions: Help text
+            card_width: Fixed width for each card (characters)
+            h_spacing: Spaces between cards
+
+        Returns:
+            Selected value or None if cancelled
+        """
+        selected = [0]
+        result = [None]
+
+        def compute_columns() -> int:
+            try:
+                from .tui_manager import tui
+                width, _ = tui.get_terminal_size()
+                total = card_width + h_spacing
+                return max(1, width // total)
+            except Exception:
+                return 3
+
+        def build_card_lines(title_text: str, body: List[str], highlighted: bool) -> List[str]:
+            # Build a simple box with title and body within card_width
+            w = max(12, card_width)
+            tl = f"╭─ {title_text} ─{'─' * max(0, w - len('╭─ ' + title_text + ' ─'))}╮"
+            lines = [tl[:w] if len(tl) > w else tl]
+            for b in body:
+                content = f"│ {b.ljust(w-4)[:w-4]} │"
+                if highlighted:
+                    content = f"[black on cyan]{content}[/black on cyan]"
+                lines.append(content)
+            # Ensure minimum body lines of 2
+            while len(lines) < 3:
+                empty = f"│ {' ' * (w-4)} │"
+                if highlighted:
+                    empty = f"[black on cyan]{empty}[/black on cyan]"
+                lines.append(empty)
+            br = f"╰{'─' * (w-2)}╯"
+            lines.append(br[:w])
+            return lines
+
+        def render_grid() -> str:
+            cols = compute_columns()
+            rows = (len(cards) + cols - 1) // cols
+            # Build all card line blocks
+            blocks = []
+            for i, (val, ttl, body) in enumerate(cards):
+                hl = (i == selected[0])
+                blocks.append(build_card_lines(ttl, body, hl))
+            # Assemble lines row by row
+            lines_out: List[str] = []
+            lines_out.append(f"[bold cyan]{title}[/bold cyan]\n")
+            for r in range(rows):
+                row_cards = blocks[r*cols:(r+1)*cols]
+                max_h = max(len(b) for b in row_cards)
+                for h in range(max_h):
+                    parts = []
+                    for b in row_cards:
+                        part = b[h] if h < len(b) else ' ' * card_width
+                        parts.append(part)
+                    lines_out.append((" " * h_spacing).join(parts))
+                lines_out.append("")
+            lines_out.append(f"[dim]{instructions}[/dim]")
+            return "\n".join(lines_out)
+
+        # Key bindings
+        kb = KeyBindings()
+
+        @kb.add(Keys.Left)
+        def _left(event):
+            if selected[0] > 0:
+                selected[0] -= 1
+                event.app.invalidate()
+
+        @kb.add(Keys.Right)
+        def _right(event):
+            if selected[0] < len(cards) - 1:
+                selected[0] += 1
+                event.app.invalidate()
+
+        @kb.add(Keys.Up)
+        def _up(event):
+            cols = compute_columns()
+            if selected[0] - cols >= 0:
+                selected[0] -= cols
+                event.app.invalidate()
+
+        @kb.add(Keys.Down)
+        def _down(event):
+            cols = compute_columns()
+            if selected[0] + cols < len(cards):
+                selected[0] += cols
+                event.app.invalidate()
+
+        @kb.add(Keys.Enter)
+        def _enter(event):
+            result[0] = cards[selected[0]][0]
+            event.app.exit()
+
+        @kb.add(Keys.Any)
+        def _any(event):
+            # Support quick keys: q to cancel
+            key = event.key_sequence[0].key
+            if key == 'q':
+                result[0] = None
+                event.app.exit()
+
+        # Layout
+        def get_formatted_text():
+            import html, re
+            grid_text = render_grid()
+            rich_tag_pattern = r'\[/?[^\]]+\]'
+            rich_tags = re.findall(rich_tag_pattern, grid_text)
+            for i, tag in enumerate(rich_tags):
+                grid_text = grid_text.replace(tag, f"__RICHTAG{i}__", 1)
+            grid_text = html.escape(grid_text)
+            for i, tag in enumerate(rich_tags):
+                grid_text = grid_text.replace(f"__RICHTAG{i}__", tag)
+            grid_text = grid_text.replace("[bold cyan]", "<b><style fg='cyan'>")
+            grid_text = grid_text.replace("[/bold cyan]", "</style></b>")
+            grid_text = grid_text.replace("[black on cyan]", "<style bg='cyan' fg='black'>")
+            grid_text = grid_text.replace("[/black on cyan]", "</style>")
+            grid_text = grid_text.replace("[dim]", "<style fg='#666666'>")
+            grid_text = grid_text.replace("[/dim]", "</style>")
+            return HTML(grid_text)
+
+        control = FormattedTextControl(text=get_formatted_text, focusable=True, show_cursor=False)
+        window = Window(content=control, wrap_lines=True)
+        layout = Layout(window)
+        app = Application(layout=layout, key_bindings=kb, full_screen=False, mouse_support=False)
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            return None
         return result[0]
 
     def get_incremental_search_selection(

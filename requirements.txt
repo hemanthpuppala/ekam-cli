@@ -37,6 +37,7 @@ pyyaml
 psutil
 loguru
 python-dotenv
+flask  # Required for custom CLI llama-server with isolated mtmd_context
 
 # ============================================
 # Transformers - Latest model architecture support
@@ -49,6 +50,7 @@ transformers
 # ============================================
 llama-cpp-python
 gguf
+mistral-common  # Required by llama.cpp convert_hf_to_gguf.py for VLM models
 
 # ============================================
 # HuggingFace - Latest model management

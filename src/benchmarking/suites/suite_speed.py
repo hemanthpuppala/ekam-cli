@@ -7,8 +7,9 @@ Measures model inference speed and throughput:
 - Time to first token (TTFT)
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from datetime import datetime
+from pathlib import Path
 import time
 
 from src.benchmarking.suites.base_suite import BaseSuite
@@ -19,6 +20,9 @@ from src.benchmarking.models.suite_configs import SpeedConfig, speed_config_from
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
 from src.benchmarking.utils import MemoryOptimizer, memory_tracked_operation, RetryWithCleanup
+from src.benchmarking.utils.llama_delay import apply_llama_server_delay
+from src.benchmarking.core.progress_display import ProgressPhase
+from src.benchmarking.core.model_context import ModelContextManager, ModelState
 from loguru import logger
 
 
@@ -38,16 +42,18 @@ class SpeedSuite(BaseSuite):
         """Return suite type."""
         return SuiteType.SPEED
 
-    def __init__(self, endpoint_executor: EndpointExecutor = None, enable_progress: bool = True):
+    def __init__(self, endpoint_executor: EndpointExecutor = None, enable_progress: bool = True, model_context_manager: Optional[ModelContextManager] = None):
         """
         Initialize Speed suite.
 
         Args:
             endpoint_executor: Optional EndpointExecutor instance
             enable_progress: Whether to enable progress display (default: True)
+            model_context_manager: Optional ModelContextManager instance for model lifecycle management
         """
         super().__init__(enable_progress=enable_progress)
         self.executor = endpoint_executor or EndpointExecutor()
+        self.model_context_manager = model_context_manager
 
     def run(self, config: BenchmarkConfig) -> SuiteResult:
         """
@@ -78,6 +84,10 @@ class SpeedSuite(BaseSuite):
 
             logger.info(f"Using {len(test_prompts)} test prompts")
 
+            # Progress display start
+            total_runs_per_model = suite_config.num_warmup + len(test_prompts)
+            self._progress_start(total_runs=total_runs_per_model, num_models=len(config.models))
+
             # Run benchmarks for each model
             total_runs_attempted = 0
             total_runs_successful = 0
@@ -86,9 +96,28 @@ class SpeedSuite(BaseSuite):
                 logger.info(f"Benchmarking model: {model_id}")
                 self._emit_progress(f"Benchmarking model: {model_id}")
 
-                try:
+                if not self.model_context_manager:
+                    logger.error("ModelContextManager not initialized. Cannot run benchmark.")
+                    self._record_error(model_id, "N/A", 0, "ModelContextManager not initialized")
+                    continue
+
+                with self.model_context_manager.load_model(model_id) as model_context:
+                    if model_context.state != ModelState.LOADED:
+                        logger.error(f"Failed to load model {model_id}: {model_context.failed_reason}")
+                        self._record_error(model_id, "N/A", 0, f"Failed to load model: {model_context.failed_reason}")
+                        continue
+
+                    # The rest of the loop for endpoints and runs will go here
                     for endpoint in config.endpoints.get(model_id, []):
                         logger.info(f"  Endpoint: {endpoint}")
+                        # Update model with endpoint context for UI
+                        if self.progress_display:
+                            try:
+                                self.progress_display.update_model(model_id, config.models.index(model_id) + 1, endpoint)
+                            except Exception:
+                                self._progress_update_model(model_id, config.models.index(model_id) + 1)
+                        else:
+                            self._progress_update_model(model_id, config.models.index(model_id) + 1)
 
                         # Warmup runs - critical for discovering working inference methods
                         # Always use the first prompt for warmup
@@ -100,7 +129,8 @@ class SpeedSuite(BaseSuite):
 
                             warmup_prompt = test_prompts[0]  # Always use first prompt for warmup
                             for warmup_num in range(1, suite_config.num_warmup + 1):
-                                success, latency_ms = self._execute_speed_run(
+                                self._progress_update_run(warmup_num, is_warmup=True)
+                                success, latency_ms, timings = self._execute_speed_run(
                                     model_id=model_id,
                                     endpoint=endpoint,
                                     prompt=warmup_prompt,
@@ -114,6 +144,21 @@ class SpeedSuite(BaseSuite):
                                     self._emit_progress(f"Warmup run {warmup_num}/{suite_config.num_warmup} completed in {latency_ms:.2f}ms")
                                     # At least one warmup succeeded - we found a working method
                                     logger.info(f"✓ Warmup {warmup_num} succeeded - inference method confirmed")
+                                metrics_update = {"latency_ms": latency_ms}
+                                if "ttft_ms" in timings:
+                                    metrics_update["ttft_ms"] = timings["ttft_ms"]
+                                if "tokens_per_sec" in timings:
+                                    metrics_update["tokens_per_sec"] = timings["tokens_per_sec"]
+                                if "itl_ms" in timings:
+                                    metrics_update["itl_ms"] = timings["itl_ms"]
+                                if "decode_latency_ms" in timings:
+                                    metrics_update["decode_latency_ms"] = timings["decode_latency_ms"]
+                                self._progress_update_metrics(metrics_update)
+                                if self.progress_display:
+                                    try:
+                                        self.progress_display.report_success()
+                                    except Exception:
+                                        pass
                                     break
                                 else:
                                     warmup_failures += 1
@@ -142,8 +187,9 @@ class SpeedSuite(BaseSuite):
                         logger.info(f"  Running {num_prompts} benchmark runs (1 prompt = 1 run)...")
                         for prompt_idx, prompt in enumerate(test_prompts, 1):
                             total_runs_attempted += 1
-
-                            success, latency_ms = self._execute_speed_run(
+                            # Update run number accounting for warmup offset
+                            self._progress_update_run(suite_config.num_warmup + prompt_idx, is_warmup=False)
+                            success, latency_ms, timings = self._execute_speed_run(
                                 model_id=model_id,
                                 endpoint=endpoint,
                                 prompt=prompt,
@@ -157,19 +203,21 @@ class SpeedSuite(BaseSuite):
                                 total_runs_successful += 1
                                 # Emit progress with latency for each completed run
                                 self._emit_progress(f"Run {prompt_idx}/{num_prompts} completed in {latency_ms:.2f}ms")
-
-                finally:
-                    # Unload model after all runs complete to free memory
-                    if hasattr(self.executor, 'llm_handler') and \
-                       hasattr(self.executor.llm_handler, 'provider_bridge') and \
-                       self.executor.llm_handler.provider_bridge:
-                        logger.info(f"  Unloading model: {model_id}")
-                        self.executor.llm_handler.provider_bridge.unload_model(model_id)
-                    elif hasattr(self.executor, 'vlm_handler') and \
-                         hasattr(self.executor.vlm_handler, 'provider_bridge') and \
-                         self.executor.vlm_handler.provider_bridge:
-                        logger.info(f"  Unloading model: {model_id}")
-                        self.executor.vlm_handler.provider_bridge.unload_model(model_id)
+                                metrics_update = {"latency_ms": latency_ms}
+                                if "ttft_ms" in timings:
+                                    metrics_update["ttft_ms"] = timings["ttft_ms"]
+                                if "tokens_per_sec" in timings:
+                                    metrics_update["tokens_per_sec"] = timings["tokens_per_sec"]
+                                if "itl_ms" in timings:
+                                    metrics_update["itl_ms"] = timings["itl_ms"]
+                                if "decode_latency_ms" in timings:
+                                    metrics_update["decode_latency_ms"] = timings["decode_latency_ms"]
+                                self._progress_update_metrics(metrics_update)
+                                if self.progress_display:
+                                    try:
+                                        self.progress_display.report_success()
+                                    except Exception:
+                                        pass
 
             # Determine status
             if total_runs_successful == total_runs_attempted:
@@ -208,7 +256,7 @@ class SpeedSuite(BaseSuite):
         is_warmup: bool,
         config: BenchmarkConfig,
         suite_config: SpeedConfig
-    ) -> tuple[bool, float]:
+    ) -> tuple[bool, float, dict]:
         """
         Execute a single speed benchmark run with memory optimization.
 
@@ -227,7 +275,7 @@ class SpeedSuite(BaseSuite):
             config: Benchmark configuration
 
         Returns:
-            Tuple of (success: bool, latency_ms: float)
+            Tuple of (success: bool, latency_ms: float, timings: dict)
         """
         try:
             # O(1) memory pressure check
@@ -247,7 +295,7 @@ class SpeedSuite(BaseSuite):
                 )
                 # Aggressive cleanup and return failure
                 MemoryOptimizer.aggressive_cleanup()
-                return (False, 0.0)
+                return (False, 0.0, {})
 
             # Smart cleanup: only if memory is getting tight
             if pressure in ["high", "critical"]:
@@ -258,16 +306,48 @@ class SpeedSuite(BaseSuite):
             if config.model_type == ModelType.LLM:
                 input_data = prompt
                 input_image_path = "-"  # LLMs don't use images
+                used_prompt = prompt
             else:  # VLM
-                # For VLM, need image path
-                images = config.test_data.get("images", [])
-                if not images:
-                    logger.warning("No images provided for VLM benchmark")
-                    return (False, 0.0)
+                # For VLM, prefer explicit image-prompt pairs mapping if provided
+                pairs = config.test_data.get("pairs")
+                effective_prompt = prompt
+                input_image_path = None
 
-                input_image_path = images[run_number % len(images)]
+                def _normalize_pairs(p):
+                    if p is None:
+                        return []
+                    if isinstance(p, dict):
+                        return list(p.items())
+                    out = []
+                    for item in p:
+                        if isinstance(item, (list, tuple)) and len(item) == 2:
+                            out.append((item[0], item[1]))
+                        elif isinstance(item, dict):
+                            img = item.get("image") or item.get("image_path") or item.get("img")
+                            pr = item.get("prompt")
+                            if img is not None and pr is not None:
+                                out.append((img, pr))
+                    return out
+
+                norm_pairs = _normalize_pairs(pairs)
+                if norm_pairs:
+                    # For warmup runs, always use the first pair (index 0)
+                    # For counted runs, use the appropriate pair based on run_number
+                    if is_warmup:
+                        idx = 0
+                    else:
+                        idx = max(0, (run_number - 1) % len(norm_pairs))
+                    input_image_path, effective_prompt = norm_pairs[idx]
+                else:
+                    images = config.test_data.get("images", [])
+                    if not images:
+                        logger.warning("No images provided for VLM benchmark")
+                        return (False, 0.0, {})
+                    input_image_path = images[run_number % len(images)]
+
+                used_prompt = effective_prompt
                 input_data = {
-                    "prompt": prompt,
+                    "prompt": effective_prompt,
                     "image_path": input_image_path
                 }
 
@@ -309,6 +389,9 @@ class SpeedSuite(BaseSuite):
                     exec_params['_stream_callback'] = token_callback
                     exec_params['_enable_timing'] = True
 
+                    # Log request before inference
+                    logger.info(f"Run {run_number} | Request: prompt='{used_prompt[:50]}...' image={Path(input_image_path).name}")
+
                     result = self.executor.execute(
                         model_type=config.model_type,
                         model_id=model_id,
@@ -344,6 +427,11 @@ class SpeedSuite(BaseSuite):
                         if timing_data['first_token_time']:
                             decode_latency_ms = (timing_data['token_times'][-1] - timing_data['first_token_time']) * 1000
 
+                    # Log response after inference
+                    raw_after = result.get("output", "") if isinstance(result, dict) else ""
+                    response_preview = raw_after[:100].replace('\n', ' ') if raw_after else "Empty"
+                    logger.info(f"Run {run_number} | Response: {response_preview}..." if len(raw_after) > 100 else f"Run {run_number} | Response: {response_preview}")
+
                     return result, total_latency_ms, ttft_ms, itl_ms, decode_latency_ms
 
             # Execute with retry
@@ -352,11 +440,22 @@ class SpeedSuite(BaseSuite):
             # Extract raw response (untruncated)
             raw_response = result.get("output", "")
 
+            # Extract reasoning from response and format
+            from src.utils.response_formatter import extract_thinking_blocks
+            thinking_blocks, clean_response = extract_thinking_blocks(raw_response)
+
+            # Format response with reasoning if present
+            if thinking_blocks:
+                reasoning_str = "\n\n".join(thinking_blocks)
+                formatted_response = f"Reasoning: {reasoning_str}\n\nResponse: {clean_response}"
+            else:
+                formatted_response = raw_response
+
             # Create metadata dict with full input/output details for CSV
             run_metadata = {
-                "input_prompt": prompt,
+                "input_prompt": used_prompt,
                 "input_image_path": input_image_path,
-                "raw_response": raw_response
+                "raw_response": formatted_response  # Store formatted version with reasoning
             }
 
             # Record total latency metric with full I/O metadata
@@ -455,12 +554,32 @@ class SpeedSuite(BaseSuite):
                 metadata=run_metadata
             )
 
-            return (True, latency_ms)
+            # Build timings dict for UI updates (O(1))
+            timings = {}
+            if ttft_ms is not None:
+                timings["ttft_ms"] = ttft_ms
+            if itl_ms is not None:
+                timings["itl_ms"] = itl_ms
+            if decode_latency_ms is not None:
+                timings["decode_latency_ms"] = decode_latency_ms
+            if "token_count" in result.get("metadata", {}):
+                # tokens_per_sec computed above if duration_seconds>0; recompute safely here
+                token_count = result["metadata"]["token_count"]
+                duration_seconds = latency_ms / 1000.0
+                if duration_seconds > 0:
+                    timings["tokens_per_sec"] = token_count / duration_seconds
+
+            # Apply post-inference delay for llama-server to allow state cleanup
+            # This delay is OUTSIDE latency measurement and does not affect benchmark timing
+            provider_type = model_id.split(":")[0] if ":" in model_id else model_id
+            apply_llama_server_delay(provider_type)
+
+            return (True, latency_ms, timings)
 
         except Exception as e:
             logger.error(f"Speed run {run_number} failed: {str(e)}")
             self._record_error(model_id, endpoint, run_number, str(e))
-            return (False, 0.0)
+            return (False, 0.0, {})
 
     def _get_test_data(self, config: BenchmarkConfig) -> List[str]:
         """

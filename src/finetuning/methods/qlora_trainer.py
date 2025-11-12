@@ -198,7 +198,7 @@ class QLoRATrainer(BaseTrainer):
         }
         return dtype_map.get(dtype_str, torch.float16)
 
-    def _get_device_map(self) -> str | dict:
+    def _get_device_map(self) -> "str | dict":
         """Determine device mapping for model loading.
 
         Returns:

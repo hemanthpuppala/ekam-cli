@@ -11,6 +11,7 @@ Measures resource consumption during model inference:
 
 from typing import Dict, Any, List
 from datetime import datetime
+from pathlib import Path
 import time
 
 from src.benchmarking.suites.base_suite import BaseSuite
@@ -20,6 +21,7 @@ from src.benchmarking.models.metric_types import SuiteType, ResultStatus, Metric
 from src.benchmarking.models.suite_configs import ResourcesConfig, resources_config_from_params
 from src.benchmarking.core.progress_display import ProgressPhase
 from src.benchmarking.handlers.endpoint_executor import EndpointExecutor
+from src.benchmarking.utils.llama_delay import apply_llama_server_delay
 from src.benchmarking.datasets.defaults import get_prompts_for_suite
 from src.benchmarking.utils import MemoryOptimizer
 from loguru import logger
@@ -114,12 +116,19 @@ class ResourcesSuite(BaseSuite):
             for model_index, model_id in enumerate(config.models):
                 logger.info(f"Benchmarking model: {model_id}")
                 self._emit_progress(f"Benchmarking model: {model_id}")
-                self._progress_update_model(model_id, model_index)
+                # Use 1-based index for display
+                self._progress_update_model(model_id, model_index + 1)
                 self._progress_update_phase(ProgressPhase.LOADING_MODEL)
 
                 try:
                     for endpoint in config.endpoints.get(model_id, []):
                         logger.info(f"  Endpoint: {endpoint}")
+                        # Update current endpoint for dashboard display
+                        if self.progress_display:
+                            try:
+                                self.progress_display.state.current_endpoint = endpoint
+                            except Exception:
+                                pass
 
                         # Warmup runs - always use first prompt
                         if suite_config.num_warmup > 0:
@@ -271,22 +280,53 @@ class ResourcesSuite(BaseSuite):
             if config.model_type == ModelType.LLM:
                 input_data = prompt
                 input_image_path = "-"  # LLMs don't use images
+                used_prompt = prompt
             else:  # VLM
-                images = config.test_data.get("images", [])
-                if not images:
-                    logger.warning("No images provided for VLM benchmark")
-                    return False
+                # Prefer explicit pairs mapping if provided
+                pairs = config.test_data.get("pairs")
+                effective_prompt = prompt
+                input_image_path = None
 
-                # 1 prompt = 1 run paradigm: use corresponding image (no cycling)
-                image_idx = run_number - 1
-                if image_idx < len(images):
-                    input_image_path = images[image_idx]
+                def _normalize_pairs(p):
+                    if p is None:
+                        return []
+                    if isinstance(p, dict):
+                        return list(p.items())
+                    out = []
+                    for item in p:
+                        if isinstance(item, (list, tuple)) and len(item) == 2:
+                            out.append((item[0], item[1]))
+                        elif isinstance(item, dict):
+                            img = item.get("image") or item.get("image_path") or item.get("img")
+                            pr = item.get("prompt")
+                            if img is not None and pr is not None:
+                                out.append((img, pr))
+                    return out
+
+                norm_pairs = _normalize_pairs(pairs)
+                if norm_pairs:
+                    # For warmup runs, always use the first pair (index 0)
+                    # For counted runs, use the appropriate pair based on run_number
+                    if is_warmup:
+                        idx = 0
+                    else:
+                        idx = max(0, (run_number - 1) % len(norm_pairs))
+                    input_image_path, effective_prompt = norm_pairs[idx]
                 else:
-                    # Fallback if more runs than images
-                    input_image_path = images[image_idx % len(images)]
+                    images = config.test_data.get("images", [])
+                    if not images:
+                        logger.warning("No images provided for VLM benchmark")
+                        return False
+                    # 1 prompt = 1 run paradigm: use corresponding image (no cycling)
+                    image_idx = run_number - 1
+                    if image_idx < len(images):
+                        input_image_path = images[image_idx]
+                    else:
+                        input_image_path = images[image_idx % len(images)]
 
+                used_prompt = effective_prompt
                 input_data = {
-                    "prompt": prompt,
+                    "prompt": effective_prompt,
                     "image_path": input_image_path
                 }
 
@@ -294,6 +334,9 @@ class ResourcesSuite(BaseSuite):
             # The system monitor wrapper automatically records resource metrics
             import time
             start_time = time.perf_counter()
+
+            # Log request before inference
+            logger.info(f"Run {run_number} | Request: prompt='{used_prompt[:50]}...' image={Path(input_image_path).name}")
 
             with self.system_monitor.track_inference(
                 model_id=model_id,
@@ -320,11 +363,26 @@ class ResourcesSuite(BaseSuite):
             # Extract raw response (untruncated)
             raw_response = result.get("output", "")
 
+            # Extract reasoning from response and format
+            from src.utils.response_formatter import extract_thinking_blocks
+            thinking_blocks, clean_response = extract_thinking_blocks(raw_response)
+
+            # Format response with reasoning if present
+            if thinking_blocks:
+                reasoning_str = "\n\n".join(thinking_blocks)
+                formatted_response = f"Reasoning: {reasoning_str}\n\nResponse: {clean_response}"
+            else:
+                formatted_response = raw_response
+
+            # Log response after inference
+            response_preview = clean_response[:100].replace('\n', ' ') if clean_response else "Empty"
+            logger.info(f"Run {run_number} | Response: {response_preview}..." if len(clean_response) > 100 else f"Run {run_number} | Response: {response_preview}")
+
             # Create metadata dict with full input/output details for CSV
             run_metadata = {
-                "input_prompt": prompt,
+                "input_prompt": used_prompt,
                 "input_image_path": input_image_path,
-                "raw_response": raw_response
+                "raw_response": formatted_response  # Store formatted version with reasoning
             }
 
             # Record latency metric per run
@@ -393,6 +451,11 @@ class ResourcesSuite(BaseSuite):
                                 is_warmup=is_warmup,
                                 metadata=run_metadata
                             )
+
+            # Apply post-inference delay for llama-server to allow state cleanup
+            # This delay is OUTSIDE latency measurement and does not affect benchmark timing
+            provider_type = model_id.split(":")[0] if ":" in model_id else model_id
+            apply_llama_server_delay(provider_type)
 
             return True
 

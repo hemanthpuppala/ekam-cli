@@ -218,3 +218,95 @@ For future cross-platform features:
 This was a **platform-specific path separator issue** that prevented OLLAMA model discovery on Windows. The fix is minimal (single character class addition to regex) but critical for Windows users.
 
 The solution is **backwards compatible** - it doesn't break existing Unix/Linux/macOS functionality while adding Windows support.
+
+
+
+
+
+ llama-server API Interface
+
+  1. OpenAI-Compatible HTTP API
+
+  llama-server exposes an OpenAI-compatible REST API on http://127.0.0.1:<port>
+
+  2. Typical Request Format for VLM
+
+  Endpoint: POST /v1/chat/completions
+
+  Request body (JSON):
+  {
+    "model": "model-name",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "What's in this image?"
+          },
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+            }
+          }
+        ]
+      }
+    ],
+    "temperature": 0.7,
+    "max_tokens": 512,
+    "stream": false
+  }
+
+  3. Image Formats Supported
+
+  - Base64 encoded: data:image/jpeg;base64,<base64_string>
+  - File path: file:///path/to/image.jpg (local files)
+  - URL: https://example.com/image.jpg (if supported)
+
+  4. Other Parameters
+
+  {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 40,
+    "max_tokens": 512,
+    "stop": ["</s>", "User:"],
+    "stream": false,  // or true for streaming responses
+    "n_predict": 512,
+    "repeat_penalty": 1.1
+  }
+
+  5. Response Format
+
+  {
+    "id": "chatcmpl-xxx",
+    "object": "chat.completion",
+    "created": 1234567890,
+    "model": "model-name",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "The image shows..."
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 50,
+      "completion_tokens": 30,
+      "total_tokens": 80
+    }
+  }
+
+  6. Template Handling
+
+  llama-server automatically applies the chat template from the GGUF model metadata:
+  - Qwen models use their specific template
+  - LLaVA uses its template
+  - No need to manually format prompts
+
+  ---
+  Is this the structure you're using? Or do you have a different implementation? If you want, I can check your actual code to see the exact implementation details.

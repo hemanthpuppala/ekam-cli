@@ -176,6 +176,71 @@ def load_image_efficiently(path: str, max_dim: int) -> Image.Image:
     return img.convert("RGB")  # Only decode needed channels
 
 
+def rescale_image_with_padding(
+    image: Image.Image,
+    target_width: int,
+    target_height: int,
+    pad_color: Tuple[int, int, int] = (0, 0, 0)
+) -> Image.Image:
+    """Rescale image to target dimensions while preserving aspect ratio with padding.
+
+    This function is used for VLM inference to normalize input images to a consistent
+    resolution (e.g., 1280x1024) while maintaining the original aspect ratio by adding
+    black padding bars (letterbox/pillarbox style).
+
+    Args:
+        image: PIL Image to rescale
+        target_width: Target width in pixels
+        target_height: Target height in pixels
+        pad_color: RGB tuple for padding (default: black (0,0,0))
+
+    Returns:
+        Rescaled PIL Image with padding in RGB format
+
+    Example:
+        >>> img = Image.open("photo.jpg")  # 1920x1080 (16:9)
+        >>> rescaled = rescale_image_with_padding(img, 1280, 1024)  # 1280x1024 (5:4)
+        >>> # Result: 1280x720 image centered with black bars top/bottom
+    """
+    original_width, original_height = image.size
+    original_aspect = original_width / original_height
+    target_aspect = target_width / target_height
+
+    # Calculate dimensions to maintain aspect ratio
+    if original_aspect > target_aspect:
+        # Image is wider - fit to width, pad top/bottom
+        new_width = target_width
+        new_height = int(target_width / original_aspect)
+    else:
+        # Image is taller - fit to height, pad left/right
+        new_height = target_height
+        new_width = int(target_height * original_aspect)
+
+    # Resize image maintaining aspect ratio
+    resized = image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+
+    # Ensure RGB mode
+    if resized.mode != "RGB":
+        resized = resized.convert("RGB")
+
+    # Create new image with padding
+    padded = Image.new("RGB", (target_width, target_height), pad_color)
+
+    # Calculate paste position to center the image
+    paste_x = (target_width - new_width) // 2
+    paste_y = (target_height - new_height) // 2
+
+    # Paste resized image onto padded canvas
+    padded.paste(resized, (paste_x, paste_y))
+
+    logger.debug(
+        f"Rescaled image from {original_width}x{original_height} to {target_width}x{target_height} "
+        f"(actual content: {new_width}x{new_height}, padding: {paste_x},{paste_y})"
+    )
+
+    return padded
+
+
 def save_annotated_image(
     image: Image.Image,
     detections: list[dict],

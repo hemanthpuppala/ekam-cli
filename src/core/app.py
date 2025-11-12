@@ -80,6 +80,12 @@ def check_and_show_completion_notifications() -> None:
                     f"[green]✓ {task.model_info.name} → {task.quant_type.display_name}[/green]"
                 )
                 tui.console.print(f"[dim]Output: {task.output_path.name}[/dim]\n")
+                # If there was a fallback warning, display it
+                try:
+                    if getattr(task, "warning_message", None):
+                        tui.console.print(f"[yellow]⚠ {task.warning_message}[/yellow]\n")
+                except Exception:
+                    pass
             elif task.status.value == "failed":
                 tui.console.print(
                     f"\n[bold red]❌ NOTIFICATION: Quantization Failed[/bold red]",
@@ -1411,12 +1417,28 @@ def run_inference_mode(session_manager: SessionManager, config: dict, system_spe
                     style="yellow"
                 )
 
-                confirm = tui.prompt(
-                    "Do you want to proceed anyway? [y/N]:",
-                    style="yellow"
-                ).lower().strip()
+                # Navigation-aware confirmation
+                from ..cli.text_input import ProfessionalPrompt
+                prompt = ProfessionalPrompt()
+                choice = prompt.get_arrow_selection(
+                    options=[
+                        ("PROCEED", "[green]Proceed Anyway[/green]", "Load model despite warning"),
+                        ("BACK", "[dim]◄ Go back[/dim]", "Return to model list"),
+                        ("HOME", "[dim]⌂ Home[/dim]", "Go to main menu"),
+                        ("QUIT", "[dim]Quit[/dim]", "Exit application"),
+                    ],
+                    title="Confirm Load",
+                    instructions="Use ↑/↓ to navigate, Enter to select"
+                )
 
-                if confirm not in ["y", "yes"]:
+                if choice != "PROCEED":
+                    if choice == "HOME":
+                        logger.info("User returned to main menu from memory warning")
+                        return "main_menu"
+                    if choice == "QUIT":
+                        logger.info("User quit from memory warning")
+                        return "quit"
+                    # BACK or cancel → continue to model menu
                     logger.info(f"User declined to load too-large model: {selected_model.model_id}")
                     continue
 

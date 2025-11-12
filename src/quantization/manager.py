@@ -222,6 +222,8 @@ class QuantizationManager:
         use_gpu: bool = False,
         background: bool = False,
         vlm_components: Optional[str] = None,
+        vision_encoder_type: Optional[QuantizationType] = None,
+        language_decoder_type: Optional[QuantizationType] = None,
     ) -> QuantizationTask:
         """Create a quantization task.
 
@@ -232,6 +234,8 @@ class QuantizationManager:
             use_gpu: Whether to use GPU
             background: Whether to run in background
             vlm_components: For VLMs, which components to quantize ("vision", "language", "both", or None)
+            vision_encoder_type: For VLM component-level, quantization type for vision encoder
+            language_decoder_type: For VLM component-level, quantization type for language decoder
 
         Returns:
             Created task
@@ -314,6 +318,8 @@ class QuantizationManager:
             use_gpu=use_gpu,
             background=background,
             vlm_components=vlm_components,
+            vision_encoder_type=vision_encoder_type,
+            language_decoder_type=language_decoder_type,
         )
 
         logger.info(f"Created quantization task {task_id}: {model_info.name} → {quant_type.display_name}")

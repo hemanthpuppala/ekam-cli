@@ -18,7 +18,8 @@ class ConversationExchange(BaseModel):
     """A single user-AI exchange in a conversation."""
 
     user_message: str = Field(description="User's message")
-    ai_response: str = Field(description="AI's response")
+    ai_response: str = Field(description="AI's response (clean response without reasoning)")
+    ai_reasoning: Optional[str] = Field(default=None, description="AI's reasoning/thinking blocks (if present)")
     timestamp: datetime = Field(default_factory=datetime.now)
     inference_time_ms: float = Field(default=0.0, description="Time taken for this response")
 
@@ -59,6 +60,93 @@ class ModelParameters(BaseModel):
         ge=0.0,
         le=10.0,
         description="Repetition penalty (0.0-10.0, 1.0 = no penalty)"
+    )
+    # Llama.cpp advanced sampling parameters
+    presence_penalty: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Presence penalty (0.0-2.0, 0 = none)"
+    )
+    frequency_penalty: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        description="Frequency penalty (0.0-2.0, 0 = none)"
+    )
+    typical_p: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Typical decoding p (0.0-1.0)"
+    )
+    tfs_z: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Tail free sampling z (0.0-1.0)"
+    )
+    min_p: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Min-p sampling (0.0-1.0)"
+    )
+    penalty_last_n: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=4096,
+        description="Tokens to consider for repetition penalty"
+    )
+    mirostat: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=2,
+        description="Mirostat mode (0=off,1,2)"
+    )
+    mirostat_tau: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=10.0,
+        description="Mirostat target entropy"
+    )
+    mirostat_eta: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=10.0,
+        description="Mirostat learning rate"
+    )
+    n_keep: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=32768,
+        description="Number of initial tokens to keep from being truncated"
+    )
+    ignore_eos: Optional[bool] = Field(
+        default=None,
+        description="Ignore end-of-sequence tokens"
+    )
+    stop: Optional[list[str]] = Field(
+        default=None,
+        description="Stop sequences"
+    )
+    n_probs: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=10,
+        description="Return top-n token probabilities"
+    )
+    grammar: Optional[str] = Field(
+        default=None,
+        description="GGML grammar (string)"
+    )
+    logit_bias: Optional[dict] = Field(
+        default=None,
+        description="Logit bias map (token or id -> bias)"
+    )
+    system_prompt: Optional[str] = Field(
+        default=None,
+        description="System prompt to prepend as role=system"
     )
     seed: Optional[int] = Field(
         default=None,
@@ -120,11 +208,25 @@ class ConversationSession(BaseModel):
         """Duration of session in minutes."""
         return (self.last_active - self.created_at).total_seconds() / 60
 
-    def add_exchange(self, user_message: str, ai_response: str, inference_time_ms: float = 0.0) -> None:
-        """Add a new exchange to the session."""
+    def add_exchange(
+        self,
+        user_message: str,
+        ai_response: str,
+        inference_time_ms: float = 0.0,
+        ai_reasoning: Optional[str] = None
+    ) -> None:
+        """Add a new exchange to the session.
+
+        Args:
+            user_message: User's input message
+            ai_response: AI's clean response (without reasoning/thinking blocks)
+            inference_time_ms: Time taken for inference
+            ai_reasoning: Optional reasoning/thinking blocks extracted from response
+        """
         exchange = ConversationExchange(
             user_message=user_message,
             ai_response=ai_response,
+            ai_reasoning=ai_reasoning,
             inference_time_ms=inference_time_ms
         )
         self.exchanges.append(exchange)
@@ -140,6 +242,7 @@ class ConversationSession(BaseModel):
 
         Returns:
             List of (user_message, ai_response) tuples, most recent last
+            Note: Only returns clean responses (without reasoning blocks) for context
         """
         exchanges_to_use = self.exchanges
 

@@ -234,6 +234,12 @@ def managed_image(image_path: str):
             img = img.convert('RGB')
             old_img.close()  # Close original to free memory
 
+        # Attach source path for downstream debugging/logging
+        try:
+            setattr(img, "_source_path", str(image_path))
+        except Exception:
+            pass
+
         yield img
 
     finally:

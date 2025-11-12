@@ -200,7 +200,7 @@ class FinetuneConfig(BaseModel):
         if self.method == FinetuneMethod.QLORA and not self.qlora_config:
             raise ValueError("qlora_config required when method=qlora")
 
-    def get_method_config(self) -> LoRAConfig | QLoRAConfig:
+    def get_method_config(self) -> "LoRAConfig | QLoRAConfig":
         """Get the configuration for the selected method."""
         if self.method == FinetuneMethod.LORA:
             return self.lora_config

@@ -95,16 +95,16 @@ def setup_logging(log_dir: Path = Path("logs"), console_level: str = "ERROR") ->
     # Create log directory if it doesn't exist
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    # File handler (DEBUG+) with rotation - everything goes to log file
+    # File handler (INFO+) with rotation - info and above goes to log file
     logger.add(
         log_dir / "ekam_cli_{time:YYYY-MM-DD}.log",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
-        level="DEBUG",
+        level="INFO",
         rotation="100 MB",
         retention="30 days",
         compression="zip",
     )
 
     # Log initialization (goes to file only, not console)
-    logger.info("Logging initialized - console level: {}, file level: DEBUG", console_level)
+    logger.info("Logging initialized - console level: {}, file level: INFO", console_level)
     logger.debug("Third-party library output suppressed for clean TUI")

@@ -465,6 +465,23 @@ class BackgroundJobManager:
                 "use_gpu": task.use_gpu,
             }
 
+            # Persist VLM component selections (stateful) if present
+            try:
+                if getattr(task, "language_decoder_type", None):
+                    metadata["vlm_language_quant"] = task.language_decoder_type.value  # type: ignore[attr-defined]
+                if getattr(task, "vision_encoder_type", None):
+                    metadata["vlm_vision_quant"] = task.vision_encoder_type.value  # type: ignore[attr-defined]
+                if getattr(task, "vlm_language_file", None):
+                    metadata["vlm_language_file"] = task.vlm_language_file  # type: ignore[attr-defined]
+                if getattr(task, "vlm_vision_file", None):
+                    metadata["vlm_vision_file"] = task.vlm_vision_file  # type: ignore[attr-defined]
+                if getattr(task, "attempted_vision_quant_type", None):
+                    metadata["vlm_vision_attempted"] = task.attempted_vision_quant_type.value  # type: ignore[attr-defined]
+                if getattr(task, "warning_message", None):
+                    metadata["warning_message"] = task.warning_message  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
             # Determine metadata file path based on output type
             if task.output_path.is_file():
                 # GGUF file - save metadata as .json next to it

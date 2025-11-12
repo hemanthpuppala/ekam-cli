@@ -169,23 +169,23 @@ QUALITY_TEST_PROMPTS: List[str] = [
 # Visual Q&A Endpoint Prompts (Easy/Medium/Hard pattern)
 VLM_VISION_QA_PROMPTS: List[str] = [
     # 1-Easy
-    "What is the main object in this image?",
+    "Is there are watermelon in this image? Respond in a single sentence.",
     # 2-Medium
-    "Describe the setting and location shown in the image.",
+    "Describe this image, and the items in this image.",
     # 3-Hard
-    "Analyze the composition and visual hierarchy of elements in this image.",
+    "Analyze this image and explain the relationships between the objects present.",
     # 4-Easy
     "What colors are most prominent?",
     # 5-Medium
-    "Identify the mood or atmosphere conveyed by this image.",
+    "Identify the number of people and their activities in the image.",
     # 6-Hard
-    "What cultural or historical context can you infer from the visual elements?",
+    "What cultural or historical context can you infer from this location?",
     # 7-Easy
     "Are there any people in this image?",
     # 8-Medium
-    "Describe what the people in this image are doing.",
+    "Assess the pavement condition.",
     # 9-Hard
-    "Analyze the body language and interactions between people in this image.",
+    "Analyze the item type, color, pattern, closure, handle-length and its brand based on visible logos or design features.",
     # 10-Easy
     "What animals can you see?",
     # 11-Medium
@@ -598,13 +598,14 @@ def check_output_matches_expected(prompt: str, output: str) -> bool:
 # ============================================
 
 # Test data directory structure
-TEST_DATA_ROOT = Path(__file__).parent.parent.parent.parent / "assets" / "test_data"
+# Use repository-local dataset under src/benchmarking/datasets/test_data
+TEST_DATA_ROOT = Path(__file__).parent / "test_data"
 
 ENDPOINT_DIRS = {
-    "vision/qa": TEST_DATA_ROOT / "visual_qa",
-    "vision/caption": TEST_DATA_ROOT / "caption",
-    "vision/detect": TEST_DATA_ROOT / "detect",
-    "vision/point": TEST_DATA_ROOT / "point",
+    "vision/qa": TEST_DATA_ROOT / "vision_qa",
+    "vision/caption": TEST_DATA_ROOT / "vision_caption",
+    "vision/detect": TEST_DATA_ROOT / "vision_detect",
+    "vision/point": TEST_DATA_ROOT / "vision_point",
 }
 
 TEST_DATA_CONFIG = TEST_DATA_ROOT / "test_data_config.json"
@@ -629,9 +630,14 @@ def get_endpoint_images(endpoint: str) -> List[Path]:
     if not images_dir.exists():
         return []
 
-    # Get all image files
+    # Get all image files, ignore hidden and AppleDouble files (e.g., ._image.jpg)
     image_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp'}
-    images = [f for f in images_dir.iterdir() if f.suffix.lower() in image_extensions]
+    images = [
+        f for f in images_dir.iterdir()
+        if f.is_file()
+        and f.suffix.lower() in image_extensions
+        and not f.name.startswith('.')  # excludes .DS_Store, ._ files, hidden files
+    ]
     images.sort()
 
     return images

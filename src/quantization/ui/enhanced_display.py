@@ -155,9 +155,67 @@ def show_enhanced_live_progress(
                     f"{task.write_speed_mbps:.1f} MB/s"
                 )
 
+            # Build high-level steps (vague labels, no technical details)
+            steps = [
+                ("Step 1", "Prepare"),
+                ("Step 2", "Process"),
+                ("Step 3", "Package"),
+                ("Step 4", "Finalize"),
+            ]
+
+            # Determine current step from status and progress
+            from ..models import TaskStatus
+            if task.status == TaskStatus.PREPARING:
+                current_idx = 0
+            elif task.status == TaskStatus.RUNNING:
+                if task.progress < 50:
+                    current_idx = 1
+                elif task.progress < 95:
+                    current_idx = 2
+                else:
+                    current_idx = 3
+            elif task.status == TaskStatus.COMPLETED:
+                current_idx = len(steps) - 1
+            else:
+                # FAILED/CANCELLED → keep at current progress bucket
+                if task.progress < 50:
+                    current_idx = 1
+                elif task.progress < 95:
+                    current_idx = 2
+                else:
+                    current_idx = 3
+
+            # Render steps table
+            steps_table = Table.grid(padding=(0, 2))
+            steps_table.add_column(style="cyan", width=10)
+            steps_table.add_column(style="white")
+
+            for i, (label, title) in enumerate(steps):
+                if task.status == TaskStatus.COMPLETED or i < current_idx:
+                    bullet = "[green]✓[/green]"
+                    style = "white"
+                elif i == current_idx:
+                    bullet = "[cyan]»[/cyan]"
+                    style = "cyan"
+                else:
+                    bullet = "[dim]•[/dim]"
+                    style = "dim"
+                steps_table.add_row(f"{bullet} {label}", f"[{style}]{title}[/{style}]")
+
+            # Device info (vague)
+            device_text = Text(f"Device: {'GPU' if use_gpu else 'CPU'}", style="dim")
+
             # Build the complete display
             content_group = Group(
                 progress_display,
+                device_text,
+                "",  # Spacing
+                Panel(
+                    steps_table,
+                    title="[bold]📋 Steps[/bold]",
+                    border_style="cyan",
+                    padding=(0, 1),
+                ),
                 "",  # Spacing
                 Panel(
                     metrics_table,
@@ -215,10 +273,53 @@ def show_enhanced_live_progress(
         avg_cpu = sum(m['cpu'] for m in metrics_history) / len(metrics_history) if metrics_history else 0
         peak_memory = max(m['memory'] for m in metrics_history) if metrics_history else 0
 
-        tui.show_message(
-            f"""[bold green]✅ Quantization Completed![/bold green]
+        # Build generated files list (handles VLM component outputs and intermediate files)
+        generated_lines = []
+        try:
+            # Primary output
+            primary_label = "Primary"
+            primary_type = getattr(task.quant_type, 'display_name', task.quant_type.value)
+            generated_lines.append(f"  • {primary_label}: {task.output_path} [dim]({primary_type})[/dim]")
 
-[bold]Output:[/bold] {task.output_path}
+            # VLM language/vision files if present
+            if getattr(task, 'vlm_language_file', None):
+                lang_type = getattr(task, 'language_decoder_type', None)
+                lang_type_name = lang_type.display_name if lang_type else 'Unknown'
+                generated_lines.append(f"  • Language: {task.vlm_language_file} [dim]({lang_type_name})[/dim]")
+            if getattr(task, 'vlm_vision_file', None):
+                vis_type = getattr(task, 'vision_encoder_type', None)
+                vis_type_name = vis_type.display_name if vis_type else 'Unknown'
+                # Mark mmproj clearly if filename indicates
+                prefix = "Vision"
+                try:
+                    from pathlib import Path as _P
+                    if "mmproj-" in _P(str(task.vlm_vision_file)).name:
+                        prefix = "Vision (mmproj)"
+                except Exception:
+                    pass
+                generated_lines.append(f"  • {prefix}: {task.vlm_vision_file} [dim]({vis_type_name})[/dim]")
+
+            # Intermediate FP16 (exposed but optional)
+            if getattr(task, 'intermediate_file', None):
+                generated_lines.append(f"  • Intermediate: {task.intermediate_file} [dim](FP16)[/dim]")
+        except Exception:
+            pass
+
+        generated_block = "\n".join(generated_lines) if generated_lines else str(task.output_path)
+
+        # Optional fallback warning
+        warning_text = ""
+        try:
+            if getattr(task, "warning_message", None):
+                warning_text = f"\n[bold yellow]⚠ {task.warning_message}[/bold yellow]"
+        except Exception:
+            pass
+
+        tui.show_message(
+            f"""[bold green]✅ Quantization Completed![/bold green]{warning_text}
+
+[bold]Generated Files:[/bold]
+{generated_block}
 [bold]Final Size:[/bold] {quantized_size_gb:.2f} GB (original: {original_size:.2f} GB)
 [bold]Size Reduction:[/bold] {reduction_pct:.1f}%
 [bold]Time Taken:[/bold] {int(elapsed / 60)}m {int(elapsed % 60)}s

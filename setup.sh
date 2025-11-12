@@ -613,6 +613,445 @@ else
     echo -e "  ${YELLOW}bash $SCRIPT_DIR/install-ekam-cli.sh $SCRIPT_DIR${NC}"
 fi
 
+# Helper function: Install system dependencies based on OS
+install_system_dependencies() {
+    local deps_needed=()
+    local cmake_installed=false
+    local git_installed=false
+    local build_tools_installed=false
+
+    # Check what's missing
+    if ! command -v cmake &> /dev/null; then
+        deps_needed+=("cmake")
+    else
+        cmake_installed=true
+    fi
+
+    if ! command -v git &> /dev/null; then
+        deps_needed+=("git")
+    else
+        git_installed=true
+    fi
+
+    if [ "$OS" != "macos" ] && ! command -v make &> /dev/null; then
+        deps_needed+=("build-essential")
+    else
+        build_tools_installed=true
+    fi
+
+    # If nothing is missing, return success
+    if [ ${#deps_needed[@]} -eq 0 ]; then
+        print_success "All system dependencies are already installed"
+        return 0
+    fi
+
+    # Install missing dependencies
+    print_section "Installing missing system dependencies: ${deps_needed[*]}"
+    echo
+
+    case $OS in
+        macos)
+            if ! command -v brew &> /dev/null; then
+                print_error "Homebrew not found. Please install Homebrew first:"
+                echo -e "  ${YELLOW}/bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"${NC}"
+                return 1
+            fi
+
+            echo "Installing via Homebrew..."
+            for dep in "${deps_needed[@]}"; do
+                if brew install "$dep" 2>&1 | grep -v "Warning"; then
+                    print_success "$dep installed"
+                else
+                    print_warning "Failed to install $dep - you may need to install manually"
+                fi
+            done
+            ;;
+
+        linux)
+            # Detect package manager
+            if command -v apt-get &> /dev/null; then
+                echo "Installing via apt-get..."
+                if sudo apt-get update && sudo apt-get install -y "${deps_needed[@]}"; then
+                    print_success "Dependencies installed successfully"
+                else
+                    print_error "Failed to install dependencies via apt-get"
+                    return 1
+                fi
+            elif command -v yum &> /dev/null; then
+                echo "Installing via yum..."
+                if sudo yum install -y "${deps_needed[@]}"; then
+                    print_success "Dependencies installed successfully"
+                else
+                    print_error "Failed to install dependencies via yum"
+                    return 1
+                fi
+            elif command -v pacman &> /dev/null; then
+                echo "Installing via pacman..."
+                if sudo pacman -S --noconfirm "${deps_needed[@]}"; then
+                    print_success "Dependencies installed successfully"
+                else
+                    print_error "Failed to install dependencies via pacman"
+                    return 1
+                fi
+            else
+                print_error "Could not detect package manager"
+                print_warning "Please install manually: ${deps_needed[*]}"
+                return 1
+            fi
+            ;;
+
+        wsl)
+            echo "Installing via apt-get (WSL)..."
+            if sudo apt-get update && sudo apt-get install -y "${deps_needed[@]}"; then
+                print_success "Dependencies installed successfully"
+            else
+                print_error "Failed to install dependencies"
+                return 1
+            fi
+            ;;
+
+        windows)
+            print_error "Windows native installation not supported via bash"
+            print_warning "Please install dependencies manually:"
+            for dep in "${deps_needed[@]}"; do
+                case $dep in
+                    cmake) echo -e "  ${YELLOW}https://cmake.org/download/${NC}" ;;
+                    git) echo -e "  ${YELLOW}https://git-scm.com/download/win${NC}" ;;
+                esac
+            done
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+# Helper function: Detect GPU type and return build flags
+detect_gpu_and_build_flags() {
+    local gpu_type=""
+    local gpu_flags=""
+    local gpu_description=""
+
+    case $OS in
+        macos)
+            # Check for Apple Silicon vs Intel
+            if sysctl -a | grep -q "arm64"; then
+                gpu_type="metal_silicon"
+                gpu_flags="-DGGML_METAL=ON"
+                gpu_description="Apple Silicon (Metal GPU)"
+            else
+                gpu_type="metal_intel"
+                gpu_flags="-DGGML_METAL=ON"
+                gpu_description="Intel Mac (Metal GPU)"
+            fi
+            ;;
+
+        linux|wsl)
+            # Check for NVIDIA GPU
+            if command -v nvidia-smi &> /dev/null; then
+                if lspci 2>/dev/null | grep -i nvidia &> /dev/null || nvidia-smi &> /dev/null; then
+                    gpu_type="nvidia"
+                    gpu_flags="-DGGML_CUDA=ON"
+                    gpu_description="NVIDIA GPU (CUDA)"
+                fi
+            fi
+
+            # Check for AMD GPU if NVIDIA not found
+            if [ -z "$gpu_type" ]; then
+                if command -v rocm-smi &> /dev/null || [ -d "/opt/rocm" ]; then
+                    gpu_type="amd"
+                    gpu_flags="-DGGML_HIPBLAS=ON"
+                    gpu_description="AMD GPU (ROCm)"
+                fi
+            fi
+
+            # Check for Intel Arc GPU
+            if [ -z "$gpu_type" ]; then
+                if lspci 2>/dev/null | grep -i "intel.*arc" &> /dev/null; then
+                    gpu_type="intel_arc"
+                    gpu_flags="-DGGML_ONEAPI=ON"
+                    gpu_description="Intel Arc GPU (oneAPI)"
+                fi
+            fi
+
+            # Default to CPU-only
+            if [ -z "$gpu_type" ]; then
+                gpu_type="cpu"
+                gpu_flags=""
+                gpu_description="CPU-only mode (no GPU detected)"
+            fi
+            ;;
+
+        *)
+            gpu_type="cpu"
+            gpu_flags=""
+            gpu_description="CPU-only mode"
+            ;;
+    esac
+
+    echo "$gpu_type|$gpu_flags|$gpu_description"
+}
+
+# Main llama.cpp installation
+print_section "Setting up llama.cpp (GGUF model support - REQUIRED)..."
+echo
+
+LLAMACPP_DIR="$SCRIPT_DIR/llama.cpp"
+LLAMACPP_BINARY="$LLAMACPP_DIR/build/bin/llama-server"
+LLAMACPP_INSTALL_FAILED=false
+REBUILD_LLAMA=false
+
+# Step 1: Check if llama.cpp directory exists
+if [ -d "$LLAMACPP_DIR" ]; then
+    print_success "llama.cpp directory found"
+
+    # Update llama.cpp to latest version
+    print_section "Updating llama.cpp to latest version..."
+    echo "Checking for updates..."
+    cd "$LLAMACPP_DIR"
+
+    # Fetch latest changes
+    if git fetch origin master 2>&1 | grep -v "Already up to date"; then
+        # Check if there are updates
+        LOCAL=$(git rev-parse HEAD)
+        REMOTE=$(git rev-parse origin/master)
+
+        if [ "$LOCAL" != "$REMOTE" ]; then
+            print_warning "Updates available. Pulling latest changes..."
+            if git pull origin master 2>&1; then
+                print_success "llama.cpp updated to latest version"
+                print_warning "Rebuild required due to updates"
+                rm -rf "$LLAMACPP_DIR/build"
+                # Remove patch marker so patches are reapplied after update
+                rm -f "$LLAMACPP_DIR/.ekam_patches_applied"
+                rm -f "$LLAMACPP_DIR/tools/mtmd/mtmd.cpp.ekam-backup"
+                REBUILD_LLAMA=true
+            else
+                print_error "Failed to update llama.cpp. Continuing with existing version..."
+            fi
+        else
+            print_success "llama.cpp is already up to date"
+        fi
+    fi
+
+    cd "$SCRIPT_DIR"
+
+    # Check if binary is built and working
+    if [ -f "$LLAMACPP_BINARY" ] && [ "$REBUILD_LLAMA" != true ]; then
+        print_success "llama-server binary already exists"
+        echo "Testing binary..."
+        if "$LLAMACPP_BINARY" --version &> /dev/null; then
+            print_success "llama-server is working correctly"
+        else
+            print_warning "Binary exists but doesn't work (possibly incompatible architecture)"
+            echo "Marking for rebuild..."
+            rm -rf "$LLAMACPP_DIR/build"
+            REBUILD_LLAMA=true
+        fi
+    else
+        if [ "$REBUILD_LLAMA" != true ]; then
+            print_warning "llama-server binary not found"
+            REBUILD_LLAMA=true
+        fi
+    fi
+else
+    print_warning "llama.cpp not found. Need to clone from GitHub..."
+    REBUILD_LLAMA=true
+fi
+
+# Step 2: If rebuild needed, install dependencies first
+if [ "$REBUILD_LLAMA" = true ] && [ "$LLAMACPP_INSTALL_FAILED" = false ]; then
+    print_section "Installing system dependencies for llama.cpp..."
+    if ! install_system_dependencies; then
+        print_error "Failed to install system dependencies"
+        LLAMACPP_INSTALL_FAILED=true
+    else
+        echo
+    fi
+fi
+
+# Step 3: Clone llama.cpp if needed
+if [ "$REBUILD_LLAMA" = true ] && [ ! -d "$LLAMACPP_DIR" ] && [ "$LLAMACPP_INSTALL_FAILED" = false ]; then
+    print_section "Cloning llama.cpp repository..."
+    echo "This may take a minute..."
+    echo
+
+    if git clone --depth 1 https://github.com/ggerganov/llama.cpp "$LLAMACPP_DIR" 2>&1; then
+        print_success "llama.cpp cloned successfully"
+        echo
+    else
+        print_error "Failed to clone llama.cpp repository"
+        LLAMACPP_INSTALL_FAILED=true
+    fi
+fi
+
+# Step 3.5: Apply production patches to llama.cpp
+if [ -d "$LLAMACPP_DIR" ] && [ "$LLAMACPP_INSTALL_FAILED" = false ]; then
+    print_section "Applying production patches to llama.cpp..."
+    echo
+
+    if [ -f "$SCRIPT_DIR/patches/apply_patches.sh" ]; then
+        if bash "$SCRIPT_DIR/patches/apply_patches.sh"; then
+            print_success "Production patches applied successfully"
+            echo
+            echo -e "${CYAN}Applied fixes:${NC}"
+            echo "  ✓ Vision model state corruption fix (mtmd_encode buffer clearing)"
+            echo "  ✓ Prevents HTTP 500 errors in continuous batching mode"
+            echo "  ✓ Ensures stable multi-image processing"
+            echo
+        else
+            print_warning "Some patches failed to apply"
+            print_warning "Vision model support may be less stable"
+            echo
+            echo "This is usually fine - the patches may already be in upstream llama.cpp"
+            echo
+        fi
+    else
+        print_warning "Patch script not found at: $SCRIPT_DIR/patches/apply_patches.sh"
+        print_warning "Continuing without patches - vision models may be less stable"
+        echo
+    fi
+fi
+
+# Step 4: Build llama.cpp if needed
+if [ -d "$LLAMACPP_DIR" ] && [ ! -f "$LLAMACPP_BINARY" ] && [ "$LLAMACPP_INSTALL_FAILED" = false ]; then
+    print_section "Building llama.cpp..."
+    echo
+
+    # Detect GPU and get build flags
+    GPU_INFO=$(detect_gpu_and_build_flags)
+    GPU_TYPE=$(echo "$GPU_INFO" | cut -d'|' -f1)
+    GPU_FLAGS=$(echo "$GPU_INFO" | cut -d'|' -f2)
+    GPU_DESCRIPTION=$(echo "$GPU_INFO" | cut -d'|' -f3)
+
+    if [ -n "$GPU_FLAGS" ]; then
+        print_success "Detected: $GPU_DESCRIPTION"
+    else
+        print_warning "No GPU detected: $GPU_DESCRIPTION"
+    fi
+
+    echo "Build configuration:"
+    echo "  GPU Support: $GPU_DESCRIPTION"
+    echo "  Build Flags: ${GPU_FLAGS:-'(none - CPU only)'}"
+    echo
+
+    # Create build directory
+    cd "$LLAMACPP_DIR"
+    if [ -d build ]; then
+        print_warning "Cleaning previous build..."
+        rm -rf build
+    fi
+
+    mkdir -p build
+    cd build
+
+    # Run CMake configuration
+    echo "Configuring CMake..."
+    if ! cmake .. $GPU_FLAGS 2>&1 | tail -20; then
+        print_error "CMake configuration failed"
+        LLAMACPP_INSTALL_FAILED=true
+    else
+        print_success "CMake configuration successful"
+        echo
+
+        # Detect number of CPU cores for parallel build
+        if command -v nproc &> /dev/null; then
+            CORES=$(nproc)
+        elif command -v sysctl &> /dev/null; then
+            CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+        else
+            CORES=4
+        fi
+
+        # Build with appropriate parallelism
+        echo "Building with $CORES parallel jobs..."
+        echo "This may take 5-15 minutes depending on your system..."
+        echo
+
+        if cmake --build . --config Release -j"$CORES" 2>&1 | tail -50; then
+            print_success "llama.cpp built successfully!"
+            echo
+
+            # Verify binary was created
+            if [ -f "$LLAMACPP_BINARY" ]; then
+                print_success "llama-server binary created successfully"
+                print_success "Location: $LLAMACPP_BINARY"
+
+                # Test the binary
+                echo
+                echo "Testing binary..."
+                if "$LLAMACPP_BINARY" --version &> /dev/null; then
+                    print_success "Binary test passed - llama.cpp is ready!"
+                else
+                    print_warning "Binary was created but test failed"
+                    LLAMACPP_INSTALL_FAILED=true
+                fi
+            else
+                print_error "Build completed but binary not found at: $LLAMACPP_BINARY"
+                LLAMACPP_INSTALL_FAILED=true
+            fi
+        else
+            print_error "llama.cpp build failed"
+            print_warning "Common solutions:"
+            echo "  1. Ensure you have enough disk space (~2GB)"
+            echo "  2. Try rebuilding: rm -rf '$LLAMACPP_DIR/build' && bash $SCRIPT_DIR/setup.sh"
+            echo "  3. For GPU issues, verify drivers are installed"
+            LLAMACPP_INSTALL_FAILED=true
+        fi
+    fi
+
+    # Return to script directory
+    cd "$SCRIPT_DIR"
+fi
+
+# Final llama.cpp status report
+echo
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
+if [ -f "$LLAMACPP_BINARY" ]; then
+    print_success "llama.cpp is ready for GGUF model support"
+    echo
+    print_success "Binary location: $LLAMACPP_BINARY"
+    echo
+    echo "You can now use GGUF models with the application!"
+elif [ "$LLAMACPP_INSTALL_FAILED" = true ]; then
+    print_warning "llama.cpp installation encountered issues"
+    print_warning "GGUF model support will not be available"
+    echo
+    echo "To troubleshoot and install manually:"
+    echo "  1. Verify dependencies:"
+    case $OS in
+        macos)
+            echo -e "     ${YELLOW}brew install cmake git${NC}"
+            ;;
+        linux|wsl)
+            echo -e "     ${YELLOW}sudo apt-get install cmake git build-essential${NC}"
+            ;;
+    esac
+    echo
+    echo "  2. Clone and build:"
+    echo -e "     ${YELLOW}cd \"$SCRIPT_DIR\"${NC}"
+    echo -e "     ${YELLOW}git clone https://github.com/ggerganov/llama.cpp${NC}"
+    echo -e "     ${YELLOW}cd llama.cpp && mkdir build && cd build${NC}"
+    echo
+    echo "  3. Configure for your system:"
+    case $OS in
+        macos)
+            echo -e "     ${YELLOW}cmake .. -DGGML_METAL=ON${NC}"
+            ;;
+        linux)
+            echo -e "     For NVIDIA GPU: ${YELLOW}cmake .. -DGGML_CUDA=ON${NC}"
+            echo -e "     For AMD GPU: ${YELLOW}cmake .. -DGGML_HIPBLAS=ON${NC}"
+            echo -e "     For CPU only: ${YELLOW}cmake ..${NC}"
+            ;;
+    esac
+    echo
+    echo "  4. Build:"
+    echo -e "     ${YELLOW}cmake --build . --config Release -j\$(nproc)${NC}"
+    echo
+else
+    print_warning "llama.cpp setup status unknown"
+fi
+echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 echo
 print_success "Setup completed successfully!"
 echo

@@ -13,6 +13,8 @@ from ..models.model_cache import ModelMetadataCache
 from ..models.provider import ProviderConfig
 from ..models.system import SystemSpecs
 from ..services.llama_server_manager import LlamaServerManager
+from ..services.llama_cli_server_manager import LlamaCLIServerManager
+from ..config.server_config import get_llama_server_type
 from ..utils.history_formatter import format_conversation_history, format_qa_history
 from .base import BaseProvider
 
@@ -47,6 +49,10 @@ class GGUFProvider(BaseProvider):
         # llama-server instances for GPU acceleration + KV cache reuse
         self.llama_servers: Dict[str, LlamaServerManager] = {}  # model_path -> server
         self.use_llama_server = True  # Always use server for GGUF models (GPU + cache)
+
+        # VLM image rescaling preferences (per-model, session-scoped)
+        # Maps model_id -> (width, height) or None to disable
+        self._rescale_resolution: Dict[str, Optional[tuple[int, int]]] = {}
 
         logger.info(f"GGUF provider initialized (GPU: {self.use_gpu}, type: {self.system_specs.gpu.gpu_type}, llama-server mode: ON)")
 
@@ -323,8 +329,104 @@ class GGUFProvider(BaseProvider):
             else:
                 n_gpu_layers = -1 if self.use_gpu else 0
 
-            # Context size: Jamba needs larger context
-            n_ctx = 8192 if is_jamba else 4096
+            # Determine context window (n_ctx)
+            # In benchmark mode, suppress interactive prompt and use defaults or override from env/params
+            import os
+            min_ctx, max_ctx = 256, 32768
+            default_ctx = 8192 if is_jamba else 4096
+            n_ctx = default_ctx
+            try:
+                # Allow explicit override via env var
+                env_ctx = os.getenv("EKAM_N_CTX")
+                if env_ctx:
+                    n_ctx = max(min_ctx, min(max_ctx, int(env_ctx)))
+                # If not in benchmark mode, preserve interactive prompt
+                if not os.getenv("EKAM_BENCHMARK_MODE"):
+                    from ..cli.text_input import professional_prompt
+                    from ..cli.tui_manager import tui
+                    tui.clear_screen()
+                    tui.console.print("\n[cyan]Context Window (n_ctx)[/cyan] — tokens kept in memory per request")
+                    tui.console.print(
+                        f"[dim]Min:[/dim] {min_ctx}   [dim]Max:[/dim] {max_ctx}   "
+                        f"[dim]Default:[/dim] {default_ctx}   [dim]Recommended:[/dim] {default_ctx}"
+                    )
+                    tui.console.print("[dim]Higher values increase RAM/VRAM usage and may reduce throughput.[/dim]")
+                    n_ctx = professional_prompt.get_numeric(
+                        "Context length (tokens)",
+                        min_val=min_ctx,
+                        max_val=max_ctx,
+                        default=default_ctx,
+                        style="cyan",
+                    )
+            except Exception:
+                # Fallback to default if any parsing/IO error
+                n_ctx = default_ctx
+
+            # Check for mmproj file for VLM support (needed for rescaling prompt)
+            mmproj_path = self._find_mmproj_file(str(model_id))
+            is_vlm_model = mmproj_path is not None
+
+            # VLM Image Rescaling Configuration (only for VLM models)
+            # Ask user for target resolution to normalize input images
+            rescale_width, rescale_height = None, None
+            if is_vlm_model and model_id not in self._rescale_resolution:
+                # Default rescaling resolution
+                default_resolution = "1280x1024"
+                try:
+                    # In benchmark mode, resolution is set via benchmark config (not here)
+                    # In regular inference mode, prompt user
+                    if not os.getenv("EKAM_BENCHMARK_MODE"):
+                        from ..cli.text_input import professional_prompt
+                        from ..cli.tui_manager import tui
+                        tui.clear_screen()
+                        tui.console.print("\n[cyan]VLM Image Rescaling[/cyan] — normalize input image resolution")
+                        tui.console.print(
+                            f"[dim]Images will be rescaled to consistent resolution (maintains aspect ratio with padding)[/dim]"
+                        )
+                        tui.console.print(
+                            f"[dim]Default:[/dim] {default_resolution}   [dim]Range:[/dim] 256x256 to 4096x4096"
+                        )
+                        tui.console.print(
+                            "[dim]Enter resolution as WIDTHxHEIGHT (e.g., 1280x1024) or press Enter for default[/dim]"
+                        )
+
+                        resolution_input = professional_prompt.get_input(
+                            f"Image resolution (default: {default_resolution})",
+                            style="cyan",
+                            allow_multiline=False,
+                            show_instructions=False
+                        )
+
+                        # Use default if user pressed Enter without input
+                        if not resolution_input.strip():
+                            resolution_input = default_resolution
+
+                        # Parse resolution (WIDTHxHEIGHT)
+                        import re
+                        match = re.match(r'(\d+)x(\d+)', resolution_input.strip())
+                        if match:
+                            rescale_width, rescale_height = int(match.group(1)), int(match.group(2))
+                            # Validate range (256-4096 per dimension)
+                            if not (256 <= rescale_width <= 4096 and 256 <= rescale_height <= 4096):
+                                logger.warning(
+                                    f"Resolution {rescale_width}x{rescale_height} out of range (256-4096). "
+                                    f"Using default {default_resolution}"
+                                )
+                                rescale_width, rescale_height = 1280, 1024
+                        else:
+                            logger.warning(f"Invalid resolution format '{resolution_input}'. Using default {default_resolution}")
+                            rescale_width, rescale_height = 1280, 1024
+                    else:
+                        # Benchmark mode - use default (will be overridden by benchmark config)
+                        rescale_width, rescale_height = 1280, 1024
+
+                    # Store rescaling preference for this model
+                    if rescale_width and rescale_height:
+                        self._rescale_resolution[model_id] = (rescale_width, rescale_height)
+                        logger.info(f"VLM image rescaling enabled: {rescale_width}x{rescale_height}")
+                except Exception as e:
+                    logger.warning(f"Error configuring image rescaling: {e}. Disabling rescaling.")
+                    self._rescale_resolution[model_id] = None
 
             # Thread configuration
             physical_cores = self.system_specs.cpu_cores_physical
@@ -337,15 +439,40 @@ class GGUFProvider(BaseProvider):
                 s.bind(('', 0))
                 port = s.getsockname()[1]
 
-            # Check for mmproj file for VLM support
-            mmproj_path = self._find_mmproj_file(str(model_id))
+            # Show compact loading box only if not in benchmark mode
+            if not os.getenv("EKAM_BENCHMARK_MODE"):
+                from ..cli.tui_manager import tui
+                tui.clear_screen()
+                tui.show_message(
+                    f"Loading model: {Path(model_id).name}\n\n[dim]Please wait...[/dim]",
+                    title="Loading",
+                    style="cyan",
+                )
 
-            # Create and start llama-server
-            server = LlamaServerManager(
-                model_path=str(model_id),
-                host="127.0.0.1",
-                port=port,
-            )
+            # Determine which server implementation to use
+            server_type = get_llama_server_type()
+
+            if server_type == "llama-cli-server":
+                # Use custom CLI server with isolated mtmd_context (supports both LLM and VLM)
+                if mmproj_path:
+                    logger.info("Using custom CLI server with isolated mtmd_context for VLM")
+                else:
+                    logger.info("Using custom CLI server with isolated mtmd_context for LLM")
+                server = LlamaCLIServerManager(
+                    model_path=str(model_id),
+                    host="127.0.0.1",
+                    port=port,
+                )
+                ServerManagerClass = LlamaCLIServerManager
+            else:
+                # Use legacy llama-server (has vision model bugs)
+                logger.info("Using legacy llama-server (EKAM_USE_LLAMA_SERVER=true)")
+                server = LlamaServerManager(
+                    model_path=str(model_id),
+                    host="127.0.0.1",
+                    port=port,
+                )
+                ServerManagerClass = LlamaServerManager
 
             success = server.start(
                 n_gpu_layers=n_gpu_layers,
@@ -358,7 +485,7 @@ class GGUFProvider(BaseProvider):
             )
 
             if not success:
-                raise RuntimeError(f"Failed to start llama-server for {model_id}")
+                raise RuntimeError(f"Failed to start {server_type} for {model_id}")
 
             # Store server instance
             self.llama_servers[model_key] = server
@@ -387,19 +514,20 @@ class GGUFProvider(BaseProvider):
         """Unload GGUF model and free memory.
 
         Args:
-            handle: LlamaServerManager instance or legacy Llama model instance
+            handle: LlamaServerManager or LlamaCLIServerManager instance
         """
         if handle is None:
             return
 
         try:
-            # Stop llama-server if this is a server instance
-            if isinstance(handle, LlamaServerManager):
+            # Stop server if this is a server instance (works for both types)
+            if isinstance(handle, (LlamaServerManager, LlamaCLIServerManager)):
                 model_key = str(handle.model_path)
                 if model_key in self.llama_servers:
                     handle.stop()
                     del self.llama_servers[model_key]
-                    logger.info(f"llama-server stopped for {handle.model_path.name}")
+                    server_type = "custom CLI server" if isinstance(handle, LlamaCLIServerManager) else "llama-server"
+                    logger.info(f"{server_type} stopped for {handle.model_path.name}")
                 return
 
             # Legacy: direct Llama instance
@@ -413,99 +541,262 @@ class GGUFProvider(BaseProvider):
         handle: Any,
         image: Image.Image,
         question: str,
-        conversation_history: Optional[list[tuple[str, str]]] = None
+        conversation_history: Optional[list[tuple[str, str]]] = None,
+        custom_parameters: Optional[dict] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
-        """Run QA with GGUF VLM using unified history formatter.
+        """Run QA with GGUF VLM using llama-server HTTP API.
 
-        2025 UPDATE: Now uses chat handler with image support for true VLM inference.
+        2025 UPDATE: Now uses llama-server HTTP API with native file:// format (prevents hallucinations).
+        Priority: file:// (native llama.cpp) → OpenAI base64 → [img-1] proprietary (fallback)
 
         Args:
-            handle: Llama model instance (with VLM chat handler if available)
+            handle: LlamaServerManager instance
             image: PIL Image
             question: Question text
             conversation_history: Optional list of (user_msg, bot_response) tuples
+            custom_parameters: Optional custom inference parameters
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Answer text
         """
-        try:
-            # Check if model has chat_handler (VLM support)
-            if hasattr(handle, 'chat_handler') and handle.chat_handler is not None:
-                # 2025 VLM INFERENCE: Use chat completion with image
-                logger.info("Using VLM chat handler for vision-based QA")
+        from ..services.llama_server_manager import LlamaServerManager
+        from ..benchmarking.utils.llama_delay import apply_llama_server_delay
+        import base64
+        from io import BytesIO
+        import tempfile
+        import os
 
-                # Save image to temporary file for llama.cpp
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    image.save(tmp.name)
-                    image_path = tmp.name
+        logger.info("Running GGUF VLM inference via llama-server...")
 
-                try:
-                    # Build messages with image
-                    messages = []
+        # Verify model is LlamaServerManager instance
+        if not isinstance(handle, LlamaServerManager):
+            raise TypeError(f"Expected LlamaServerManager, got {type(handle).__name__}")
 
-                    # Add conversation history if present
-                    if conversation_history:
-                        for user_msg, bot_response in conversation_history[-5:]:  # Last 5 turns
-                            messages.append({"role": "user", "content": user_msg})
-                            messages.append({"role": "assistant", "content": bot_response})
-
-                    # Add current question with image
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "image_url", "image_url": {"url": f"file://{image_path}"}},
-                            {"type": "text", "text": question}
-                        ]
-                    })
-
-                    # Generate with VLM
-                    response = handle.create_chat_completion(
-                        messages=messages,
-                        max_tokens=1024,
-                        temperature=0.0,  # Deterministic for QA
+        # Apply VLM image rescaling if configured for this model
+        model_path = str(handle.model_path) if hasattr(handle, 'model_path') else None
+        if model_path and model_path in self._rescale_resolution:
+            rescale_config = self._rescale_resolution[model_path]
+            if rescale_config:  # Not None (None = disabled)
+                target_width, target_height = rescale_config
+                original_size = image.size
+                # Only rescale if image is different size
+                if image.size != (target_width, target_height):
+                    from ..utils.image import rescale_image_with_padding
+                    image = rescale_image_with_padding(image, target_width, target_height)
+                    logger.info(
+                        f"Rescaled image from {original_size[0]}x{original_size[1]} to "
+                        f"{target_width}x{target_height} (with aspect ratio preservation)"
                     )
 
-                    answer = response["choices"][0]["message"]["content"].strip()
-                    logger.info("✓ VLM QA completed")
-                    return answer
+        # Prepare image in multiple formats for llama-server API
+        # 1. Save to temporary file for file:// URL (native llama.cpp format - RECOMMENDED)
+        temp_image_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                image.save(tmp.name, format="JPEG")
+                temp_image_path = tmp.name
+        except Exception as e:
+            logger.warning(f"Could not save temp image file: {e}")
 
-                finally:
-                    # Clean up temp file
-                    import os
+        # 2. Convert to base64 data URL for OpenAI-style format
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_bytes = buffered.getvalue()
+        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+        img_data_url = f"data:image/jpeg;base64,{img_base64}"
+
+        # Debug logging
+        logger.debug(f"Image encoding: {len(img_bytes)} bytes → {len(img_base64)} base64 chars")
+        logger.debug(f"Image size: {image.size}, mode: {image.mode}")
+        if temp_image_path:
+            logger.debug(f"Temp image saved to: {temp_image_path}")
+
+        # Build messages array with vision content
+        messages = []
+
+        # System prompt (from custom_parameters)
+        sys_prompt = None
+        if custom_parameters and isinstance(custom_parameters.get("system_prompt"), str):
+            sys_prompt = custom_parameters.get("system_prompt")
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+
+        # Add conversation history (text-only, no images in history)
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-3:]:  # Last 3 turns
+                messages.append({"role": "user", "content": user_msg})
+                messages.append({"role": "assistant", "content": bot_msg})
+
+        # Add current question with image
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": img_data_url}}
+            ]
+        })
+
+        # Gather advanced parameters from custom_parameters
+        extra = {}
+        if custom_parameters:
+            for key in [
+                "top_k", "min_p", "typical_p", "tfs_z", "repeat_penalty",
+                "presence_penalty", "frequency_penalty", "penalty_last_n",
+                "mirostat", "mirostat_tau", "mirostat_eta", "seed", "n_keep",
+                "ignore_eos", "grammar", "logit_bias", "n_probs",
+            ]:
+                if key in custom_parameters:
+                    extra[key] = custom_parameters[key]
+
+        # ============================================================================
+        # 2025 llama.cpp STANDARD FORMAT: OpenAI-compatible image_url content parts
+        # ============================================================================
+        # Reference: https://github.com/ggml-org/llama.cpp/blob/master/tools/server/utils.hpp:616-660
+        # The llama.cpp server supports OpenAI-compatible format with image_url in content array:
+        # - data:image/*;base64,<base64> (standard, portable, proven to work)
+        # - http:// or https:// URLs (downloads remote images automatically)
+        # - file:// URLs (experimental, may not be supported in all versions)
+        #
+        # Priority order (as requested by user):
+        # 1. PRIMARY: OpenAI base64 data URL format (most compatible with llama.cpp web UI)
+        # 2. FALLBACK: Proprietary [img-1] format (for compatibility with older code)
+        # ============================================================================
+
+        # Format 1: OpenAI-compatible format with base64 data URL (PRIMARY)
+        # This is what the llama.cpp web UI uses internally
+        openai_messages = []
+        if sys_prompt:
+            openai_messages.append({"role": "system", "content": sys_prompt})
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-3:]:
+                openai_messages.append({"role": "user", "content": user_msg})
+                openai_messages.append({"role": "assistant", "content": bot_msg})
+        openai_messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image_url", "image_url": {"url": img_data_url}}
+            ]
+        })
+
+        # Format 2: HTTP URL format (if we support remote images in future)
+        # Placeholder for potential HTTP URL support
+        # llama.cpp server can download images from http:// or https:// URLs
+        # Not implementing now as we're working with local PIL images
+
+        # Format 3: Proprietary llama.cpp format with [img-1] placeholder (FALLBACK for compatibility)
+        # This is a custom format not part of standard llama.cpp
+        # Keeping as fallback for any edge cases where OpenAI format might not work
+        proprietary_messages = []
+        if sys_prompt:
+            proprietary_messages.append({"role": "system", "content": sys_prompt})
+        if conversation_history:
+            for user_msg, bot_msg in conversation_history[-3:]:
+                proprietary_messages.append({"role": "user", "content": user_msg})
+                proprietary_messages.append({"role": "assistant", "content": bot_msg})
+        proprietary_messages.append({
+            "role": "user",
+            "content": f"[img-1]\n{question}"
+        })
+        proprietary_image_data = [{"id": 1, "data": img_base64}]
+
+        # Try formats in priority order (as requested):
+        # 1. OpenAI base64 (PRIMARY - standard llama.cpp web UI format)
+        # 2. Proprietary [img-1] (FALLBACK - for compatibility)
+        formats_to_try = []
+        formats_to_try.append(("openai_base64", openai_messages, None))  # PRIMARY: Standard OpenAI format
+        formats_to_try.append(("proprietary", proprietary_messages, proprietary_image_data))  # FALLBACK: Custom format
+
+        last_error = None
+        for format_tuple in formats_to_try:
+            format_name = format_tuple[0]
+            test_messages = format_tuple[1]
+            test_image_data = format_tuple[2] if len(format_tuple) > 2 else None
+
+            try:
+                logger.info(f"Trying vision format: {format_name}")
+
+                # Build kwargs for chat_completion with streaming support
+                chat_kwargs = {
+                    "messages": test_messages,
+                    "max_tokens": 1024,
+                    "temperature": 0.7,
+                    "stream": bool(stream_callback),  # Enable streaming if callback provided
+                }
+                chat_kwargs.update(extra)
+                if test_image_data:
+                    chat_kwargs["image_data"] = test_image_data
+
+                response = handle.chat_completion(**chat_kwargs)
+
+                # Handle streaming vs non-streaming responses
+                if stream_callback and hasattr(response, '__iter__'):
+                    # Streaming response
+                    answer = ""
+                    is_first_token = True
+                    for chunk in response:
+                        if isinstance(chunk, dict) and "choices" in chunk:
+                            delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                            if delta:
+                                answer += delta
+                                stream_callback(delta, is_first=is_first_token)
+                                is_first_token = False
+                elif isinstance(response, dict) and "choices" in response:
+                    # Non-streaming response
+                    answer = response["choices"][0]["message"]["content"]
+                else:
+                    logger.warning(f"Format {format_name}: Unexpected response format")
+                    last_error = RuntimeError(f"Unexpected response format from {format_name}")
+                    continue
+
+                # Validate content
+                error_keywords = [
+                    "not a valid image", "invalid image", "unable to process",
+                    "cannot", "no image", "do not see an image"
+                ]
+                if any(k in answer.lower() for k in error_keywords):
+                    logger.warning(f"Format {format_name} produced suspected error response; trying next format")
+                    last_error = RuntimeError(f"{format_name} returned suspected error response")
+                    continue
+
+                logger.info(f"✓ GGUF VLM inference successful ({format_name} format)")
+                # Clean up temp file before returning
+                if temp_image_path:
                     try:
-                        os.unlink(image_path)
+                        os.unlink(temp_image_path)
                     except Exception:
                         pass
-            else:
-                # Fallback: Text-only inference (no vision)
-                logger.warning("Model does not have VLM support - running text-only QA")
+                # Apply post-inference delay for llama-server state cleanup
+                apply_llama_server_delay("gguf")
+                return answer.strip()
 
-                prompt = format_qa_history(
-                    conversation_history=conversation_history,
-                    current_question=question,
-                    max_turns=5
-                )
+            except Exception as e:
+                logger.error(f"Format {format_name} failed with error: {type(e).__name__}: {e}")
+                last_error = e
+                continue
 
-                response = handle.create_completion(
-                    prompt=prompt,
-                    max_tokens=1024,
-                    temperature=0.7,
-                    stop=["Q:", "\n\n"]
-                )
+        # All formats failed - clean up temp file
+        if temp_image_path:
+            try:
+                os.unlink(temp_image_path)
+            except Exception:
+                pass
 
-                return response["choices"][0]["text"].strip()
-
-        except Exception as e:
-            logger.error(f"GGUF VLM QA failed: {e}")
-            raise NotImplementedError(f"VLM QA not supported: {e}")
+        if last_error:
+            logger.error(f"All vision formats failed. Last error: {last_error}")
+            raise last_error
+        else:
+            raise RuntimeError("All vision formats failed with no specific error")
 
     def run_caption(
         self,
         handle: Any,
         image: Image.Image,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        detail_level: str = "detailed"
+        detail_level: str = "detailed",
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate caption with GGUF VLM.
 
@@ -514,6 +805,7 @@ class GGUFProvider(BaseProvider):
             image: PIL Image
             conversation_history: Optional list of (user_msg, bot_response) tuples
             detail_level: "detailed" or "short"
+            stream_callback: Optional callback for token streaming (delta: str, is_first: bool)
 
         Returns:
             Caption text
@@ -523,7 +815,7 @@ class GGUFProvider(BaseProvider):
             if detail_level == "detailed"
             else "Describe this image briefly:"
         )
-        return self.run_qa(handle, image, prompt, conversation_history)
+        return self.run_qa(handle, image, prompt, conversation_history, stream_callback=stream_callback)
 
     def run_detect(self, handle: Any, image: Image.Image, object_name: str) -> list[dict]:
         """Detect objects with GGUF VLM and parse bounding boxes.
@@ -601,7 +893,8 @@ class GGUFProvider(BaseProvider):
         handle: Any,
         prompt: str,
         conversation_history: Optional[list[tuple[str, str]]] = None,
-        custom_parameters: Optional[dict] = None
+        custom_parameters: Optional[dict] = None,
+        stream_callback: Optional[callable] = None,
     ) -> str:
         """Generate text with GGUF LLM with production-level chat templates.
 
@@ -628,8 +921,11 @@ class GGUFProvider(BaseProvider):
                 stop_tokens = get_stop_tokens(model_name=model_name)
 
                 # Build messages format for chat completion API
+                sys_prompt = None
+                if custom_parameters and isinstance(custom_parameters.get("system_prompt"), str):
+                    sys_prompt = custom_parameters.get("system_prompt")
                 messages = [
-                    {"role": "system", "content": "You are a helpful AI assistant. Provide accurate, concise, and well-formatted responses."}
+                    {"role": "system", "content": sys_prompt or "You are a helpful AI assistant. Provide accurate, concise, and well-formatted responses."}
                 ]
 
                 # Add conversation history (last 5 turns for context)
@@ -653,6 +949,34 @@ class GGUFProvider(BaseProvider):
                     top_p = custom_parameters.get("top_p", top_p)
 
                 # Call llama-server's chat completion API
+                # Map advanced parameters from session custom_parameters if provided
+                extra = {}
+                if custom_parameters:
+                    for key in [
+                        "top_k","min_p","typical_p","tfs_z","repeat_penalty",
+                        "presence_penalty","frequency_penalty","penalty_last_n",
+                        "mirostat","mirostat_tau","mirostat_eta","seed","n_keep",
+                        "ignore_eos","grammar","logit_bias","n_probs",
+                    ]:
+                        if key in custom_parameters:
+                            extra[key] = custom_parameters[key]
+
+                # Build and log exact request before sending
+                try:
+                    url, payload = handle.build_chat_payload(
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=stop_tokens,
+                        stream=True,
+                        **extra,
+                    )
+                    # Log request
+                    logger.debug(f"Request: POST {url} | stream=True")
+                except Exception:
+                    pass
+
                 response_stream = handle.chat_completion(
                     messages=messages,
                     max_tokens=max_tokens,
@@ -660,21 +984,31 @@ class GGUFProvider(BaseProvider):
                     top_p=top_p,
                     stop=stop_tokens,
                     stream=True,
+                    **extra,
                 )
 
                 # Accumulate streaming response
                 full_text = ""
+                is_first_token = True
                 for chunk in response_stream:
                     if 'choices' in chunk and len(chunk['choices']) > 0:
                         delta = chunk['choices'][0].get('delta', {}).get('content', '')
                         if delta:
                             full_text += delta
+                            if stream_callback:
+                                try:
+                                    stream_callback(delta, is_first=is_first_token)
+                                finally:
+                                    is_first_token = False
 
                 # Clean response to remove artifacts and meta-commentary
                 from ..utils.response_cleaner import clean_model_response
+                from ..benchmarking.utils.llama_delay import apply_llama_server_delay
                 cleaned_response = clean_model_response(full_text, aggressive=True)
 
                 logger.debug(f"llama-server response generated ({len(cleaned_response)} chars)")
+                # Apply post-inference delay for llama-server state cleanup
+                apply_llama_server_delay("gguf")
                 return cleaned_response
 
             # Legacy path: Direct llama-cpp-python inference (fallback)

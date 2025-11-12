@@ -26,11 +26,19 @@ from src.benchmarking.suites.suite_complete import CompleteSuite
 from src.benchmarking.reporters.json_reporter import JSONReporter
 from src.benchmarking.reporters.csv_reporter import CSVReporter
 from src.benchmarking.reporters.console_formatter import ConsoleFormatter
-from src.benchmarking.reporters.graph_generator import GraphGenerator
+from loguru import logger
+try:
+    from src.benchmarking.reporters.graph_generator import GraphGenerator
+except Exception as _graph_err:
+    # Minimal fallback to avoid crashing when matplotlib style library
+    # cannot be decoded on some macOS setups with AppleDouble files.
+    logger.warning(f"Graph generator unavailable, disabling graphs: {_graph_err}")
+    class GraphGenerator:  # type: ignore
+        def generate_graphs(self, *args, **kwargs):
+            return []
 from src.benchmarking.reporters.html_reporter import HTMLReporter
 from src.benchmarking.reporters.dashboard_generator import DashboardGenerator
 from src.services.session import SessionManager
-from loguru import logger
 
 
 class BenchmarkRunner:
@@ -96,11 +104,8 @@ class BenchmarkRunner:
         for warning in warnings:
             logger.warning(warning)
 
-        # Execute based on mode
-        if config.execution_mode == ExecutionMode.FOREGROUND:
-            return self._run_foreground(config, progress_callback)
-        else:  # BACKGROUND
-            return self._run_background(config, progress_callback)
+        # Execute in foreground with live updates (background disabled)
+        return self._run_foreground(config, progress_callback)
 
     def _run_foreground(
         self,
@@ -119,6 +124,18 @@ class BenchmarkRunner:
         """
         logger.info(f"Starting foreground benchmark: {config.benchmark_id}")
 
+        # Enable non-interactive provider behavior for benchmarks
+        import os
+        os.environ["EKAM_BENCHMARK_MODE"] = "1"
+        # Allow global override of context window via parameters; default to 2048
+        try:
+            n_ctx_param = None
+            if config.parameters:
+                n_ctx_param = config.parameters.get("n_ctx")
+            os.environ["EKAM_N_CTX"] = str(int(n_ctx_param)) if n_ctx_param is not None else "2048"
+        except Exception:
+            os.environ["EKAM_N_CTX"] = "2048"
+
         if progress_callback:
             progress_callback(f"Starting {config.suite_type.display_name()}...")
 
@@ -128,15 +145,45 @@ class BenchmarkRunner:
         result_dir = self.results_manager.base_dir / date_str / config.benchmark_id
 
         # Get appropriate suite with progress callback
-        suite = self._get_suite(config.suite_type, progress_callback=progress_callback)
+        suite = self._get_suite(config.suite_type, progress_callback=progress_callback, model_context_manager=self.model_context_manager)
 
         # Set result directory on executor's VLM handler for visualization outputs
         if hasattr(suite, 'executor') and hasattr(suite.executor, 'vlm_handler'):
             suite.executor.vlm_handler.set_result_dir(result_dir)
             logger.debug(f"Set VLM handler result_dir to: {result_dir}")
 
+        # Start live UI dashboard
+        failed_models_for_ui = getattr(self.provider_bridge, "_recent_load_failures", set())
+        try:
+            from .live_dashboard import BenchmarkLiveUI
+            ui = BenchmarkLiveUI(
+                progress=suite.progress_display if hasattr(suite, 'progress_display') else None,
+                suite_name=config.suite_type.display_name(),
+                config_params=config.parameters or {},
+                models=list(config.models),
+                endpoints=dict(config.endpoints),
+                num_warmup=config.num_warmup,
+                num_runs=config.num_runs,
+                failed_models_ref=failed_models_for_ui,
+            )
+        except Exception:
+            ui = None
+
+        if ui and suite.progress_display:
+            try:
+                ui.start()
+            except Exception:
+                ui = None
+
         # Execute benchmark
         result = suite.run(config)
+
+        # Stop UI
+        if ui:
+            try:
+                ui.stop()
+            except Exception:
+                pass
 
         if progress_callback:
             progress_callback(f"Benchmark complete: {result.status.value}")
@@ -147,6 +194,32 @@ class BenchmarkRunner:
 
         # Save results
         self._save_results(result, config)
+
+        # After first run, retry models that failed to load (once)
+        try:
+            failed_models = []
+            if hasattr(self.provider_bridge, "get_and_clear_load_failures"):
+                failed_models = self.provider_bridge.get_and_clear_load_failures()
+
+            failed_models = [m for m in failed_models if m in config.models]
+            if failed_models:
+                logger.info(f"Retrying failed-to-load models at end: {failed_models}")
+                retry_config = BenchmarkConfig(
+                    model_type=config.model_type,
+                    suite_type=config.suite_type,
+                    models=failed_models,
+                    endpoints={k: v for k, v in config.endpoints.items() if k in failed_models},
+                    test_data=config.test_data,
+                    parameters=config.parameters,
+                    num_runs=config.num_runs,
+                    num_warmup=config.num_warmup,
+                    execution_mode=config.execution_mode,
+                    export_formats=config.export_formats,
+                )
+                # Best-effort retry run (no separate UI)
+                _ = suite.run(retry_config)
+        except Exception as e:
+            logger.warning(f"Retry pass for failed models skipped due to error: {e}")
 
         # Export in requested formats
         self._export_results(result, config)
@@ -182,7 +255,7 @@ class BenchmarkRunner:
                 date_str = datetime.now().strftime("%Y-%m-%d")
                 result_dir = self.results_manager.base_dir / date_str / config.benchmark_id
 
-                suite = self._get_suite(config.suite_type)
+                suite = self._get_suite(config.suite_type, model_context_manager=self.model_context_manager)
 
                 # Set result directory on executor's VLM handler
                 if hasattr(suite, 'executor') and hasattr(suite.executor, 'vlm_handler'):
@@ -286,7 +359,7 @@ class BenchmarkRunner:
         # This would require implementing cooperative cancellation in suites
         return True
 
-    def _get_suite(self, suite_type: SuiteType, progress_callback: Optional[Callable[[str], None]] = None):
+    def _get_suite(self, suite_type: SuiteType, progress_callback: Optional[Callable[[str], None]] = None, model_context_manager: Optional[ModelContextManager] = None):
         """
         Get suite instance for suite type.
 
@@ -308,7 +381,7 @@ class BenchmarkRunner:
         from src.benchmarking.suites.suite_stress import StressSuite
 
         if suite_type == SuiteType.SPEED:
-            suite = SpeedSuite(endpoint_executor=executor)
+            suite = SpeedSuite(endpoint_executor=executor, model_context_manager=model_context_manager)
         elif suite_type == SuiteType.RESOURCES:
             suite = ResourcesSuite(endpoint_executor=executor)
         elif suite_type == SuiteType.COMPLETE:

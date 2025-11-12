@@ -296,7 +296,9 @@ class ModelContextManager:
             return
 
         context.state = ModelState.LOADING
-        logger.info(f"Loading model: {context.model_id} via {context.provider.value}")
+        # Provider may be an Enum or already its value (str) depending on Pydantic config
+        provider_display = getattr(context.provider, 'value', context.provider)
+        logger.info(f"Loading model: {context.model_id} via {provider_display}")
 
         try:
             # Use provider bridge to load model

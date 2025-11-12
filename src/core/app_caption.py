@@ -119,7 +119,7 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
             display_conversation_history(active_session)
 
         # Show instructions
-        tui.console.print("[dim]Commands: /info | /config | /status | /newimage | /exit | Press Enter for auto caption[/dim]\n")
+        tui.console.print("[dim]Commands: /info | /config | /status | /newimage | /clear | /exit | Press Enter for auto caption[/dim]\n")
 
         # Get user input
         user_instruction = tui.prompt("Your instruction (or Enter for auto):", style="green")
@@ -203,6 +203,18 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
                 tui.prompt("Press Enter to continue...", style="dim")
                 continue
 
+            # Clear history command
+            if command in ["clear"]:
+                if use_history and active_session:
+                    active_session.exchanges.clear()
+                    tui.clear_screen()
+                    tui.console.print("[green]✓ Caption history cleared[/green]\n")
+                    tui.prompt("Press Enter to continue...", style="dim")
+                else:
+                    tui.console.print("\n[yellow]No history to clear (single-turn mode)[/yellow]\n")
+                    tui.prompt("Press Enter to continue...", style="dim")
+                continue
+
             # New image command
             elif command in ["newimage", "image", "changeimage"]:
                 instruction_lower = "newimage"  # Set to trigger the existing newimage handler below
@@ -215,6 +227,7 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
                 tui.console.print("  [cyan]/status[/cyan]    - Display current generation parameters")
                 tui.console.print("  [cyan]/config[/cyan]    - Configure generation parameters (temperature, max_tokens, etc.)")
                 tui.console.print("  [cyan]/newimage[/cyan] - Change to a different image")
+                tui.console.print("  [cyan]/clear[/cyan]    - Clear caption history and screen")
                 tui.console.print("  [cyan]/help[/cyan]      - Show this help message")
                 tui.console.print("  [cyan]/exit[/cyan]      - Exit Caption endpoint\n")
                 tui.console.print("  [dim]Press Enter without typing to auto-generate caption[/dim]\n")
@@ -314,17 +327,42 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
             if provider is None:
                 raise ValueError(f"Provider {model_info.provider} not registered")
 
+            # Setup streaming callback for progressive token display
+            from rich.live import Live
+            from rich.text import Text
+            ai_text = Text()
+            streamed_text = [""]
+            first_token_time = [None]
+
+            def _stream_cb(delta: str, is_first: bool):
+                if is_first and first_token_time[0] is None:
+                    first_token_time[0] = time.perf_counter()
+                streamed_text[0] += delta
+                ai_text.append(delta)
+                live.update(ai_text)
+
+            live = Live(ai_text, console=tui.console, refresh_per_second=24)
+            live.start()
+
             # Use appropriate method based on provider type
             provider_type_str = str(model_info.provider).lower()
 
             if provider_type_str == "ollama":
-                # Ollama has convenience methods
+                # Ollama has convenience methods - use run_qa/run_caption for streaming support
+                from PIL import Image
+                image = Image.open(current_image)
+
+                # Get conversation history if using history
+                conversation_history = None
+                if use_history and active_session:
+                    conversation_history = active_session.get_history_for_provider()
+
                 if instruction_stripped:
-                    # Custom instruction - use QA endpoint
-                    response = provider.qa(model_info.model_id, str(current_image), caption_prompt)
+                    # Custom instruction - use QA endpoint with streaming
+                    response = provider.run_qa(model_info.model_id, image, caption_prompt, conversation_history, stream_callback=_stream_cb)
                 else:
-                    # Auto caption
-                    response = provider.caption(model_info.model_id, str(current_image))
+                    # Auto caption with streaming
+                    response = provider.run_caption(model_info.model_id, image, conversation_history=conversation_history, stream_callback=_stream_cb)
             else:
                 # HF and GGUF use handle-based approach with conversation history
                 if not session_manager.state.loaded_model:
@@ -341,13 +379,26 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
                 from PIL import Image
                 image = Image.open(current_image)
 
-                # Pass conversation history to provider
-                if instruction_stripped:
-                    # Custom instruction - use QA with history
-                    response = provider.run_qa(model_handle, image, caption_prompt, conversation_history)
-                else:
-                    # Auto caption
-                    response = provider.run_caption(model_handle, image, conversation_history)
+                # Pass conversation history to provider with streaming support
+                try:
+                    if instruction_stripped:
+                        # Custom instruction - use QA with history and streaming
+                        response = provider.run_qa(model_handle, image, caption_prompt, conversation_history, stream_callback=_stream_cb)
+                    else:
+                        # Auto caption with streaming
+                        response = provider.run_caption(model_handle, image, conversation_history, stream_callback=_stream_cb)
+                except TypeError:
+                    # Fallback: older provider signature without stream_callback
+                    if instruction_stripped:
+                        response = provider.run_qa(model_handle, image, caption_prompt, conversation_history)
+                    else:
+                        response = provider.run_caption(model_handle, image, conversation_history)
+
+            # Stop live streaming view and immediately show final response
+            try:
+                live.stop()
+            except Exception:
+                pass
 
             end_time = time.perf_counter()
             elapsed_ms = (end_time - start_time) * 1000
@@ -374,7 +425,9 @@ def run_caption_endpoint(session_manager: SessionManager, model_info: "ModelInfo
             session_manager.state.statistics.record_inference(inference_result, used_history=use_history)
             logger.debug(f"Recorded inference in statistics (history={use_history})")
 
-            # Display just the new response (history already shown above)
+            # The Live display showed the streamed response without labels
+            # Now add formatted output with labels and timing
+            tui.console.print()  # Add newline for spacing
             tui.console.print(f"[bold green]Request:[/bold green] {caption_prompt}")
             tui.console.print(f"[bold cyan]Caption:[/bold cyan] {response}")
             tui.console.print(f"[dim]({elapsed_ms/1000:.2f}s)[/dim]\n")

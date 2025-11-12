@@ -92,6 +92,7 @@ class ModelInfo(BaseModel):
         Returns:
             (status, message) tuple
         """
+        # O(1) time and space complexity - simple division and comparison
         ratio = self.size_gb / recommended_size_gb
 
         if ratio < 0.7:
@@ -110,7 +111,7 @@ class ModelInfo(BaseModel):
         else:
             return (
                 CompatibilityStatus.TOO_LARGE,
-                f"Model exceeds recommended size by {(ratio-1)*100:.0f}% "
+                f"Model is {ratio:.1f}x larger than recommended "
                 f"({self.size_gb:.1f}GB vs {recommended_size_gb:.1f}GB). "
                 "May cause OOM errors.",
             )

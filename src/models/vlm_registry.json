@@ -1,0 +1,189 @@
+{
+  "vlm_architectures": {
+    "qwen_vl": {
+      "aliases": ["qwen3-vl", "qwen3_vl", "qwen_vl"],
+      "model_type_patterns": ["qwen3_vl", "qwen_vl"],
+      "architecture_patterns": ["Qwen3VLForConditionalGeneration", "QwenVLForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "gguf_note": "Qwen3-VL fully supported by llama.cpp (added October 2025)",
+      "display_name": "Qwen3-VL",
+      "version": "3.x"
+    },
+    "qwen2_5_vl": {
+      "aliases": ["qwen2.5-vl", "qwen2_5_vl", "qwen2.5_vl"],
+      "model_type_patterns": ["qwen2_5_vl", "qwen2.5_vl"],
+      "architecture_patterns": ["Qwen2_5VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration", "Qwen2_5OmniModel"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "display_name": "Qwen2.5-VL",
+      "version": "2.5.x"
+    },
+    "qwen2_vl": {
+      "aliases": ["qwen2-vl", "qwen2_vl"],
+      "model_type_patterns": ["qwen2_vl"],
+      "architecture_patterns": ["Qwen2VLForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "display_name": "Qwen2-VL",
+      "version": "2.x"
+    },
+    "gemma3_vision": {
+      "aliases": ["gemma3-vision", "gemma3_vision", "paligemma3"],
+      "model_type_patterns": ["gemma3", "paligemma3"],
+      "architecture_patterns": ["PaliGemmaForConditionalGeneration", "Gemma3ForVision", "Gemma3ForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "display_name": "Gemma 3 Vision",
+      "version": "3.x"
+    },
+    "pixtral": {
+      "aliases": ["pixtral-12b", "pixtral"],
+      "model_type_patterns": ["pixtral"],
+      "architecture_patterns": ["PixtralForConditionalGeneration", "Mistral3ForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "gguf_note": "Pixtral uses Mistral3 architecture in llama.cpp",
+      "display_name": "Pixtral 12B",
+      "version": "1.x"
+    },
+    "smolvlm": {
+      "aliases": ["smolvlm"],
+      "model_type_patterns": ["smolvlm"],
+      "architecture_patterns": ["SmolVLMForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "display_name": "SmolVLM",
+      "version": "1.x"
+    },
+    "smolvlm2": {
+      "aliases": ["smolvlm2"],
+      "model_type_patterns": ["smolvlm2"],
+      "architecture_patterns": ["SmolVLM2ForConditionalGeneration", "SmolVLMForConditionalGeneration", "Idefics3ForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "gguf_note": "SmolVLM2 may use SmolVLM or Idefics3 architecture in llama.cpp",
+      "display_name": "SmolVLM2",
+      "version": "2.x"
+    },
+    "internvl_3": {
+      "aliases": ["internvl-3", "internvl_3", "internvl3"],
+      "model_type_patterns": ["internvl3", "internvl_3"],
+      "architecture_patterns": ["InternVL3ForConditionalGeneration", "InternVisionModel"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "display_name": "InternVL 3",
+      "version": "3.x"
+    },
+    "internvl_2_5": {
+      "aliases": ["internvl-2.5", "internvl_2_5", "internvl2_5"],
+      "model_type_patterns": ["internvl2_5", "internvl_2_5"],
+      "architecture_patterns": ["InternVL2ForConditionalGeneration", "InternVisionModel"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "display_name": "InternVL 2.5",
+      "version": "2.5.x"
+    },
+    "moondream2": {
+      "aliases": ["moondream2", "moondream"],
+      "model_type_patterns": ["moondream"],
+      "architecture_patterns": ["MoondreamForConditionalGeneration", "LlavaForConditionalGeneration", "HfMoondream"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "gguf_note": "Moondream2 supported via llama.cpp LLaVA-based converter (uses llava-cli with mmproj)",
+      "display_name": "Moondream2",
+      "version": "2.x"
+    },
+    "mistral_small_vision": {
+      "aliases": ["mistral-small-vision"],
+      "model_type_patterns": ["mistral"],
+      "architecture_patterns": ["MistralSmallVisionForConditionalGeneration", "Mistral3ForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": true,
+      "supports_gguf_conversion": true,
+      "gguf_note": "Mistral Small Vision uses Mistral3 architecture in llama.cpp",
+      "display_name": "Mistral Small Vision",
+      "version": "1.x"
+    },
+    "llava_1_6": {
+      "aliases": ["llava-1.6", "llava_1_6"],
+      "model_type_patterns": ["llava"],
+      "architecture_patterns": ["LlavaForConditionalGeneration"],
+      "version_indicators": ["1.6"],
+      "vision_config_keys": ["mm_vision_tower"],
+      "supports_modern_conversion": false,
+      "display_name": "LLaVA 1.6",
+      "version": "1.6"
+    },
+    "llava_1_5": {
+      "aliases": ["llava-1.5", "llava_1_5"],
+      "model_type_patterns": ["llava"],
+      "architecture_patterns": ["LlavaForConditionalGeneration"],
+      "version_indicators": ["1.5"],
+      "vision_config_keys": ["mm_vision_tower"],
+      "supports_modern_conversion": false,
+      "display_name": "LLaVA 1.5",
+      "version": "1.5"
+    },
+    "minicpm_v_2_6": {
+      "aliases": ["minicpm-v-2.6", "minicpm_v_2_6", "minicpm-v2.6"],
+      "model_type_patterns": ["minicpmv"],
+      "architecture_patterns": ["MiniCPMVForConditionalGeneration"],
+      "version_indicators": ["2.6"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": false,
+      "display_name": "MiniCPM-V 2.6",
+      "version": "2.6"
+    },
+    "minicpm_o_2_6": {
+      "aliases": ["minicpm-o-2.6", "minicpm_o_2_6", "minicpm-o2.6"],
+      "model_type_patterns": ["minicpmo"],
+      "architecture_patterns": ["MiniCPMOForConditionalGeneration"],
+      "version_indicators": ["2.6"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": false,
+      "display_name": "MiniCPM-O 2.6",
+      "version": "2.6"
+    },
+    "minicpm_v_2_5": {
+      "aliases": ["minicpm-v-2.5", "minicpm_v_2_5", "minicpm-v2.5"],
+      "model_type_patterns": ["minicpmv"],
+      "architecture_patterns": ["MiniCPMVForConditionalGeneration"],
+      "version_indicators": ["2.5"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": false,
+      "display_name": "MiniCPM-V 2.5",
+      "version": "2.5"
+    },
+    "glm_edge": {
+      "aliases": ["glm-edge", "glm_edge"],
+      "model_type_patterns": ["glm"],
+      "architecture_patterns": ["GLMForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": false,
+      "display_name": "GLM-Edge",
+      "version": "1.x"
+    },
+    "granite_vision": {
+      "aliases": ["granite-vision", "granite_vision"],
+      "model_type_patterns": ["granite"],
+      "architecture_patterns": ["GraniteVisionForConditionalGeneration"],
+      "vision_config_keys": ["vision_config"],
+      "supports_modern_conversion": false,
+      "display_name": "IBM Granite Vision",
+      "version": "1.x"
+    }
+  },
+  "vision_indicators": {
+    "config_keys": ["vision_config", "vision_tower", "mm_vision_tower", "image_size", "vision_model", "visual"],
+    "model_type_keywords": ["vl", "vision", "multimodal", "mm", "moondream"]
+  }
+}
